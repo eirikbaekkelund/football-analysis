@@ -11,7 +11,7 @@ def run(cmd):
 
 def detect_gpu():
     system = platform.system()
-    
+
     try:
         result = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
@@ -22,7 +22,7 @@ def detect_gpu():
             return "cu121"
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
-    
+
     if system == "Darwin":
         try:
             result = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True)
@@ -30,7 +30,7 @@ def detect_gpu():
                 return "mps"
         except FileNotFoundError:
             pass
-    
+
     if system == "Linux":
         try:
             result = subprocess.run(["rocm-smi"], capture_output=True, timeout=5)
@@ -38,13 +38,13 @@ def detect_gpu():
                 return "rocm"
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
-    
+
     return "cpu"
 
 
 def get_torch_cmd(backend):
     pkgs = ["torch", "torchvision", "torchaudio"]
-    
+
     if backend.startswith("cu"):
         return ["uv", "pip", "install", *pkgs, "--index-url", f"https://download.pytorch.org/whl/{backend}"]
     elif backend == "rocm":
@@ -74,21 +74,21 @@ def main():
     parser.add_argument("--cpu", action="store_true", help="Force CPU-only")
     parser.add_argument("--skip-verify", action="store_true", help="Skip verification")
     args = parser.parse_args()
-    
+
     if args.cpu:
         backend = "cpu"
     elif args.cuda:
         backend = f"cu{args.cuda.replace('.', '')}"
     else:
         backend = detect_gpu()
-    
+
     print(f"Backend: {backend}")
-    
+
     run(get_torch_cmd(backend))
     run(["uv", "pip", "install", "ultralytics", "--no-deps"])
     run(["uv", "pip", "install", "opencv-python"])
     run(["uv", "pip", "install", "-e", ".", "--no-deps"])
-    
+
     if not args.skip_verify:
         verify_installation(backend)
 
