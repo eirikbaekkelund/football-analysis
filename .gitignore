@@ -2,5 +2,10 @@ venv/
 __pycache__/
 *.pyc
 .DS_Store
+*.pt
 *.pth
-soccernet/tracking/tracking/
+*.mp4
+*.zip
+soccernet/tracking/*
+soccernet/calibration/*
+*egg-info/

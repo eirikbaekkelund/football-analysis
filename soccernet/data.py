@@ -8,7 +8,7 @@ from PIL import Image
 from typing import List, Dict, Any, Literal
 from torch.utils.data import Dataset
 
-class SoccerNetTrackingDataset(Dataset):
+class PlayerTrackingDataset(Dataset):
     def __init__(
         self, 
         zip_path: str, 
@@ -36,7 +36,11 @@ class SoccerNetTrackingDataset(Dataset):
 
         self._build_index()
 
-    def _build_index(self):
+    def _build_index(self) -> None:
+        """
+        Build index of samples and load annotations from the zip file.
+        NOTE: this reduces repeated file I/O during training and u don't need to unzip files into computer storage
+        """
         fs, _, _ = fsspec.get_fs_token_paths(self.zip_path)
 
         with fs.open(self.zip_path, "rb") as f:
@@ -84,15 +88,14 @@ class SoccerNetTrackingDataset(Dataset):
                 for frame in df["frame"].unique():
                     self.samples.append((seq_name, frame))
         
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.samples)
 
-    def _load_image(self, seq, frame):
+    def _load_image(self, seq: str, frame: int) -> torch.Tensor:
         img_path = f"zip://{seq}/img1/{frame:06d}.jpg::{self.zip_path}"
         with fsspec.open(img_path, "rb") as f:
             img: Image.Image = Image.open(BytesIO(f.read())).convert("RGB")
         
-        # Convert to tensor
         img = torch.from_numpy(
             np.array(img)
         ).permute(2, 0, 1)  # [H, W, C] -> [C, H, W]
@@ -135,7 +138,7 @@ class SoccerNetTrackingDataset(Dataset):
         else:
             raise ValueError(f"Unknown bbox format: {self.bbox_format}")
 
-    def _jersey_color_feature(self, image: torch.Tensor, box: np.ndarray):
+    def _jersey_color_feature(self, image: torch.Tensor, box: np.ndarray) -> torch.Tensor:
         """
         Extract jersey color features from a bounding box.
         
@@ -218,7 +221,7 @@ def tracking_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "frames": [b["frame"] for b in batch],
     }
 
-def visualize_sample(sample: Dict[str, Any], bbox_format: str = "xyxy", show_diagnostics: bool = True) -> None:
+def visualize_sample(sample: Dict[str, Any], bbox_format: str = "xyxy") -> None:
     """
     Visualize a sample with bounding boxes.
     
@@ -237,7 +240,7 @@ def visualize_sample(sample: Dict[str, Any], bbox_format: str = "xyxy", show_dia
     img_h, img_w = image.shape[:2]
 
 
-    fig, ax = plt.subplots(1, figsize=(16, 10))
+    _, ax = plt.subplots(1, figsize=(16, 10))
     ax.imshow(image)
 
     for box, track_id in zip(boxes, track_ids):
@@ -269,10 +272,7 @@ def visualize_sample(sample: Dict[str, Any], bbox_format: str = "xyxy", show_dia
 if __name__ == "__main__":
     zip_path = "soccernet/tracking/tracking/train.zip"
     
-    dataset_xywh = SoccerNetTrackingDataset(zip_path, bbox_format="xywh", debug=True)
+    dataset_xywh = PlayerTrackingDataset(zip_path, bbox_format="xywh", debug=True)
     sample_xywh = dataset_xywh[0]
-    visualize_sample(sample_xywh, bbox_format="xywh", show_diagnostics=True)
-    
-    dataset_xyxy = SoccerNetTrackingDataset(zip_path, bbox_format="xyxy", debug=False)
-    sample_xyxy = dataset_xyxy[0]
-    visualize_sample(sample_xyxy, bbox_format="xyxy", show_diagnostics=True)
+    visualize_sample(sample_xywh, bbox_format="xywh",)
+  
