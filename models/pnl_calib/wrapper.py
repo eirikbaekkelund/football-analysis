@@ -7,10 +7,10 @@ import cv2
 import torchvision.transforms as T
 import torchvision.transforms.functional as f
 from PIL import Image
-from model.cls_hrnet import get_cls_net
-from model.cls_hrnet_l import get_cls_net as get_cls_net_l
-from utils.utils_calib import FramebyFrameCalib
-from utils.utils_heatmap import (
+from models.pnl_calib.model.cls_hrnet import get_cls_net
+from models.pnl_calib.model.cls_hrnet_l import get_cls_net as get_cls_net_l
+from models.pnl_calib.utils.utils_calib import FramebyFrameCalib
+from models.pnl_calib.utils.utils_heatmap import (
     get_keypoints_from_heatmap_batch_maxpool,
     get_keypoints_from_heatmap_batch_maxpool_l,
     complete_keypoints,

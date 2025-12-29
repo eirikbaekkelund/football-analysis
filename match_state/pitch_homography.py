@@ -482,8 +482,8 @@ class PitchVisualizer:
         # Colors
         self.pitch_color = (34, 139, 34)  # Forest green
         self.line_color = (255, 255, 255)  # White
-        self.team1_color = (255, 0, 0)  # Red (BGR)
-        self.team2_color = (0, 0, 255)  # Blue (BGR)
+        self.team1_color = (0, 0, 255)  # Red (BGR)
+        self.team2_color = (255, 0, 0)  # Blue (BGR)
         self.unknown_color = (128, 128, 128)  # Gray
 
         # Create base pitch image
@@ -492,7 +492,7 @@ class PitchVisualizer:
     def _pitch_to_pixel(self, x: float, y: float) -> Tuple[int, int]:
         """Convert pitch coordinates (meters) to pixel coordinates."""
         px = int(self.margin + (x + HALF_LENGTH) * self.scale)
-        py = int(self.margin + (HALF_WIDTH - y) * self.scale)  # Flip Y
+        py = int(self.margin + (y + HALF_WIDTH) * self.scale)  # flip y-axis to reflect image coords
         return px, py
 
     def _draw_pitch(self) -> np.ndarray:
@@ -501,12 +501,12 @@ class PitchVisualizer:
         total_height = self.height + 2 * self.margin
         img = np.zeros((total_height, total_width, 3), dtype=np.uint8)
 
-        # Fill pitch area
+        # green pitch area
         cv2.rectangle(
             img, (self.margin, self.margin), (self.margin + self.width, self.margin + self.height), self.pitch_color, -1
         )
 
-        # Draw outer boundary
+        # outer boundary
         cv2.rectangle(
             img,
             self._pitch_to_pixel(-HALF_LENGTH, HALF_WIDTH),
@@ -515,18 +515,18 @@ class PitchVisualizer:
             2,
         )
 
-        # Halfway line
+        # halfway line
         cv2.line(img, self._pitch_to_pixel(0, HALF_WIDTH), self._pitch_to_pixel(0, -HALF_WIDTH), self.line_color, 2)
 
-        # Center circle
+        # center circle
         center = self._pitch_to_pixel(0, 0)
         radius = int(CENTER_CIRCLE_RADIUS * self.scale)
         cv2.circle(img, center, radius, self.line_color, 2)
 
-        # Center spot
+        # center spot
         cv2.circle(img, center, 3, self.line_color, -1)
 
-        # Left penalty area
+        # penalty areas
         cv2.rectangle(
             img,
             self._pitch_to_pixel(-HALF_LENGTH, PENALTY_AREA_WIDTH / 2),
@@ -534,8 +534,6 @@ class PitchVisualizer:
             self.line_color,
             2,
         )
-
-        # Right penalty area
         cv2.rectangle(
             img,
             self._pitch_to_pixel(HALF_LENGTH - PENALTY_AREA_DEPTH, PENALTY_AREA_WIDTH / 2),
@@ -544,7 +542,7 @@ class PitchVisualizer:
             2,
         )
 
-        # Left goal area
+        # goal area boxes
         cv2.rectangle(
             img,
             self._pitch_to_pixel(-HALF_LENGTH, GOAL_AREA_WIDTH / 2),
@@ -552,8 +550,6 @@ class PitchVisualizer:
             self.line_color,
             2,
         )
-
-        # Right goal area
         cv2.rectangle(
             img,
             self._pitch_to_pixel(HALF_LENGTH - GOAL_AREA_DEPTH, GOAL_AREA_WIDTH / 2),
@@ -562,21 +558,17 @@ class PitchVisualizer:
             2,
         )
 
-        # Penalty spots
+        # penalty spots
         left_spot = self._pitch_to_pixel(-HALF_LENGTH + PENALTY_SPOT_DISTANCE, 0)
         right_spot = self._pitch_to_pixel(HALF_LENGTH - PENALTY_SPOT_DISTANCE, 0)
         cv2.circle(img, left_spot, 3, self.line_color, -1)
         cv2.circle(img, right_spot, 3, self.line_color, -1)
-
-        # Penalty arcs (outside penalty area)
-        # Left arc
-        cv2.ellipse(img, left_spot, (radius, radius), 0, -53, 53, self.line_color, 2)  # Arc angles
-        # Right arc
+        # penalty arcs
+        cv2.ellipse(img, left_spot, (radius, radius), 0, -53, 53, self.line_color, 2)
         cv2.ellipse(img, right_spot, (radius, radius), 180, -53, 53, self.line_color, 2)
 
-        # Goals (behind the line)
-        goal_depth = 2.44  # depth of goal
-        # Left goal
+        # goal boxes
+        goal_depth = 2.44
         cv2.rectangle(
             img,
             self._pitch_to_pixel(-HALF_LENGTH - goal_depth, GOAL_WIDTH / 2),
@@ -584,7 +576,6 @@ class PitchVisualizer:
             self.line_color,
             2,
         )
-        # Right goal
         cv2.rectangle(
             img,
             self._pitch_to_pixel(HALF_LENGTH, GOAL_WIDTH / 2),
@@ -639,52 +630,97 @@ class PitchVisualizer:
 
     def draw_with_trails(
         self,
-        pitch_positions: List[Tuple[float, float, int, Optional[int]]],
+        pitch_positions: List[Tuple[float, float, float, float, int, Optional[int]]],  # x, y, vx, vy, id, team
         history: Dict[int, List[Tuple[float, float]]],  # track_id -> [(x, y), ...]
         trail_length: int = 30,
+        draw_vectors: bool = True,
+        draw_dominance: bool = True,
     ) -> np.ndarray:
         """
-        Draw players with movement trails.
+        Draw players with movement trails, directional vectors, and spatial dominance.
 
         Args:
-            pitch_positions: Current positions
+            pitch_positions: Current positions with velocity (x, y, vx, vy, id, team)
             history: Historical positions per track_id
             trail_length: Maximum trail points to show
+            draw_vectors: Whether to draw velocity vectors
+            draw_dominance: Whether to draw spatial dominance heatmap
 
         Returns:
-            Image with players and trails
+            Image with visualization
         """
         img = self.base_pitch.copy()
 
-        # Draw trails first (so players appear on top)
+        # 1. Draw Spatial Dominance Heatmap
+        if draw_dominance:
+            # Get raw influence maps for both teams
+            inf_t0, inf_t1 = self._compute_spatial_dominance(pitch_positions)
+
+            if inf_t0 is not None and inf_t1 is not None:
+                # Normalize to probability [0, 1] to fill the pitch
+                # Add small epsilon to avoid division by zero
+                total = inf_t0 + inf_t1 + 1e-6
+                prob_t1 = inf_t1 / total
+                prob_t0 = inf_t0 / total
+
+                # Create colored overlay
+                # Team 0 (Red) -> Red Channel (2)
+                # Team 1 (Blue) -> Blue Channel (0)
+                # Mixed -> Purple
+
+                overlay = np.zeros_like(img)
+                overlay[:, :, 0] = (prob_t1 * 255).astype(np.uint8)  # Blue
+                overlay[:, :, 2] = (prob_t0 * 255).astype(np.uint8)  # Red
+
+                # Constant alpha for visibility
+                alpha_val = 0.4
+
+                # Mask out areas outside the pitch
+                tl = self._pitch_to_pixel(-HALF_LENGTH, HALF_WIDTH)
+                br = self._pitch_to_pixel(HALF_LENGTH, -HALF_WIDTH)
+
+                # Create mask
+                mask = np.zeros((img.shape[0], img.shape[1]), dtype=np.uint8)
+
+                x_min = min(tl[0], br[0])
+                x_max = max(tl[0], br[0])
+                y_min = min(tl[1], br[1])
+                y_max = max(tl[1], br[1])
+
+                cv2.rectangle(mask, (x_min, y_min), (x_max, y_max), 255, -1)
+
+                # Apply mask to alpha
+                alpha_mask = np.zeros((img.shape[0], img.shape[1]), dtype=np.float32)
+                alpha_mask[mask > 0] = alpha_val
+
+                # Blend
+                for c in range(3):
+                    img[:, :, c] = (img[:, :, c] * (1 - alpha_mask) + overlay[:, :, c] * alpha_mask).astype(np.uint8)
+
+        # 2. Draw trails
         for track_id, positions in history.items():
             if len(positions) < 2:
                 continue
 
-            # Get recent positions
             recent = positions[-trail_length:]
-
-            # Draw trail as fading line
             for i in range(len(recent) - 1):
-                alpha = (i + 1) / len(recent)  # Fade from old to new
+                alpha = (i + 1) / len(recent)
                 x1, y1 = recent[i]
                 x2, y2 = recent[i + 1]
 
                 p1 = self._pitch_to_pixel(x1, y1)
                 p2 = self._pitch_to_pixel(x2, y2)
 
-                # Skip if points are outside pitch
                 if abs(x1) > HALF_LENGTH + 5 or abs(y1) > HALF_WIDTH + 5:
                     continue
                 if abs(x2) > HALF_LENGTH + 5 or abs(y2) > HALF_WIDTH + 5:
                     continue
 
-                # Fading gray color
                 gray = int(100 + 155 * alpha)
                 cv2.line(img, p1, p2, (gray, gray, gray), 2)
 
-        # Draw current positions
-        for x, y, track_id, team_id in pitch_positions:
+        # 3. Draw players and vectors
+        for x, y, vx, vy, track_id, team_id in pitch_positions:
             if abs(x) > HALF_LENGTH + 5 or abs(y) > HALF_WIDTH + 5:
                 continue
 
@@ -697,44 +733,87 @@ class PitchVisualizer:
             else:
                 color = self.unknown_color
 
+            # Draw velocity vector
+            if draw_vectors and (abs(vx) > 0.1 or abs(vy) > 0.1):
+                # Scale velocity for visualization (e.g. 1 second projection)
+                end_x = x + vx * 15  # 15 frames projection (~0.5s)
+                end_y = y + vy * 15
+                px_end, py_end = self._pitch_to_pixel(end_x, end_y)
+                cv2.arrowedLine(img, (px, py), (px_end, py_end), color, 2, tipLength=0.3)
+
             cv2.circle(img, (px, py), 8, color, -1)
             cv2.circle(img, (px, py), 8, (0, 0, 0), 2)
-
             cv2.putText(img, str(track_id), (px - 5, py + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
         return img
 
+    def _compute_spatial_dominance(self, players, resolution=2.0):
+        """
+        Compute spatial dominance map based on player positions and velocities.
+        Returns raw influence maps for Team 0 and Team 1.
+        """
+        # Create grid covering the full image area (including margins)
+        # We need to map pixels back to meters to evaluate the Gaussian
 
-if __name__ == "__main__":
-    # Test visualization
-    viz = PitchVisualizer()
+        h_img, w_img = self.height + 2 * self.margin, self.width + 2 * self.margin
 
-    # Some test player positions
-    test_positions = [
-        (0, 0, 1, 0),  # Center, team 0
-        (-30, 10, 2, 0),  # Left midfield, team 0
-        (-45, 0, 3, 0),  # Goalkeeper area, team 0
-        (20, -15, 4, 1),  # Right side, team 1
-        (35, 5, 5, 1),  # Attack, team 1
-        (10, 25, 6, None),  # Unknown team
-    ]
+        # Create coordinate grid in pixels
+        # Downsample for speed
+        scale_factor = 0.25
+        h_small, w_small = int(h_img * scale_factor), int(w_img * scale_factor)
 
-    img = viz.draw_players(test_positions)
+        x_indices = np.arange(w_small)
+        y_indices = np.arange(h_small)
+        X_pix, Y_pix = np.meshgrid(x_indices, y_indices)
 
-    cv2.imwrite("test_pitch.png", img)
-    print("Saved test_pitch.png")
+        # Convert pixel coordinates to pitch coordinates (meters)
+        # Inverse of _pitch_to_pixel logic
+        # px = margin + (x + HALF_LENGTH) * scale
+        # x = (px - margin) / scale - HALF_LENGTH
 
-    # Test homography estimator
-    print("\nTesting HomographyEstimator...")
-    estimator = HomographyEstimator()
+        X_meters = (X_pix / scale_factor - self.margin) / self.scale - HALF_LENGTH
+        # py = margin + (y + HALF_WIDTH) * scale
+        # y = (py - margin) / scale - HALF_WIDTH
+        Y_meters = (Y_pix / scale_factor - self.margin) / self.scale - HALF_WIDTH
 
-    # Simulate some keypoint detections (would come from line detector)
-    num_classes = 28
-    max_points = 12
-    keypoints = torch.rand(num_classes, max_points, 2)
-    visibility = torch.rand(num_classes, max_points)
-    confidence = torch.rand(num_classes)
+        influence_t0 = np.zeros_like(X_meters)
+        influence_t1 = np.zeros_like(X_meters)
 
-    # This won't produce a good homography with random data, but tests the API
-    success = estimator.estimate(keypoints, visibility, confidence, (1080, 1920))
-    print(f"Homography estimation: {'Success' if success else 'Failed (expected with random data)'}")
+        for px, py, vx, vy, _, team_id in players:
+            if team_id not in [0, 1]:
+                continue
+
+            # Gaussian parameters
+            speed = np.sqrt(vx**2 + vy**2)
+            angle = np.arctan2(vy, vx)  # Note: vy is in pitch coords (meters/frame)
+
+            # Shift center based on momentum (0.5s projection)
+            # This makes influence extend forward and lag behind
+            mu_x = px + vx * 15.0  # 15 frames ~ 0.5s
+            mu_y = py + vy * 15.0
+
+            # Base influence radius (meters)
+            sigma_x = 4.0 * (1 + speed * 0.5)  # Elongate with speed
+            sigma_y = 4.0
+
+            # Rotate grid coordinates to align with player velocity
+            dx = X_meters - mu_x
+            dy = Y_meters - mu_y
+
+            # Standard rotation
+            dx_rot = dx * np.cos(angle) + dy * np.sin(angle)
+            dy_rot = -dx * np.sin(angle) + dy * np.cos(angle)
+
+            # Compute Gaussian
+            g = np.exp(-(dx_rot**2 / (2 * sigma_x**2) + dy_rot**2 / (2 * sigma_y**2)))
+
+            if team_id == 0:
+                influence_t0 += g
+            else:
+                influence_t1 += g
+
+        # Resize back to full image size
+        inf_t0_full = cv2.resize(influence_t0, (w_img, h_img))
+        inf_t1_full = cv2.resize(influence_t1, (w_img, h_img))
+
+        return inf_t0_full, inf_t1_full

@@ -6,7 +6,9 @@ from ultralytics import YOLO
 from match_state.player_tracker import TeamClassifier
 
 
-def process_video(video_path: str, model_path: str, max_duration: float = None, show_fps: bool = True) -> None:
+def process_video(
+    video_path: str, model_path: str, max_duration: float = None, show_fps: bool = True, tracker: str = None
+) -> None:
     print(f"Loading YOLO model from {model_path}...")
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = YOLO(model_path)
@@ -51,7 +53,7 @@ def process_video(video_path: str, model_path: str, max_duration: float = None, 
 
         start = time.perf_counter()
 
-        results = model.track(frame_bgr, persist=True, tracker="bytetrack.yaml", verbose=False)
+        results = model.track(frame_bgr, persist=True, tracker=f"{tracker}.yaml", verbose=False)
 
         tracks_list = []
         if results[0].boxes.id is not None:
@@ -97,10 +99,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=str, default="videos/croatia_czechia.mp4", help="Path to input video file")
     parser.add_argument(
-        "--model", type=str, default="tracking_models/yolo/yolov8_player_tracker.pt", help="Path to YOLO model"
+        "--model", type=str, default="models/tracking/yolo/yolo11_player_tracker.pt", help="Path to YOLO model"
     )
     parser.add_argument("--duration", type=float, default=15, help="Max duration in seconds to process")
-
+    parser.add_argument("--tracker", type=str, default="botsort", help="Optional YOLO tracker yaml file")
     args = parser.parse_args()
 
-    process_video(args.input, args.model, args.duration)
+    process_video(args.input, args.model, args.duration, tracker=args.tracker)

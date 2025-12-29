@@ -1,28 +1,97 @@
-"""
-Full pipeline example: Player tracking with 2D pitch projection.
-
-This script demonstrates:
-1. Player detection (YOLO)
-2. Player tracking with team classification
-3. Line detection for camera calibration
-4. Homography estimation
-5. 2D pitch visualization with player positions
-
-Usage:
-    python examples/pitch_projection_demo.py --video input.mp4 --output output.mp4
-"""
-
 import argparse
 import cv2
 import torch
 import numpy as np
 import os
 from typing import Dict, List, Tuple
-from collections import defaultdict
 
 from match_state.player_tracker import TeamClassifier
 from match_state.pitch_homography import HomographyEstimator, PitchVisualizer, PITCH_LINE_COORDINATES
 from models.pnl_calib.wrapper import PnLCalibWrapper
+
+
+class PitchTrackManager:
+    """
+    Manages player tracks on the pitch plane with smoothing and persistence.
+    """
+
+    def __init__(self, max_missing_frames: int = 15, smoothing_alpha: float = 0.2):
+        self.tracks = {}  # id -> {pos: (x,y), velocity: (vx,vy), last_seen: frame_idx, team: int, history: []}
+        self.max_missing_frames = max_missing_frames
+        self.alpha = smoothing_alpha
+
+    def update(
+        self, observations: List[Tuple[float, float, int, int]], frame_idx: int
+    ) -> List[Tuple[float, float, float, float, int, int]]:
+        """
+        Update tracks with new observations.
+
+        Args:
+            observations: List of (x, y, track_id, team_id)
+            frame_idx: Current frame number
+
+        Returns:
+            List of active tracks (x, y, vx, vy, track_id, team_id)
+        """
+        observed_ids = set()
+
+        for x, y, tid, team in observations:
+            observed_ids.add(tid)
+
+            if tid not in self.tracks:
+                self.tracks[tid] = {
+                    "pos": (x, y),
+                    "velocity": (0.0, 0.0),
+                    "last_seen": frame_idx,
+                    "team": team,
+                    "history": [(x, y)],
+                }
+            else:
+                # smooth position
+                prev_x, prev_y = self.tracks[tid]["pos"]
+
+                # exponential smoothing for potential jitter reduction of positions
+                smooth_x = prev_x * (1 - self.alpha) + x * self.alpha
+                smooth_y = prev_y * (1 - self.alpha) + y * self.alpha
+
+                # velocity (pixels/frame)
+                vx = smooth_x - prev_x
+                vy = smooth_y - prev_y
+
+                self.tracks[tid]["pos"] = (smooth_x, smooth_y)
+                self.tracks[tid]["velocity"] = (vx, vy)
+                self.tracks[tid]["last_seen"] = frame_idx
+                if team is not None:
+                    self.tracks[tid]["team"] = team
+
+                self.tracks[tid]["history"].append((smooth_x, smooth_y))
+                if len(self.tracks[tid]["history"]) > 50:
+                    self.tracks[tid]["history"].pop(0)
+
+        # Handle missing tracks
+        active_tracks = []
+        to_remove = []
+
+        for tid, track in self.tracks.items():
+            if tid not in observed_ids:
+                # decay velocity for stationary ghosts
+                vx, vy = track["velocity"]
+                track["velocity"] = (vx * 0.9, vy * 0.9)
+
+            if frame_idx - track["last_seen"] <= self.max_missing_frames:
+                x, y = track["pos"]
+                vx, vy = track["velocity"]
+                active_tracks.append((x, y, vx, vy, tid, track["team"]))
+            else:
+                to_remove.append(tid)
+
+        for tid in to_remove:
+            del self.tracks[tid]
+
+        return active_tracks
+
+    def get_history(self) -> Dict[int, List[Tuple[float, float]]]:
+        return {tid: track["history"] for tid, track in self.tracks.items()}
 
 
 def load_pnl_calib(device: torch.device):
@@ -40,45 +109,22 @@ def load_pnl_calib(device: torch.device):
     return PnLCalibWrapper(weights_kp, weights_line, config_kp, config_line, device=str(device))
 
 
-def load_player_detector(device: torch.device):
+def load_player_detector(model_path: str, device: torch.device):
     """Load YOLO model for player detection and tracking."""
     from ultralytics import YOLO
 
-    # Using YOLO11n as requested for better tracking support
+    print(f"Loading YOLO model from {model_path}...")
     try:
-        model = YOLO("yolo11n.pt")
+        model = YOLO(model_path)
     except Exception as e:
-        print(f"Could not load yolo11n.pt, falling back to yolov8m.pt. Error: {e}")
-        model = YOLO("yolov8m.pt")
+        print(f"Could not load {model_path}. Error: {e}")
+        if "yolo11n.pt" in model_path:
+            print("Falling back to yolov8m.pt...")
+            model = YOLO("yolov8m.pt")
+        else:
+            raise e
 
     return model
-
-
-def detect_players(
-    model,
-    frame: np.ndarray,
-    conf_threshold: float = 0.3,
-) -> List[List[float]]:
-    """
-    Detect players using YOLO.
-
-    Returns:
-        List of [x1, y1, x2, y2, score] detections
-    """
-    results = model(frame, verbose=False, conf=conf_threshold)
-
-    detections = []
-    for result in results:
-        boxes = result.boxes
-        for i in range(len(boxes)):
-            cls = int(boxes.cls[i])
-            # COCO class 0 = person
-            if cls == 0:
-                x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy()
-                score = float(boxes.conf[i])
-                detections.append([x1, y1, x2, y2, score])
-
-    return detections
 
 
 def create_combined_visualization(
@@ -87,6 +133,7 @@ def create_combined_visualization(
     tracks: List[dict],
     homography_ok: bool,
     num_inliers: int = 0,
+    pitch_viz: PitchVisualizer = None,
 ) -> np.ndarray:
     """
     Create side-by-side visualization of video frame and pitch map.
@@ -94,12 +141,11 @@ def create_combined_visualization(
     h, w = frame.shape[:2]
     pitch_h, pitch_w = pitch_img.shape[:2]
 
-    # Scale pitch to match frame height
+    # scale pitch to match frame height
     scale = h / pitch_h
     new_pitch_w = int(pitch_w * scale)
     pitch_scaled = cv2.resize(pitch_img, (new_pitch_w, h))
 
-    # Draw tracking boxes on frame
     frame_viz = frame.copy()
     for track in tracks:
         box = track["box"]
@@ -108,27 +154,23 @@ def create_combined_visualization(
 
         x1, y1, x2, y2 = map(int, box)
 
-        # Team colors
         if team_id == 0:
-            color = (0, 0, 255)  # Red
+            color = pitch_viz.team1_color if pitch_viz else (255, 0, 0)
         elif team_id == 1:
-            color = (255, 0, 0)  # Blue
+            color = pitch_viz.team2_color if pitch_viz else (0, 0, 255)
         else:
-            color = (128, 128, 128)  # Gray
+            color = pitch_viz.unknown_color if pitch_viz else (128, 128, 128)
 
         cv2.rectangle(frame_viz, (x1, y1), (x2, y2), color, 2)
         cv2.putText(frame_viz, f"#{track_id}", (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        # Draw foot position
         foot_x, foot_y = int((x1 + x2) / 2), int(y2)
         cv2.circle(frame_viz, (foot_x, foot_y), 4, (0, 255, 0), -1)
 
-    # Add homography status
     status_color = (0, 255, 0) if homography_ok else (0, 0, 255)
     status_text = f"Homography: {'OK' if homography_ok else 'Failed'} ({num_inliers} inliers)"
     cv2.putText(frame_viz, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
 
-    # Combine horizontally
     combined = np.hstack([frame_viz, pitch_scaled])
 
     return combined
@@ -149,36 +191,33 @@ def draw_pitch_overlay(
     frame_viz = frame.copy()
     h, w = frame.shape[:2]
 
-    # Draw all defined pitch lines
+    # draw all defined pitch lines
     for class_name, points in PITCH_LINE_COORDINATES.items():
-        # Get pitch points for this line
         pitch_pts = np.array([p.to_array() for _, p in points])
 
-        # Project to image
         img_pts = homography.project_to_image(pitch_pts)
 
         if img_pts is None:
             continue
 
-        # Filter points outside image
+        # filter out points outside image
         valid_pts = []
         for pt in img_pts:
             x, y = int(pt[0]), int(pt[1])
-            # Allow some margin outside image
+            # allow some margin outside image
             if -1000 < x < w + 1000 and -1000 < y < h + 1000:
                 valid_pts.append((x, y))
 
         if len(valid_pts) < 2:
             continue
 
-        # Draw lines
+        # drawing lines
         if "Circle" in class_name:
-            # Draw as closed loop if enough points
+            # closed loop if enough points
             if len(valid_pts) >= 3:
                 pts = np.array(valid_pts, dtype=np.int32)
                 cv2.polylines(frame_viz, [pts], isClosed=True, color=color, thickness=thickness)
         else:
-            # Draw as connected segments
             for i in range(len(valid_pts) - 1):
                 cv2.line(frame_viz, valid_pts[i], valid_pts[i + 1], color, thickness)
 
@@ -189,7 +228,15 @@ def main():
     parser = argparse.ArgumentParser(description="Player tracking with pitch projection")
     parser.add_argument("--video", type=str, default="videos/croatia_czechia.mp4", help="Input video path")
     parser.add_argument("--output", type=str, default="output_2d_test.mp4", help="Output video path")
+    parser.add_argument(
+        "--model", type=str, default="models/tracking/yolo/yolov11_player_tracker.pt", help="Path to YOLO model"
+    )
+    parser.add_argument("--classes", type=int, nargs="+", default=None, help="Classes to track (default: auto)")
     parser.add_argument("--homography-interval", type=int, default=5, help="Frames between homography updates")
+    parser.add_argument("--ghost-frames", type=int, default=15, help="Frames to keep lost tracks alive")
+    parser.add_argument("--smooth-alpha", type=float, default=0.2, help="Smoothing factor (0.0-1.0)")
+    parser.add_argument("--no-vectors", action="store_true", help="Disable velocity vectors")
+    parser.add_argument("--no-dominance", action="store_true", help="Disable spatial dominance heatmap")
     parser.add_argument("--show", action="store_true", help="Show live preview")
     parser.add_argument("--duration", type=int, default=60, help="Output video duration in seconds")
     parser.add_argument(
@@ -200,16 +247,20 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Load models
-    print("Loading PnLCalib model...")
     pnl_calib = load_pnl_calib(device)
+    player_detector = load_player_detector(args.model, device)
 
-    print("Loading player detector...")
-    player_detector = load_player_detector(device)
+    track_classes = args.classes
+    if track_classes is None:
+        names = player_detector.names
+        if 0 in names and names[0] == 'person':
+            track_classes = [0]
+        else:
+            track_classes = list(names.keys())
+    print(f"Tracking classes: {track_classes}")
 
-    # Initialize tracker and homography
-    # tracker = PlayerTracker() # Deprecated in favor of YOLO11 tracking
     team_classifier = TeamClassifier()
+    track_manager = PitchTrackManager(max_missing_frames=args.ghost_frames, smoothing_alpha=args.smooth_alpha)
 
     homography = HomographyEstimator(
         min_correspondences=6,
@@ -218,10 +269,7 @@ def main():
     )
     pitch_viz = PitchVisualizer()
 
-    # Position history for trails
-    position_history: Dict[int, List[Tuple[float, float]]] = defaultdict(list)
-
-    # Open video
+    cap = cv2.VideoCapture(args.video)
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():
         print(f"Error: Could not open video {args.video}")
@@ -232,14 +280,11 @@ def main():
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Limit output to requested duration
     max_frames = min(fps * args.duration, total_frames)
 
     print(f"Video: {frame_w}x{frame_h} @ {fps}fps, {total_frames} frames")
     print(f"Output limited to {args.duration}s ({max_frames} frames)")
 
-    # Setup output video
-    # Combined width = frame + scaled pitch
     pitch_h, pitch_w = pitch_viz.base_pitch.shape[:2]
     scale = frame_h / pitch_h
     output_w = frame_w + int(pitch_w * scale)
@@ -261,16 +306,15 @@ def main():
 
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # Update homography periodically
             if frame_idx % args.homography_interval == 0:
                 P = pnl_calib.process_frame(frame)
                 if P is not None:
                     # P maps (x, y, 0, 1) to (u, v, w)
                     # H maps (x, y, 1) to (u, v, w)
-                    # So H is columns 0, 1, 3 of P
+                    # s.t. H is columns 0, 1, 3 of P
                     H_inv = P[:, [0, 1, 3]]
 
-                    # Normalize H_inv
+                    # H_inv normalization
                     if H_inv[2, 2] != 0:
                         H_inv /= H_inv[2, 2]
 
@@ -283,11 +327,10 @@ def main():
                 else:
                     homography_ok = False
 
-            # Detect and track players
             # Run YOLO11 tracking with BoT-SORT
-            # persist=True maintains tracks between frames
-            # classes=[0] filters for persons only
-            results = player_detector.track(frame, persist=True, tracker="botsort.yaml", verbose=False, classes=[0])
+            results = player_detector.track(
+                frame, persist=True, tracker="botsort.yaml", verbose=False, classes=track_classes
+            )
 
             tracks = []
             if results and results[0].boxes.id is not None:
@@ -298,40 +341,35 @@ def main():
                 for box, track_id in zip(boxes, track_ids):
                     raw_tracks.append({'box': box.tolist(), 'id': int(track_id)})
 
-                # Update team classification
                 tracks = team_classifier.update(raw_tracks, frame_rgb)
 
-            # Project to pitch coordinates
-            pitch_positions = []
+            current_observations = []
             for track in tracks:
                 if homography_ok:
                     pitch_pos = homography.project_player_to_pitch(track["box"])
                     if pitch_pos is not None:
                         x, y = pitch_pos
-                        pitch_positions.append((x, y, track["id"], track.get("team")))
+                        current_observations.append((x, y, track["id"], track.get("team")))
 
-                        # Update history
-                        position_history[track["id"]].append((x, y))
-                        # Limit history length
-                        if len(position_history[track["id"]]) > 100:
-                            position_history[track["id"]] = position_history[track["id"]][-100:]
+            active_pitch_positions = track_manager.update(current_observations, frame_idx)
 
-            # Draw pitch visualization
-            if pitch_positions:
-                pitch_img = pitch_viz.draw_with_trails(pitch_positions, position_history)
+            if active_pitch_positions:
+                pitch_img = pitch_viz.draw_with_trails(
+                    active_pitch_positions,
+                    track_manager.get_history(),
+                    draw_vectors=not args.no_vectors,
+                    draw_dominance=not args.no_dominance,
+                )
             else:
                 pitch_img = pitch_viz.base_pitch.copy()
 
-            # Draw reprojected pitch lines (debug)
             if args.debug_overlay and homography_ok:
                 frame = draw_pitch_overlay(frame, homography)
 
-            # Create combined visualization
             combined = create_combined_visualization(
-                frame, pitch_img, tracks, homography_ok, num_inliers=0  # PnLCalib doesn't return inliers count easily
+                frame, pitch_img, tracks, homography_ok, num_inliers=0, pitch_viz=pitch_viz
             )
 
-            # Write output
             out.write(combined)
 
             if args.show:
