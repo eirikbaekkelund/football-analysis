@@ -66,7 +66,7 @@ def get_jersey_color_class(img_pil, box):
     return 0  # Other (Purple, Orange, etc.)
 
 
-def convert_to_yolo_format(zip_path, output_dir):
+def convert_to_yolo_format(zip_path, output_dir, use_colors=True):
     """
     Extracts images from zip and converts GT to YOLO format.
     YOLO format: class_id x_center y_center width height (normalized 0-1)
@@ -79,7 +79,7 @@ def convert_to_yolo_format(zip_path, output_dir):
     images_dir.mkdir(parents=True, exist_ok=True)
     labels_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Converting data from {zip_path} to YOLO format in {output_dir}...")
+    print(f"Converting data from {zip_path} to YOLO format in {output_dir} (use_colors={use_colors})...")
 
     # Use fsspec to read zip without extracting everything first
     fs = fsspec.filesystem("zip", fo=zip_path)
@@ -152,12 +152,17 @@ def convert_to_yolo_format(zip_path, output_dir):
 
                 x, y, w, h = row["x"], row["y"], row["w"], row["h"]
 
-                if cache_key in track_color_cache:
-                    color_class = track_color_cache[cache_key]
+                if use_colors:
+                    if cache_key in track_color_cache:
+                        color_class = track_color_cache[cache_key]
+                    else:
+                        color_class = get_jersey_color_class(img, (x, y, w, h))
+                        if color_class != 0:
+                            track_color_cache[cache_key] = color_class
+                    cls = color_class
                 else:
-                    color_class = get_jersey_color_class(img, (x, y, w, h))
-                    if color_class != 0:
-                        track_color_cache[cache_key] = color_class
+                    # Default to single class 'player'
+                    cls = 0
 
                 cx = (x + w / 2) / img_w
                 cy = (y + h / 2) / img_h
@@ -169,23 +174,32 @@ def convert_to_yolo_format(zip_path, output_dir):
                 nw = np.clip(nw, 0, 1)
                 nh = np.clip(nh, 0, 1)
 
-                yolo_lines.append(f"{color_class} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}")
+                yolo_lines.append(f"{cls} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}")
 
             with open(labels_dir / f"{save_name}.txt", "w") as f:
                 f.write("\n".join(yolo_lines))
+
+    if use_colors:
+        names_yaml = """
+        names:
+          0: player_other
+          1: player_white
+          2: player_black
+          3: player_red
+          4: player_blue
+          5: player_yellow
+          6: player_green"""
+    else:
+        names_yaml = """
+        names:
+          0: player"""
 
     yaml_content = f"""
         path: {output_dir.absolute()}
         train: images/train
         val: images/train
-        names:
-        0: player_other
-        1: player_white
-        2: player_black
-        3: player_red
-        4: player_blue
-        5: player_yellow
-        6: player_green"""
+{names_yaml}
+    """
 
     with open(output_dir / "dataset.yaml", "w") as f:
         f.write(yaml_content)
@@ -194,30 +208,54 @@ def convert_to_yolo_format(zip_path, output_dir):
 
 
 def train_yolo():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-colors", action="store_true", help="Disable jersey color classification")
+    args = parser.parse_args()
+
+    use_colors = not args.no_colors
+
+    # Allow user to specify dataset path via env var or argument, default to local conversion
+    DATA_DIR = os.environ.get("YOLO_DATASET_DIR", "yolo_dataset")
+    if use_colors:
+        DATA_DIR += "_colors"
+
     ZIP_PATH = "soccernet/tracking/tracking/train.zip"
-    if os.path.exists("/workspace"):
-        DATA_DIR = "/workspace/yolo_dataset"
-    else:
-        DATA_DIR = "yolo_dataset"
 
     if not os.path.exists(DATA_DIR):
-        convert_to_yolo_format(ZIP_PATH, DATA_DIR)
+        print(f"Dataset not found at {DATA_DIR}. Attempting to convert from {ZIP_PATH}...")
+        if os.path.exists(ZIP_PATH):
+            convert_to_yolo_format(ZIP_PATH, DATA_DIR, use_colors=use_colors)
+        else:
+            print(f"Warning: Zip file {ZIP_PATH} not found. Please ensure you have a dataset prepared in {DATA_DIR}")
+            # We continue, assuming the user might have mounted data there or will provide it
     else:
         print(f"Dataset found at {DATA_DIR}, skipping conversion.")
 
-    model = YOLO("yolov8m.pt")
+    # Load YOLO11 model (nano version as requested, or use 'yolo11m.pt' for medium)
+    try:
+        model = YOLO("yolo11n.pt")
+    except Exception as e:
+        print(f"Could not load yolo11n.pt: {e}. Please ensure ultralytics is updated.")
+        return
 
+    project_name = "football_yolo_colors" if use_colors else "football_yolo_simple"
+
+    # Train the model
     results = model.train(
         data=f"{DATA_DIR}/dataset.yaml",
-        epochs=10,
+        epochs=50,  # Increased epochs as per recommendation
         imgsz=640,
-        batch=64,
-        device=0,  # NOTE: assumes single gpu, can be adjusted
-        project="football_yolo",
-        name="yolov8m_run",
+        batch=32,  # Adjusted batch size
+        device=0,
+        project=project_name,
+        name="yolo11n_football",
+        exist_ok=True,
+        plots=True,
     )
 
-    print(f"Best model saved at: {results.save_dir}/weights/yolov8_player_tracker.pt")
+    print(f"Best model saved at: {results.save_dir}/weights/best.pt")
 
 
 if __name__ == "__main__":

@@ -313,6 +313,11 @@ class LineKeypointDataset(Dataset):
             points = annotations[class_name]
             is_circle = class_name in CIRCLE_CLASSES
 
+            # Sort points for lines to ensure canonical order (left-to-right)
+            # This prevents the model from being confused by random point ordering in GT
+            if not is_circle and len(points) > 1:
+                points = sorted(points, key=lambda p: (p["x"], p["y"]))
+
             max_allowed = max_pts if is_circle else self.MAX_LINE_POINTS
             for i, p in enumerate(points[:max_allowed]):
                 keypoints[class_idx, i, 0] = p["x"]

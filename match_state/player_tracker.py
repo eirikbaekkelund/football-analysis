@@ -179,6 +179,108 @@ class KalmanTrack:
         return [x1, y1, x2, y2]
 
 
+class TeamClassifier:
+    """
+    Classifies players into teams based on jersey color.
+    Designed to work with external trackers (like YOLO11 BoT-SORT).
+    """
+
+    def __init__(self):
+        self.team_state = {}  # track_id -> {'team_belief': float, 'color_feature': np.array}
+        self.gmm = None
+        self.team_centers = None
+        self.color_buffer = []
+        self.fitting_complete = False
+
+    def update(self, tracks: List[dict], image_rgb: np.ndarray) -> List[dict]:
+        """
+        Update team classification for the given tracks.
+
+        Args:
+            tracks: List of dicts with 'id', 'box' keys.
+            image_rgb: Current frame.
+
+        Returns:
+            List of tracks with added 'team' key.
+        """
+        active_ids = set()
+
+        for track in tracks:
+            track_id = track['id']
+            box = track['box']
+            active_ids.add(track_id)
+
+            color_feat = get_jersey_color_feature(image_rgb, box)
+
+            if track_id not in self.team_state:
+                self.team_state[track_id] = {'team_belief': 0.0, 'color_feature': color_feat, 'hits': 1}
+            else:
+                old_feat = self.team_state[track_id]['color_feature']
+                self.team_state[track_id]['color_feature'] = 0.9 * old_feat + 0.1 * color_feat
+                self.team_state[track_id]['hits'] += 1
+
+        valid_colors = []
+        for track in tracks:
+            tid = track['id']
+            feat = self.team_state[tid]['color_feature']
+            if np.linalg.norm(feat) > 0:
+                valid_colors.append(feat)
+
+        # Fit GMM if needed
+        if not self.fitting_complete:
+            self.color_buffer.extend(valid_colors)
+            if len(self.color_buffer) > 300:
+                print("Fitting Team Colors with GMM...")
+                data = np.array(self.color_buffer)
+                self.gmm = GaussianMixture(n_components=2, covariance_type='full', random_state=42, n_init=3)
+                self.gmm.fit(data)
+                self.team_centers = self.gmm.means_
+                self.fitting_complete = True
+                self.color_buffer = []
+
+        # Predict teams
+        if self.fitting_complete and valid_colors:
+            features = np.array(valid_colors)
+            predictions = self.gmm.predict(features)
+            probs = self.gmm.predict_proba(features)
+
+            for i, track in enumerate(tracks):
+                tid = track['id']
+                feat = self.team_state[tid]['color_feature']
+
+                if np.linalg.norm(feat) == 0:
+                    continue
+
+                pred = predictions[i]
+                confidence = probs[i].max()
+
+                if confidence < 0.6:
+                    continue
+
+                # Check distance to center
+                dist = np.linalg.norm(feat - self.team_centers[pred])
+                if dist > 80:
+                    continue
+
+                vote = -1.0 if pred == 0 else 1.0
+
+                # Update belief
+                current_belief = self.team_state[tid]['team_belief']
+                if current_belief == 0.0:
+                    self.team_state[tid]['team_belief'] = vote
+                else:
+                    alpha = 0.1 * confidence
+                    self.team_state[tid]['team_belief'] = (1 - alpha) * current_belief + alpha * vote
+
+        # Assign teams to tracks
+        for track in tracks:
+            tid = track['id']
+            belief = self.team_state[tid]['team_belief']
+            track['team'] = 1 if belief > 0 else 0
+
+        return tracks
+
+
 class PlayerTracker:
     """
     Multi-object tracker with jersey color-based team clustering.
@@ -321,6 +423,13 @@ class PlayerTracker:
         for t in self.tracks:
             if t.hits >= 3 and t.time_since_update < 5:
                 res_box = t.get_state()
-                results.append({'box': res_box, 'id': t.id, 'team': t.team_id})
+                results.append(
+                    {
+                        'box': res_box,
+                        'id': t.id,
+                        'team': t.team_id,
+                        'foot_position': ((res_box[0] + res_box[2]) / 2, res_box[3]),  # Bottom-center
+                    }
+                )
 
         return results

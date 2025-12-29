@@ -9,3 +9,5 @@ __pycache__/
 soccernet/tracking/*
 soccernet/calibration/*
 *egg-info/
+yolo_dataset/
+SV_*

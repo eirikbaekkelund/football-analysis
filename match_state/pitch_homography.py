@@ -1,0 +1,740 @@
+"""
+Homography estimation for projecting camera view to 2D pitch coordinates.
+
+Uses detected line keypoints from the line detector to compute a homography matrix
+that maps pixel coordinates to real-world pitch coordinates (in meters).
+
+Standard pitch dimensions (FIFA regulations):
+- Length: 105m (touchline)
+- Width: 68m (goal line)
+- Origin: center of pitch (0, 0)
+- X-axis: along touchline (-52.5 to 52.5)
+- Y-axis: along goal line (-34 to 34)
+"""
+
+import cv2
+import numpy as np
+import torch
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+
+
+# Standard FIFA pitch dimensions (in meters)
+PITCH_LENGTH = 105.0  # touchline length
+PITCH_WIDTH = 68.0  # goal line length
+
+# Derived measurements
+HALF_LENGTH = PITCH_LENGTH / 2  # 52.5m
+HALF_WIDTH = PITCH_WIDTH / 2  # 34m
+
+# Penalty area: 40.32m wide, 16.5m from goal line
+PENALTY_AREA_WIDTH = 40.32
+PENALTY_AREA_DEPTH = 16.5
+
+# Goal area: 18.32m wide, 5.5m from goal line
+GOAL_AREA_WIDTH = 18.32
+GOAL_AREA_DEPTH = 5.5
+
+# Center circle radius
+CENTER_CIRCLE_RADIUS = 9.15
+
+# Penalty spot distance from goal line
+PENALTY_SPOT_DISTANCE = 11.0
+
+# Goal dimensions
+GOAL_WIDTH = 7.32
+GOAL_HEIGHT = 2.44
+
+
+@dataclass
+class PitchPoint:
+    """A point on the pitch in real-world coordinates (meters)."""
+
+    x: float  # Along touchline, -52.5 (left) to 52.5 (right)
+    y: float  # Along goal line, -34 (bottom) to 34 (top)
+
+    def to_array(self) -> np.ndarray:
+        return np.array([self.x, self.y], dtype=np.float32)
+
+
+# Mapping from line class keypoints to pitch coordinates
+# Each line class maps to a list of (keypoint_index, PitchPoint) tuples
+# Based on SoccerNet calibration annotation conventions
+
+PITCH_LINE_COORDINATES: Dict[str, List[Tuple[int, PitchPoint]]] = {
+    # Side lines (touchlines)
+    "Side line top": [
+        (0, PitchPoint(-HALF_LENGTH, HALF_WIDTH)),  # Top-left corner
+        (1, PitchPoint(HALF_LENGTH, HALF_WIDTH)),  # Top-right corner
+    ],
+    "Side line bottom": [
+        (0, PitchPoint(-HALF_LENGTH, -HALF_WIDTH)),  # Bottom-left corner
+        (1, PitchPoint(HALF_LENGTH, -HALF_WIDTH)),  # Bottom-right corner
+    ],
+    "Side line left": [
+        (0, PitchPoint(-HALF_LENGTH, -HALF_WIDTH)),  # Bottom-left corner
+        (1, PitchPoint(-HALF_LENGTH, HALF_WIDTH)),  # Top-left corner
+    ],
+    "Side line right": [
+        (0, PitchPoint(HALF_LENGTH, -HALF_WIDTH)),  # Bottom-right corner
+        (1, PitchPoint(HALF_LENGTH, HALF_WIDTH)),  # Top-right corner
+    ],
+    # Middle line (halfway line)
+    "Middle line": [
+        (0, PitchPoint(0, -HALF_WIDTH)),  # Bottom of halfway line
+        (1, PitchPoint(0, HALF_WIDTH)),  # Top of halfway line
+    ],
+    # Big rectangle (penalty area) - LEFT side
+    "Big rect. left main": [
+        (0, PitchPoint(-HALF_LENGTH + PENALTY_AREA_DEPTH, -PENALTY_AREA_WIDTH / 2)),
+        (1, PitchPoint(-HALF_LENGTH + PENALTY_AREA_DEPTH, PENALTY_AREA_WIDTH / 2)),
+    ],
+    "Big rect. left top": [
+        (0, PitchPoint(-HALF_LENGTH, PENALTY_AREA_WIDTH / 2)),
+        (1, PitchPoint(-HALF_LENGTH + PENALTY_AREA_DEPTH, PENALTY_AREA_WIDTH / 2)),
+    ],
+    "Big rect. left bottom": [
+        (0, PitchPoint(-HALF_LENGTH, -PENALTY_AREA_WIDTH / 2)),
+        (1, PitchPoint(-HALF_LENGTH + PENALTY_AREA_DEPTH, -PENALTY_AREA_WIDTH / 2)),
+    ],
+    # Big rectangle (penalty area) - RIGHT side
+    "Big rect. right main": [
+        (0, PitchPoint(HALF_LENGTH - PENALTY_AREA_DEPTH, -PENALTY_AREA_WIDTH / 2)),
+        (1, PitchPoint(HALF_LENGTH - PENALTY_AREA_DEPTH, PENALTY_AREA_WIDTH / 2)),
+    ],
+    "Big rect. right top": [
+        (0, PitchPoint(HALF_LENGTH - PENALTY_AREA_DEPTH, PENALTY_AREA_WIDTH / 2)),
+        (1, PitchPoint(HALF_LENGTH, PENALTY_AREA_WIDTH / 2)),
+    ],
+    "Big rect. right bottom": [
+        (0, PitchPoint(HALF_LENGTH - PENALTY_AREA_DEPTH, -PENALTY_AREA_WIDTH / 2)),
+        (1, PitchPoint(HALF_LENGTH, -PENALTY_AREA_WIDTH / 2)),
+    ],
+    # Small rectangle (goal area) - LEFT side
+    "Small rect. left main": [
+        (0, PitchPoint(-HALF_LENGTH + GOAL_AREA_DEPTH, -GOAL_AREA_WIDTH / 2)),
+        (1, PitchPoint(-HALF_LENGTH + GOAL_AREA_DEPTH, GOAL_AREA_WIDTH / 2)),
+    ],
+    "Small rect. left top": [
+        (0, PitchPoint(-HALF_LENGTH, GOAL_AREA_WIDTH / 2)),
+        (1, PitchPoint(-HALF_LENGTH + GOAL_AREA_DEPTH, GOAL_AREA_WIDTH / 2)),
+    ],
+    "Small rect. left bottom": [
+        (0, PitchPoint(-HALF_LENGTH, -GOAL_AREA_WIDTH / 2)),
+        (1, PitchPoint(-HALF_LENGTH + GOAL_AREA_DEPTH, -GOAL_AREA_WIDTH / 2)),
+    ],
+    # Small rectangle (goal area) - RIGHT side
+    "Small rect. right main": [
+        (0, PitchPoint(HALF_LENGTH - GOAL_AREA_DEPTH, -GOAL_AREA_WIDTH / 2)),
+        (1, PitchPoint(HALF_LENGTH - GOAL_AREA_DEPTH, GOAL_AREA_WIDTH / 2)),
+    ],
+    "Small rect. right top": [
+        (0, PitchPoint(HALF_LENGTH - GOAL_AREA_DEPTH, GOAL_AREA_WIDTH / 2)),
+        (1, PitchPoint(HALF_LENGTH, GOAL_AREA_WIDTH / 2)),
+    ],
+    "Small rect. right bottom": [
+        (0, PitchPoint(HALF_LENGTH - GOAL_AREA_DEPTH, -GOAL_AREA_WIDTH / 2)),
+        (1, PitchPoint(HALF_LENGTH, -GOAL_AREA_WIDTH / 2)),
+    ],
+    # Goals - LEFT
+    "Goal left crossbar": [
+        (0, PitchPoint(-HALF_LENGTH, -GOAL_WIDTH / 2)),
+        (1, PitchPoint(-HALF_LENGTH, GOAL_WIDTH / 2)),
+    ],
+    "Goal left post left ": [
+        (0, PitchPoint(-HALF_LENGTH, -GOAL_WIDTH / 2)),
+        (1, PitchPoint(-HALF_LENGTH, -GOAL_WIDTH / 2)),  # Same point (vertical post)
+    ],
+    "Goal left post right": [
+        (0, PitchPoint(-HALF_LENGTH, GOAL_WIDTH / 2)),
+        (1, PitchPoint(-HALF_LENGTH, GOAL_WIDTH / 2)),
+    ],
+    # Goals - RIGHT
+    "Goal right crossbar": [
+        (0, PitchPoint(HALF_LENGTH, -GOAL_WIDTH / 2)),
+        (1, PitchPoint(HALF_LENGTH, GOAL_WIDTH / 2)),
+    ],
+    "Goal right post left": [
+        (0, PitchPoint(HALF_LENGTH, -GOAL_WIDTH / 2)),
+        (1, PitchPoint(HALF_LENGTH, -GOAL_WIDTH / 2)),
+    ],
+    "Goal right post right": [
+        (0, PitchPoint(HALF_LENGTH, GOAL_WIDTH / 2)),
+        (1, PitchPoint(HALF_LENGTH, GOAL_WIDTH / 2)),
+    ],
+}
+
+# Circle keypoints - sampled around the circle
+# Circles have ~9 keypoints in SoccerNet annotations
+def _get_circle_points(
+    center_x: float, center_y: float, radius: float, n_points: int = 9
+) -> List[Tuple[int, PitchPoint]]:
+    """Generate circle keypoints evenly spaced around the circle."""
+    points = []
+    for i in range(n_points):
+        angle = 2 * np.pi * i / n_points
+        x = center_x + radius * np.cos(angle)
+        y = center_y + radius * np.sin(angle)
+        points.append((i, PitchPoint(x, y)))
+    return points
+
+
+PITCH_LINE_COORDINATES["Circle central"] = _get_circle_points(0, 0, CENTER_CIRCLE_RADIUS)
+PITCH_LINE_COORDINATES["Circle left"] = _get_circle_points(
+    -HALF_LENGTH + PENALTY_SPOT_DISTANCE, 0, CENTER_CIRCLE_RADIUS
+)
+PITCH_LINE_COORDINATES["Circle right"] = _get_circle_points(
+    HALF_LENGTH - PENALTY_SPOT_DISTANCE, 0, CENTER_CIRCLE_RADIUS
+)
+
+
+class HomographyEstimator:
+    """
+    Estimates homography from detected line keypoints to pitch coordinates.
+
+    Uses RANSAC for robust estimation when multiple line correspondences are available.
+    Includes temporal smoothing to reduce jitter.
+    """
+
+    def __init__(
+        self,
+        min_correspondences: int = 4,
+        min_inliers: int = 6,
+        ransac_reproj_threshold: float = 3.0,
+        confidence_threshold: float = 0.5,
+        visibility_threshold: float = 0.5,
+        smoothing_alpha: float = 0.3,
+    ):
+        """
+        Args:
+            min_correspondences: Minimum point correspondences needed for homography
+            min_inliers: Minimum inliers required to accept a new homography
+            ransac_reproj_threshold: RANSAC reprojection error threshold (pixels)
+            confidence_threshold: Minimum line class confidence to use
+            visibility_threshold: Minimum keypoint visibility to use
+            smoothing_alpha: Blend factor for temporal smoothing (0=keep old, 1=use new)
+        """
+        self.min_correspondences = min_correspondences
+        self.min_inliers = min_inliers
+        self.ransac_reproj_threshold = ransac_reproj_threshold
+        self.confidence_threshold = confidence_threshold
+        self.visibility_threshold = visibility_threshold
+        self.smoothing_alpha = smoothing_alpha
+
+        self.H: Optional[np.ndarray] = None
+        self.H_inv: Optional[np.ndarray] = None
+        self.H_smoothed: Optional[np.ndarray] = None  # Temporally smoothed
+        self.inliers: Optional[np.ndarray] = None
+        self.num_inliers: int = 0
+
+        # Import line classes
+        from soccernet.calibration_data import LINE_CLASSES
+
+        self.line_classes = LINE_CLASSES
+
+    def estimate(
+        self,
+        keypoints: torch.Tensor,  # [num_classes, max_points, 2] normalized coords
+        visibility: torch.Tensor,  # [num_classes, max_points]
+        confidence: torch.Tensor,  # [num_classes]
+        image_size: Tuple[int, int],  # (height, width) of the image
+    ) -> bool:
+        """
+        Estimate homography from detected keypoints.
+
+        Args:
+            keypoints: Predicted keypoints in normalized [0,1] coords
+            visibility: Visibility scores per keypoint
+            confidence: Confidence scores per line class
+            image_size: (height, width) of the source image
+
+        Returns:
+            True if homography was successfully computed
+        """
+        h, w = image_size
+
+        # Convert tensors to numpy
+        if isinstance(keypoints, torch.Tensor):
+            keypoints = keypoints.cpu().numpy()
+        if isinstance(visibility, torch.Tensor):
+            visibility = visibility.cpu().numpy()
+        if isinstance(confidence, torch.Tensor):
+            confidence = confidence.cpu().numpy()
+
+        # Collect point correspondences
+        src_points = []  # Image points (pixels)
+        dst_points = []  # Pitch points (meters)
+
+        for class_idx, class_name in enumerate(self.line_classes):
+            # Skip low confidence classes
+            if confidence[class_idx] < self.confidence_threshold:
+                continue
+
+            # Skip classes we don't have pitch coordinates for
+            if class_name not in PITCH_LINE_COORDINATES:
+                continue
+
+            pitch_coords = PITCH_LINE_COORDINATES[class_name]
+
+            for kp_idx, pitch_point in pitch_coords:
+                # Check if this keypoint is visible
+                if kp_idx >= keypoints.shape[1]:
+                    continue
+                if visibility[class_idx, kp_idx] < self.visibility_threshold:
+                    continue
+
+                # Get image coordinates (denormalize)
+                img_x = keypoints[class_idx, kp_idx, 0] * w
+                img_y = keypoints[class_idx, kp_idx, 1] * h
+
+                # Skip invalid coordinates
+                if img_x < 0 or img_x > w or img_y < 0 or img_y > h:
+                    continue
+
+                src_points.append([img_x, img_y])
+                dst_points.append(pitch_point.to_array())
+
+        if len(src_points) < self.min_correspondences:
+            print(f"Not enough correspondences: {len(src_points)} < {self.min_correspondences}")
+            self.H = None
+            self.H_inv = None
+            return False
+
+        src_points = np.array(src_points, dtype=np.float32)
+        dst_points = np.array(dst_points, dtype=np.float32)
+
+        # Strategy 1: Standard RANSAC
+        H1, mask1 = cv2.findHomography(src_points, dst_points, cv2.RANSAC, self.ransac_reproj_threshold)
+        inliers1 = np.sum(mask1.ravel() == 1) if H1 is not None else 0
+
+        # Strategy 2: Mirrored RANSAC (Try swapping Left/Right sides)
+        # This handles cases where the model confuses left/right penalty areas
+        dst_points_mirrored = dst_points.copy()
+        dst_points_mirrored[:, 0] *= -1  # Negate X coordinate
+
+        H2, mask2 = cv2.findHomography(src_points, dst_points_mirrored, cv2.RANSAC, self.ransac_reproj_threshold)
+        inliers2 = np.sum(mask2.ravel() == 1) if H2 is not None else 0
+
+        # Select best homography
+        if inliers2 > inliers1 and inliers2 >= self.min_inliers:
+            # print(f"  Using mirrored homography ({inliers2} vs {inliers1} inliers)")
+            self.H = H2
+            self.inliers = mask2.ravel() == 1
+            self.num_inliers = inliers2
+        else:
+            self.H = H1
+            self.inliers = mask1.ravel() == 1 if H1 is not None else np.zeros(len(src_points), dtype=bool)
+            self.num_inliers = inliers1
+
+        if self.H is None:
+            # print("Homography computation failed")
+            return False
+
+        # Require minimum inliers for a reliable homography
+        if self.num_inliers < self.min_inliers:
+            print(f"Not enough inliers: {self.num_inliers} < {self.min_inliers}")
+            # Keep previous homography if available
+            if self.H_smoothed is not None:
+                return True  # Use old homography
+            return False
+
+        # Temporal smoothing: blend with previous homography
+        if self.H_smoothed is None:
+            self.H_smoothed = self.H.copy()
+        else:
+            # Blend new homography with old (exponential moving average)
+            self.H_smoothed = (1 - self.smoothing_alpha) * self.H_smoothed + self.smoothing_alpha * self.H
+
+        # Compute inverse for projecting pitch to image
+        try:
+            self.H_inv = np.linalg.inv(self.H_smoothed)
+        except np.linalg.LinAlgError:
+            self.H_inv = None
+
+        print(f"Homography estimated with {self.num_inliers}/{len(src_points)} inliers")
+        return True
+
+    def project_to_pitch(
+        self,
+        points: np.ndarray,  # [N, 2] pixel coordinates
+    ) -> Optional[np.ndarray]:
+        """
+        Project image points to pitch coordinates.
+
+        Args:
+            points: [N, 2] array of (x, y) pixel coordinates
+
+        Returns:
+            [N, 2] array of (x, y) pitch coordinates in meters, or None if no homography
+        """
+        # Use smoothed homography for stability
+        H = self.H_smoothed if self.H_smoothed is not None else self.H
+        if H is None:
+            return None
+
+        points = np.asarray(points, dtype=np.float32)
+        if points.ndim == 1:
+            points = points.reshape(1, 2)
+
+        # Convert to homogeneous coordinates
+        ones = np.ones((points.shape[0], 1), dtype=np.float32)
+        points_h = np.hstack([points, ones])  # [N, 3]
+
+        # Apply homography
+        projected = (H @ points_h.T).T  # [N, 3]
+
+        # Convert from homogeneous
+        projected = projected[:, :2] / projected[:, 2:3]
+
+        return projected
+
+    def project_to_image(
+        self,
+        pitch_points: np.ndarray,  # [N, 2] pitch coordinates in meters
+    ) -> Optional[np.ndarray]:
+        """
+        Project pitch coordinates back to image pixels.
+
+        Args:
+            pitch_points: [N, 2] array of (x, y) pitch coordinates
+
+        Returns:
+            [N, 2] array of (x, y) pixel coordinates, or None if no inverse homography
+        """
+        if self.H_inv is None:
+            return None
+
+        pitch_points = np.asarray(pitch_points, dtype=np.float32)
+        if pitch_points.ndim == 1:
+            pitch_points = pitch_points.reshape(1, 2)
+
+        ones = np.ones((pitch_points.shape[0], 1), dtype=np.float32)
+        points_h = np.hstack([pitch_points, ones])
+
+        projected = (self.H_inv @ points_h.T).T
+        projected = projected[:, :2] / projected[:, 2:3]
+
+        return projected
+
+    def get_player_foot_position(self, bbox: List[float]) -> Tuple[float, float]:
+        """
+        Get the foot position of a player from their bounding box.
+
+        Uses bottom-center of bounding box as foot position.
+
+        Args:
+            bbox: [x1, y1, x2, y2] bounding box
+
+        Returns:
+            (x, y) pixel coordinates of foot position
+        """
+        x1, y1, x2, y2 = bbox
+        foot_x = (x1 + x2) / 2
+        foot_y = y2  # Bottom of bounding box
+        return foot_x, foot_y
+
+    def project_player_to_pitch(
+        self,
+        bbox: List[float],
+    ) -> Optional[Tuple[float, float]]:
+        """
+        Project a player's position to pitch coordinates.
+
+        Args:
+            bbox: [x1, y1, x2, y2] player bounding box
+
+        Returns:
+            (x, y) pitch coordinates in meters, or None if projection fails
+        """
+        foot_x, foot_y = self.get_player_foot_position(bbox)
+
+        projected = self.project_to_pitch(np.array([[foot_x, foot_y]]))
+        if projected is None:
+            return None
+
+        x, y = float(projected[0, 0]), float(projected[0, 1])
+
+        # Reject unrealistic positions (far outside pitch bounds)
+        # Pitch is 105m x 68m, allow some margin
+        if abs(x) > 60 or abs(y) > 40:
+            return None
+
+        return x, y
+
+
+class PitchVisualizer:
+    """
+    Visualizes player positions on a 2D pitch diagram.
+    """
+
+    def __init__(
+        self,
+        width: int = 1050,  # Pixels (10 pixels per meter)
+        height: int = 680,
+        margin: int = 50,
+        scale: float = 10.0,  # pixels per meter
+    ):
+        self.width = width
+        self.height = height
+        self.margin = margin
+        self.scale = scale
+
+        # Colors
+        self.pitch_color = (34, 139, 34)  # Forest green
+        self.line_color = (255, 255, 255)  # White
+        self.team1_color = (255, 0, 0)  # Red (BGR)
+        self.team2_color = (0, 0, 255)  # Blue (BGR)
+        self.unknown_color = (128, 128, 128)  # Gray
+
+        # Create base pitch image
+        self.base_pitch = self._draw_pitch()
+
+    def _pitch_to_pixel(self, x: float, y: float) -> Tuple[int, int]:
+        """Convert pitch coordinates (meters) to pixel coordinates."""
+        px = int(self.margin + (x + HALF_LENGTH) * self.scale)
+        py = int(self.margin + (HALF_WIDTH - y) * self.scale)  # Flip Y
+        return px, py
+
+    def _draw_pitch(self) -> np.ndarray:
+        """Draw the base pitch with all markings."""
+        total_width = self.width + 2 * self.margin
+        total_height = self.height + 2 * self.margin
+        img = np.zeros((total_height, total_width, 3), dtype=np.uint8)
+
+        # Fill pitch area
+        cv2.rectangle(
+            img, (self.margin, self.margin), (self.margin + self.width, self.margin + self.height), self.pitch_color, -1
+        )
+
+        # Draw outer boundary
+        cv2.rectangle(
+            img,
+            self._pitch_to_pixel(-HALF_LENGTH, HALF_WIDTH),
+            self._pitch_to_pixel(HALF_LENGTH, -HALF_WIDTH),
+            self.line_color,
+            2,
+        )
+
+        # Halfway line
+        cv2.line(img, self._pitch_to_pixel(0, HALF_WIDTH), self._pitch_to_pixel(0, -HALF_WIDTH), self.line_color, 2)
+
+        # Center circle
+        center = self._pitch_to_pixel(0, 0)
+        radius = int(CENTER_CIRCLE_RADIUS * self.scale)
+        cv2.circle(img, center, radius, self.line_color, 2)
+
+        # Center spot
+        cv2.circle(img, center, 3, self.line_color, -1)
+
+        # Left penalty area
+        cv2.rectangle(
+            img,
+            self._pitch_to_pixel(-HALF_LENGTH, PENALTY_AREA_WIDTH / 2),
+            self._pitch_to_pixel(-HALF_LENGTH + PENALTY_AREA_DEPTH, -PENALTY_AREA_WIDTH / 2),
+            self.line_color,
+            2,
+        )
+
+        # Right penalty area
+        cv2.rectangle(
+            img,
+            self._pitch_to_pixel(HALF_LENGTH - PENALTY_AREA_DEPTH, PENALTY_AREA_WIDTH / 2),
+            self._pitch_to_pixel(HALF_LENGTH, -PENALTY_AREA_WIDTH / 2),
+            self.line_color,
+            2,
+        )
+
+        # Left goal area
+        cv2.rectangle(
+            img,
+            self._pitch_to_pixel(-HALF_LENGTH, GOAL_AREA_WIDTH / 2),
+            self._pitch_to_pixel(-HALF_LENGTH + GOAL_AREA_DEPTH, -GOAL_AREA_WIDTH / 2),
+            self.line_color,
+            2,
+        )
+
+        # Right goal area
+        cv2.rectangle(
+            img,
+            self._pitch_to_pixel(HALF_LENGTH - GOAL_AREA_DEPTH, GOAL_AREA_WIDTH / 2),
+            self._pitch_to_pixel(HALF_LENGTH, -GOAL_AREA_WIDTH / 2),
+            self.line_color,
+            2,
+        )
+
+        # Penalty spots
+        left_spot = self._pitch_to_pixel(-HALF_LENGTH + PENALTY_SPOT_DISTANCE, 0)
+        right_spot = self._pitch_to_pixel(HALF_LENGTH - PENALTY_SPOT_DISTANCE, 0)
+        cv2.circle(img, left_spot, 3, self.line_color, -1)
+        cv2.circle(img, right_spot, 3, self.line_color, -1)
+
+        # Penalty arcs (outside penalty area)
+        # Left arc
+        cv2.ellipse(img, left_spot, (radius, radius), 0, -53, 53, self.line_color, 2)  # Arc angles
+        # Right arc
+        cv2.ellipse(img, right_spot, (radius, radius), 180, -53, 53, self.line_color, 2)
+
+        # Goals (behind the line)
+        goal_depth = 2.44  # depth of goal
+        # Left goal
+        cv2.rectangle(
+            img,
+            self._pitch_to_pixel(-HALF_LENGTH - goal_depth, GOAL_WIDTH / 2),
+            self._pitch_to_pixel(-HALF_LENGTH, -GOAL_WIDTH / 2),
+            self.line_color,
+            2,
+        )
+        # Right goal
+        cv2.rectangle(
+            img,
+            self._pitch_to_pixel(HALF_LENGTH, GOAL_WIDTH / 2),
+            self._pitch_to_pixel(HALF_LENGTH + goal_depth, -GOAL_WIDTH / 2),
+            self.line_color,
+            2,
+        )
+
+        return img
+
+    def draw_players(
+        self,
+        pitch_positions: List[Tuple[float, float, int, Optional[int]]],  # [(x, y, track_id, team_id), ...]
+    ) -> np.ndarray:
+        """
+        Draw players on the pitch.
+
+        Args:
+            pitch_positions: List of (x, y, track_id, team_id) tuples
+                - x, y: pitch coordinates in meters
+                - track_id: unique player ID
+                - team_id: 0, 1, or None for unknown
+
+        Returns:
+            Image with players drawn
+        """
+        img = self.base_pitch.copy()
+
+        for x, y, track_id, team_id in pitch_positions:
+            # Skip if outside pitch bounds (with some margin)
+            if abs(x) > HALF_LENGTH + 5 or abs(y) > HALF_WIDTH + 5:
+                continue
+
+            px, py = self._pitch_to_pixel(x, y)
+
+            # Choose color based on team
+            if team_id == 0:
+                color = self.team1_color
+            elif team_id == 1:
+                color = self.team2_color
+            else:
+                color = self.unknown_color
+
+            # Draw player dot
+            cv2.circle(img, (px, py), 8, color, -1)
+            cv2.circle(img, (px, py), 8, (0, 0, 0), 2)  # Black border
+
+            # Draw track ID
+            cv2.putText(img, str(track_id), (px - 5, py + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+        return img
+
+    def draw_with_trails(
+        self,
+        pitch_positions: List[Tuple[float, float, int, Optional[int]]],
+        history: Dict[int, List[Tuple[float, float]]],  # track_id -> [(x, y), ...]
+        trail_length: int = 30,
+    ) -> np.ndarray:
+        """
+        Draw players with movement trails.
+
+        Args:
+            pitch_positions: Current positions
+            history: Historical positions per track_id
+            trail_length: Maximum trail points to show
+
+        Returns:
+            Image with players and trails
+        """
+        img = self.base_pitch.copy()
+
+        # Draw trails first (so players appear on top)
+        for track_id, positions in history.items():
+            if len(positions) < 2:
+                continue
+
+            # Get recent positions
+            recent = positions[-trail_length:]
+
+            # Draw trail as fading line
+            for i in range(len(recent) - 1):
+                alpha = (i + 1) / len(recent)  # Fade from old to new
+                x1, y1 = recent[i]
+                x2, y2 = recent[i + 1]
+
+                p1 = self._pitch_to_pixel(x1, y1)
+                p2 = self._pitch_to_pixel(x2, y2)
+
+                # Skip if points are outside pitch
+                if abs(x1) > HALF_LENGTH + 5 or abs(y1) > HALF_WIDTH + 5:
+                    continue
+                if abs(x2) > HALF_LENGTH + 5 or abs(y2) > HALF_WIDTH + 5:
+                    continue
+
+                # Fading gray color
+                gray = int(100 + 155 * alpha)
+                cv2.line(img, p1, p2, (gray, gray, gray), 2)
+
+        # Draw current positions
+        for x, y, track_id, team_id in pitch_positions:
+            if abs(x) > HALF_LENGTH + 5 or abs(y) > HALF_WIDTH + 5:
+                continue
+
+            px, py = self._pitch_to_pixel(x, y)
+
+            if team_id == 0:
+                color = self.team1_color
+            elif team_id == 1:
+                color = self.team2_color
+            else:
+                color = self.unknown_color
+
+            cv2.circle(img, (px, py), 8, color, -1)
+            cv2.circle(img, (px, py), 8, (0, 0, 0), 2)
+
+            cv2.putText(img, str(track_id), (px - 5, py + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+        return img
+
+
+if __name__ == "__main__":
+    # Test visualization
+    viz = PitchVisualizer()
+
+    # Some test player positions
+    test_positions = [
+        (0, 0, 1, 0),  # Center, team 0
+        (-30, 10, 2, 0),  # Left midfield, team 0
+        (-45, 0, 3, 0),  # Goalkeeper area, team 0
+        (20, -15, 4, 1),  # Right side, team 1
+        (35, 5, 5, 1),  # Attack, team 1
+        (10, 25, 6, None),  # Unknown team
+    ]
+
+    img = viz.draw_players(test_positions)
+
+    cv2.imwrite("test_pitch.png", img)
+    print("Saved test_pitch.png")
+
+    # Test homography estimator
+    print("\nTesting HomographyEstimator...")
+    estimator = HomographyEstimator()
+
+    # Simulate some keypoint detections (would come from line detector)
+    num_classes = 28
+    max_points = 12
+    keypoints = torch.rand(num_classes, max_points, 2)
+    visibility = torch.rand(num_classes, max_points)
+    confidence = torch.rand(num_classes)
+
+    # This won't produce a good homography with random data, but tests the API
+    success = estimator.estimate(keypoints, visibility, confidence, (1080, 1920))
+    print(f"Homography estimation: {'Success' if success else 'Failed (expected with random data)'}")
