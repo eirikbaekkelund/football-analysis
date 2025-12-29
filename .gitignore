@@ -14,6 +14,5 @@ yolo_dataset/
 SV_*
 *.csv
 *.jpg
-*.png
 *.jpeg
 logs/
