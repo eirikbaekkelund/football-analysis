@@ -3,11 +3,13 @@ import cv2
 import torch
 import numpy as np
 import os
+import time
 from typing import Dict, List, Tuple
 
 from match_state.player_tracker import TeamClassifier
 from match_state.pitch_homography import HomographyEstimator, PitchVisualizer, PITCH_LINE_COORDINATES
 from models.pnl_calib.wrapper import PnLCalibWrapper
+from utils.timing import timed, print_timing_stats, _timing_stats
 
 
 class PitchTrackManager:
@@ -127,6 +129,7 @@ def load_player_detector(model_path: str, device: torch.device):
     return model
 
 
+@timed
 def create_combined_visualization(
     frame: np.ndarray,
     pitch_img: np.ndarray,
@@ -178,6 +181,7 @@ def create_combined_visualization(
     return combined
 
 
+@timed
 def draw_pitch_overlay(
     frame: np.ndarray,
     homography: HomographyEstimator,
@@ -329,9 +333,18 @@ def main():
                 else:
                     homography_ok = False
 
+            _track_start = time.perf_counter()
             results = player_detector.track(
                 frame, persist=True, tracker="botsort.yaml", verbose=False, classes=track_classes
             )
+
+            # Time YOLO tracking manually (can't decorate external function)
+            _track_elapsed = (time.perf_counter() - _track_start) * 1000
+            if 'yolo_track' not in _timing_stats:
+                _timing_stats['yolo_track'] = {'count': 0, 'total': 0, 'max': 0}
+            _timing_stats['yolo_track']['count'] += 1
+            _timing_stats['yolo_track']['total'] += _track_elapsed
+            _timing_stats['yolo_track']['max'] = max(_timing_stats['yolo_track']['max'], _track_elapsed)
 
             tracks = []
             pitch_positions = {}  # track_id -> (x, y) in meters
@@ -397,6 +410,8 @@ def main():
 
     print(f"\nSaved output to {args.output}")
     print(f"Processed {frame_idx} frames")
+
+    print_timing_stats()
 
 
 if __name__ == "__main__":

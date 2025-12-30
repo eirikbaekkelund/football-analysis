@@ -12,17 +12,15 @@ from PIL import Image
 
 from model.cls_hrnet import get_cls_net
 from model.cls_hrnet_l import get_cls_net as get_cls_net_l
-
-from utils.utils_calib import FramebyFrameCalib
-from utils.utils_heatmap import (
+from models.pnl_calib.utils.calib import FramebyFrameCalib
+from models.pnl_calib.utils.heatmap import (
     get_keypoints_from_heatmap_batch_maxpool,
     get_keypoints_from_heatmap_batch_maxpool_l,
     complete_keypoints,
     coords_to_dict,
 )
 
-
-lines_coords = [
+LINE_COORDINATES = [
     [[0.0, 54.16, 0.0], [16.5, 54.16, 0.0]],
     [[16.5, 13.84, 0.0], [16.5, 54.16, 0.0]],
     [[16.5, 13.84, 0.0], [0.0, 13.84, 0.0]],
@@ -93,7 +91,7 @@ def inference(cam, frame, model, model_l, kp_threshold, line_threshold, pnl_refi
 
 def project(frame, P):
 
-    for line in lines_coords:
+    for line in LINE_COORDINATES:
         w1 = line[0]
         w2 = line[1]
         i1 = P @ np.array([w1[0] - 105 / 2, w1[1] - 68 / 2, w1[2], 1])

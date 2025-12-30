@@ -1,8 +1,9 @@
 import cv2
 import numpy as np
 import torch
-from pydantic import BaseModel
 from typing import Dict, List, Optional, Tuple
+
+from utils.timing import timed, DEBUG_TIMING
 
 
 # pitch dimensions (in meters)
@@ -20,9 +21,14 @@ GOAL_WIDTH = 7.32
 GOAL_HEIGHT = 2.44
 
 
-class PitchPoint(BaseModel):
-    x: float  # Along touchline, -52.5 (left) to 52.5 (right)
-    y: float  # Along goal line, -34 (bottom) to 34 (top)
+class PitchPoint:
+    """Lightweight pitch point - no Pydantic overhead."""
+
+    __slots__ = ('x', 'y')
+
+    def __init__(self, x: float, y: float):
+        self.x = x
+        self.y = y
 
     def to_array(self) -> np.ndarray:
         return np.array([self.x, self.y], dtype=np.float32)
@@ -423,6 +429,7 @@ class HomographyEstimator:
 class PitchVisualizer:
     """
     Visualizes player positions on a 2D pitch diagram.
+    Optimized for GPU acceleration when available.
     """
 
     def __init__(
@@ -431,6 +438,7 @@ class PitchVisualizer:
         height: int = 680,
         margin: int = 50,
         scale: float = 10.0,  # pixels per meter
+        use_gpu: bool = True,
     ):
         self.width = width
         self.height = height
@@ -445,11 +453,66 @@ class PitchVisualizer:
         self.unknown_color = (128, 128, 128)  # gray
 
         # spatial topology smoothing params
-        self.prev_inf_t0 = None
-        self.prev_inf_t1 = None
+        self.prev_inf_gpu = None  # GPU tensor for temporal smoothing
         self.heatmap_alpha = 0.1
 
         self.base_pitch = self._draw_pitch()
+
+        # GPU setup
+        self.device = torch.device('cuda' if torch.cuda.is_available() and use_gpu else 'cpu')
+        self._init_gpu_grids()
+
+        # Pre-compute pitch mask for blending
+        self._init_pitch_mask()
+
+    def _init_gpu_grids(self):
+        """Pre-compute coordinate grids on GPU for spatial dominance."""
+        h_img = self.height + 2 * self.margin
+        w_img = self.width + 2 * self.margin
+
+        # Downsample for speed
+        self.scale_factor = 0.25
+        h_small = int(h_img * self.scale_factor)
+        w_small = int(w_img * self.scale_factor)
+        self.h_small = h_small
+        self.w_small = w_small
+        self.h_img = h_img
+        self.w_img = w_img
+
+        # Create coordinate grids in meters (on GPU)
+        x_indices = torch.arange(w_small, device=self.device, dtype=torch.float32)
+        y_indices = torch.arange(h_small, device=self.device, dtype=torch.float32)
+        Y_pix, X_pix = torch.meshgrid(y_indices, x_indices, indexing='ij')
+
+        # Convert to pitch coordinates (meters)
+        self.X_meters = (X_pix / self.scale_factor - self.margin) / self.scale - HALF_LENGTH
+        self.Y_meters = (Y_pix / self.scale_factor - self.margin) / self.scale - HALF_WIDTH
+
+        # Pre-allocate influence tensors
+        self.inf_t0_gpu = torch.zeros((h_small, w_small), device=self.device, dtype=torch.float32)
+        self.inf_t1_gpu = torch.zeros((h_small, w_small), device=self.device, dtype=torch.float32)
+
+        if DEBUG_TIMING:
+            print(f"[GPU] Initialized grids on {self.device}, shape: {h_small}x{w_small}")
+
+    def _init_pitch_mask(self):
+        """Pre-compute pitch mask for heatmap blending."""
+        tl = self._pitch_to_pixel(-HALF_LENGTH, HALF_WIDTH)
+        br = self._pitch_to_pixel(HALF_LENGTH, -HALF_WIDTH)
+
+        x_min = min(tl[0], br[0])
+        x_max = max(tl[0], br[0])
+        y_min = min(tl[1], br[1])
+        y_max = max(tl[1], br[1])
+
+        self.pitch_mask = np.zeros((self.h_img, self.w_img), dtype=np.uint8)
+        cv2.rectangle(self.pitch_mask, (x_min, y_min), (x_max, y_max), 255, -1)
+
+        self.alpha_mask = np.zeros((self.h_img, self.w_img), dtype=np.float32)
+        self.alpha_mask[self.pitch_mask > 0] = 0.4
+
+        # Pre-allocate overlay buffer for heatmap
+        self.overlay_buffer = np.zeros((self.h_img, self.w_img, 3), dtype=np.uint8)
 
     def _pitch_to_pixel(self, x: float, y: float) -> Tuple[int, int]:
         """Convert pitch coordinates (meters) to pixel coordinates."""
@@ -592,6 +655,7 @@ class PitchVisualizer:
 
         return img
 
+    @timed
     def draw_with_trails(
         self,
         pitch_positions: List[Tuple[float, float, float, float, int, Optional[int]]],  # x, y, vx, vy, id, team
@@ -617,51 +681,44 @@ class PitchVisualizer:
 
         # 1. Draw Spatial Dominance Heatmap
         if draw_dominance:
-            # Get raw influence maps for both teams
-            inf_t0, inf_t1 = self._compute_spatial_dominance(pitch_positions)
-
-            if inf_t0 is not None and inf_t1 is not None:
-                # Normalize to probability [0, 1] to fill the pitch
-                # Add small epsilon to avoid division by zero
-                total = inf_t0 + inf_t1 + 1e-6
-                prob_t1 = inf_t1 / total
-                prob_t0 = inf_t0 / total
-
-                # Create colored overlay
-                # Team 0 (Red) -> Red Channel (2)
-                # Team 1 (Blue) -> Blue Channel (0)
-                # Mixed -> Purple
-
-                overlay = np.zeros_like(img)
-                overlay[:, :, 0] = (prob_t1 * 255).astype(np.uint8)  # Blue
-                overlay[:, :, 2] = (prob_t0 * 255).astype(np.uint8)  # Red
-
-                # Constant alpha for visibility
-                alpha_val = 0.4
-
-                # Mask out areas outside the pitch
-                tl = self._pitch_to_pixel(-HALF_LENGTH, HALF_WIDTH)
-                br = self._pitch_to_pixel(HALF_LENGTH, -HALF_WIDTH)
-
-                # Create mask
-                mask = np.zeros((img.shape[0], img.shape[1]), dtype=np.uint8)
-
-                x_min = min(tl[0], br[0])
-                x_max = max(tl[0], br[0])
-                y_min = min(tl[1], br[1])
-                y_max = max(tl[1], br[1])
-
-                cv2.rectangle(mask, (x_min, y_min), (x_max, y_max), 255, -1)
-
-                # Apply mask to alpha
-                alpha_mask = np.zeros((img.shape[0], img.shape[1]), dtype=np.float32)
-                alpha_mask[mask > 0] = alpha_val
-
-                # Blend
-                for c in range(3):
-                    img[:, :, c] = (img[:, :, c] * (1 - alpha_mask) + overlay[:, :, c] * alpha_mask).astype(np.uint8)
+            self._draw_heatmap(img, pitch_positions)
 
         # 2. Draw trails
+        self._draw_trails(img, history, trail_length)
+
+        # 3. Draw players and vectors
+        self._draw_players(img, pitch_positions, draw_vectors)
+
+        return img
+
+    @timed
+    def _draw_heatmap(self, img: np.ndarray, pitch_positions: list):
+        """Draw spatial dominance heatmap on the image."""
+        # Get raw influence maps for both teams
+        inf_t0, inf_t1 = self._compute_spatial_dominance(pitch_positions)
+
+        if inf_t0 is None or inf_t1 is None:
+            return
+
+        # Normalize to probability [0, 1] (in-place)
+        total = inf_t0 + inf_t1
+        total += 1e-6  # avoid division by zero
+        np.divide(inf_t1, total, out=inf_t1)
+        np.divide(inf_t0, total, out=inf_t0)
+
+        # Use pre-allocated overlay buffer (avoid allocation)
+        self.overlay_buffer[:, :, 0] = (inf_t1 * 255).astype(np.uint8)  # Blue
+        self.overlay_buffer[:, :, 1] = 0  # Green
+        self.overlay_buffer[:, :, 2] = (inf_t0 * 255).astype(np.uint8)  # Red
+
+        # Mask overlay to only show within pitch bounds
+        self.overlay_buffer[self.pitch_mask == 0] = 0
+
+        # Use OpenCV's optimized addWeighted function
+        cv2.addWeighted(img, 0.6, self.overlay_buffer, 0.4, 0, dst=img)
+
+    def _draw_trails(self, img: np.ndarray, history: Dict[int, List[Tuple[float, float]]], trail_length: int):
+        """Draw movement trails for players."""
         for track_id, positions in history.items():
             if len(positions) < 2:
                 continue
@@ -672,17 +729,19 @@ class PitchVisualizer:
                 x1, y1 = recent[i]
                 x2, y2 = recent[i + 1]
 
-                p1 = self._pitch_to_pixel(x1, y1)
-                p2 = self._pitch_to_pixel(x2, y2)
-
                 if abs(x1) > HALF_LENGTH + 5 or abs(y1) > HALF_WIDTH + 5:
                     continue
                 if abs(x2) > HALF_LENGTH + 5 or abs(y2) > HALF_WIDTH + 5:
                     continue
 
+                p1 = self._pitch_to_pixel(x1, y1)
+                p2 = self._pitch_to_pixel(x2, y2)
+
                 gray = int(100 + 155 * alpha)
                 cv2.line(img, p1, p2, (gray, gray, gray), 2)
 
+    def _draw_players(self, img: np.ndarray, pitch_positions: list, draw_vectors: bool):
+        """Draw player dots and velocity vectors."""
         for x, y, vx, vy, track_id, team_id in pitch_positions:
             if abs(x) > HALF_LENGTH + 5 or abs(y) > HALF_WIDTH + 5:
                 continue
@@ -699,7 +758,7 @@ class PitchVisualizer:
                 color = self.unknown_color
 
             if draw_vectors and (abs(vx) > 0.1 or abs(vy) > 0.1):
-                end_x = x + vx * 15  # 15 frames projection (~0.5s)
+                end_x = x + vx * 15
                 end_y = y + vy * 15
                 px_end, py_end = self._pitch_to_pixel(end_x, end_y)
                 cv2.arrowedLine(img, (px, py), (px_end, py_end), color, 2, tipLength=0.3)
@@ -708,76 +767,112 @@ class PitchVisualizer:
             cv2.circle(img, (px, py), 8, (0, 0, 0), 2)
             cv2.putText(img, str(track_id), (px - 5, py + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
-        return img
-
+    @timed
     def _compute_spatial_dominance(self, players, resolution=2.0):
         """
         Compute spatial dominance map based on player positions and velocities.
+        GPU-accelerated with vectorized operations.
         Returns raw influence maps for Team 0 and Team 1.
         """
-        # we need to map pixels back to meters to evaluate the Gaussian
-        h_img, w_img = self.height + 2 * self.margin, self.width + 2 * self.margin
-
-        # first we create a pixel grid and downsample for speed
-        scale_factor = 0.25
-        h_small, w_small = int(h_img * scale_factor), int(w_img * scale_factor)
-
-        x_indices = np.arange(w_small)
-        y_indices = np.arange(h_small)
-        X_pix, Y_pix = np.meshgrid(x_indices, y_indices)
-
-        # pixel coordinates to pitch coordinates (meters)
-        # is inverse of _pitch_to_pixel logic
-        X_meters = (X_pix / scale_factor - self.margin) / self.scale - HALF_LENGTH
-        Y_meters = (Y_pix / scale_factor - self.margin) / self.scale - HALF_WIDTH
-
-        influence_t0 = np.zeros_like(X_meters)
-        influence_t1 = np.zeros_like(X_meters)
+        # Filter players by team and extract data
+        t0_players = []
+        t1_players = []
 
         for px, py, vx, vy, _, team_id in players:
-            if team_id not in [0, 1]:
-                continue
-
-            # gaussian ball of pixel velocity influence
-            speed = np.sqrt(vx**2 + vy**2)
-            angle = np.arctan2(vy, vx)  # NOTE: angle is used for directional influence
-
-            # center based on momentum (0.5s projection)
-            # this makes influence extend forward and lag behind
-            mu_x = px + vx * 15.0  # 15 frames ~ 0.5s
-            mu_y = py + vy * 15.0
-
-            # base influence radius (meters)
-            # elongate in direction of motion (momentum)
-            sigma_x = 4.0 * (1 + speed * 0.5)
-            # narrow cross-track influence as speed increases (harder to turn)
-            sigma_y = 4.0 / (1 + speed * 0.2)
-
-            # rotate grid coordinates to align with player velocity
-            dx = X_meters - mu_x
-            dy = Y_meters - mu_y
-
-            # standard rotation for 2D points (i.e., rotate grid by -angle)
-            dx_rot = dx * np.cos(angle) + dy * np.sin(angle)
-            dy_rot = -dx * np.sin(angle) + dy * np.cos(angle)
-
-            gaussian = np.exp(-(dx_rot**2 / (2 * sigma_x**2) + dy_rot**2 / (2 * sigma_y**2)))
-
             if team_id == 0:
-                influence_t0 += gaussian
-            else:
-                influence_t1 += gaussian
+                t0_players.append((px, py, vx, vy))
+            elif team_id == 1:
+                t1_players.append((px, py, vx, vy))
 
-        # resize back to full image size
-        inf_t0_full = cv2.resize(influence_t0, (w_img, h_img))
-        inf_t1_full = cv2.resize(influence_t1, (w_img, h_img))
+        # Compute both team influences on GPU
+        inf_t0_gpu, inf_t1_gpu = self._compute_both_teams_influence_gpu(t0_players, t1_players)
 
-        # temporal smoothing
-        if self.prev_inf_t0 is not None:
-            inf_t0_full = self.prev_inf_t0 * (1 - self.heatmap_alpha) + inf_t0_full * self.heatmap_alpha
-            inf_t1_full = self.prev_inf_t1 * (1 - self.heatmap_alpha) + inf_t1_full * self.heatmap_alpha
+        # Stack and resize both at once (single kernel call)
+        stacked = torch.stack([inf_t0_gpu, inf_t1_gpu], dim=0).unsqueeze(0)  # [1, 2, H, W]
+        resized = torch.nn.functional.interpolate(stacked, size=(self.h_img, self.w_img), mode='nearest').squeeze(
+            0
+        )  # [2, H, W]
 
-        self.prev_inf_t0 = inf_t0_full
-        self.prev_inf_t1 = inf_t1_full
+        # Temporal smoothing on GPU before transfer
+        if self.prev_inf_gpu is not None:
+            resized = self.prev_inf_gpu * (1 - self.heatmap_alpha) + resized * self.heatmap_alpha
 
-        return inf_t0_full, inf_t1_full
+        self.prev_inf_gpu = resized
+
+        # Single CPU transfer
+        result = resized.cpu().numpy()
+        return result[0], result[1]
+
+    @timed
+    def _compute_both_teams_influence_gpu(self, t0_players: List[tuple], t1_players: List[tuple]):
+        """
+        Compute influence maps for both teams in a single GPU kernel.
+        Returns tensors on GPU to avoid intermediate transfers.
+        """
+        zeros = torch.zeros((self.h_small, self.w_small), device=self.device, dtype=torch.float32)
+
+        # Prepare tensors for both teams
+        if not t0_players:
+            inf_t0 = zeros.clone()
+        else:
+            inf_t0 = self._compute_influence_tensor(t0_players)
+
+        if not t1_players:
+            inf_t1 = zeros.clone()
+        else:
+            inf_t1 = self._compute_influence_tensor(t1_players)
+
+        return inf_t0, inf_t1
+
+    def _compute_influence_tensor(self, players: List[tuple]) -> torch.Tensor:
+        """
+        Compute influence map for players, returning a GPU tensor.
+        """
+        # Convert player data to tensors
+        player_data = torch.tensor(players, device=self.device, dtype=torch.float32)
+        px = player_data[:, 0]
+        py = player_data[:, 1]
+        vx = player_data[:, 2]
+        vy = player_data[:, 3]
+
+        # Compute per-player parameters
+        speed = torch.sqrt(vx**2 + vy**2)
+        angle = torch.atan2(vy, vx)
+
+        # Momentum-shifted centers
+        mu_x = px + vx * 15.0
+        mu_y = py + vy * 15.0
+
+        # Anisotropic sigma
+        sigma_x = 4.0 * (1 + speed * 0.5)
+        sigma_y = 4.0 / (1 + speed * 0.2)
+
+        # Pre-compute trig values
+        cos_angle = torch.cos(angle)
+        sin_angle = torch.sin(angle)
+
+        # Expand for broadcasting: [N] -> [N, 1, 1]
+        mu_x = mu_x.view(-1, 1, 1)
+        mu_y = mu_y.view(-1, 1, 1)
+        sigma_x = sigma_x.view(-1, 1, 1)
+        sigma_y = sigma_y.view(-1, 1, 1)
+        cos_angle = cos_angle.view(-1, 1, 1)
+        sin_angle = sin_angle.view(-1, 1, 1)
+
+        # Expand grid: [H, W] -> [1, H, W]
+        X = self.X_meters.unsqueeze(0)
+        Y = self.Y_meters.unsqueeze(0)
+
+        # Compute distance from each player's center: [N, H, W]
+        dx = X - mu_x
+        dy = Y - mu_y
+
+        # Rotate coordinates
+        dx_rot = dx * cos_angle + dy * sin_angle
+        dy_rot = -dx * sin_angle + dy * cos_angle
+
+        # Compute Gaussian for all players: [N, H, W]
+        gaussian = torch.exp(-(dx_rot**2 / (2 * sigma_x**2) + dy_rot**2 / (2 * sigma_y**2)))
+
+        # Sum over all players: [H, W]
+        return gaussian.sum(dim=0)

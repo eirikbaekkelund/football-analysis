@@ -4,7 +4,10 @@ from typing import List
 from sklearn.mixture import GaussianMixture
 from scipy.optimize import linear_sum_assignment
 
+from utils.timing import timed
 
+
+@timed
 def get_jersey_color_feature(image_rgb: np.ndarray, box: List[float]) -> np.ndarray:
     """
     Extracts a compact 6D color feature from shirt and shorts regions.
@@ -505,6 +508,7 @@ class TeamClassifier:
 
         return outside_ids
 
+    @timed
     def update(
         self,
         tracks: List[dict],

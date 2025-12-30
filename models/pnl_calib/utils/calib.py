@@ -5,7 +5,7 @@ import numpy as np
 
 from scipy.optimize import least_squares
 
-from models.pnl_calib.utils.utils_optimize import (
+from models.pnl_calib.utils.optimize import (
     vector_to_mtx,
     point_to_line_distance,
     get_opt_vector,

@@ -1,26 +1,19 @@
-import sys
-import os
 import torch
 import yaml
 import numpy as np
 import cv2
 import torchvision.transforms as T
-import torchvision.transforms.functional as f
-from PIL import Image
 from models.pnl_calib.model.cls_hrnet import get_cls_net
 from models.pnl_calib.model.cls_hrnet_l import get_cls_net as get_cls_net_l
-from models.pnl_calib.utils.utils_calib import FramebyFrameCalib
-from models.pnl_calib.utils.utils_heatmap import (
+from models.pnl_calib.utils.calib import FramebyFrameCalib
+from models.pnl_calib.utils.heatmap import (
     get_keypoints_from_heatmap_batch_maxpool,
     get_keypoints_from_heatmap_batch_maxpool_l,
     complete_keypoints,
     coords_to_dict,
 )
 
-# Add this directory to sys.path so imports in inference.py work
-current_dir = os.path.dirname(os.path.abspath(__file__))
-if current_dir not in sys.path:
-    sys.path.append(current_dir)
+from utils.timing import timed
 
 
 lines_coords = [
@@ -73,13 +66,11 @@ class PnLCalibWrapper:
         self.line_threshold = 0.7867
         self.pnl_refine = True
 
-        # Load configs
         with open(config_kp, 'r') as f:
             self.cfg_kp = yaml.safe_load(f)
         with open(config_line, 'r') as f:
             self.cfg_line = yaml.safe_load(f)
 
-        # Load models
         self.model_kp = get_cls_net(self.cfg_kp)
         self.model_kp.load_state_dict(torch.load(weights_kp, map_location=device))
         self.model_kp.to(device)
@@ -92,13 +83,13 @@ class PnLCalibWrapper:
 
         self.cam = None
         self.transform2 = T.Resize((540, 960))
+        self._frame_buffer = None
 
+    @timed
     def inference(self, frame):
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame_pil = Image.fromarray(frame_rgb)
-
-        frame_tensor = f.to_tensor(frame_pil).float().unsqueeze(0)
-        _, _, h_original, w_original = frame_tensor.size()
+        frame_np = frame_rgb.transpose(2, 0, 1).astype(np.float32) / 255.0
+        frame_tensor = torch.from_numpy(frame_np).unsqueeze(0)
 
         if frame_tensor.size()[-1] != 960:
             frame_tensor = self.transform2(frame_tensor)
@@ -106,7 +97,7 @@ class PnLCalibWrapper:
         frame_tensor = frame_tensor.to(self.device)
         b, c, h, w = frame_tensor.size()
 
-        with torch.no_grad():
+        with torch.no_grad(), torch.amp.autocast('cuda'):
             heatmaps = self.model_kp(frame_tensor)
             heatmaps_l = self.model_line(frame_tensor)
 
@@ -121,6 +112,7 @@ class PnLCalibWrapper:
 
         return final_params_dict
 
+    @timed
     def process_frame(self, frame):
         h, w = frame.shape[:2]
         if self.cam is None:
