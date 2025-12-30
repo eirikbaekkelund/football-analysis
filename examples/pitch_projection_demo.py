@@ -54,12 +54,17 @@ class PitchTrackManager:
                 smooth_x = prev_x * (1 - self.alpha) + x * self.alpha
                 smooth_y = prev_y * (1 - self.alpha) + y * self.alpha
 
-                # velocity (pixels/frame)
-                vx = smooth_x - prev_x
-                vy = smooth_y - prev_y
+                # velocity (pixels/frame) - calculated from smoothed positions
+                inst_vx = smooth_x - prev_x
+                inst_vy = smooth_y - prev_y
+
+                # smooth velocity vectors as well
+                prev_vx, prev_vy = self.tracks[tid]["velocity"]
+                smooth_vx = prev_vx * (1 - self.alpha) + inst_vx * self.alpha
+                smooth_vy = prev_vy * (1 - self.alpha) + inst_vy * self.alpha
 
                 self.tracks[tid]["pos"] = (smooth_x, smooth_y)
-                self.tracks[tid]["velocity"] = (vx, vy)
+                self.tracks[tid]["velocity"] = (smooth_vx, smooth_vy)
                 self.tracks[tid]["last_seen"] = frame_idx
                 if team is not None:
                     self.tracks[tid]["team"] = team
@@ -68,7 +73,6 @@ class PitchTrackManager:
                 if len(self.tracks[tid]["history"]) > 50:
                     self.tracks[tid]["history"].pop(0)
 
-        # Handle missing tracks
         active_tracks = []
         to_remove = []
 
@@ -118,11 +122,7 @@ def load_player_detector(model_path: str, device: torch.device):
         model = YOLO(model_path)
     except Exception as e:
         print(f"Could not load {model_path}. Error: {e}")
-        if "yolo11n.pt" in model_path:
-            print("Falling back to yolov8m.pt...")
-            model = YOLO("yolov8m.pt")
-        else:
-            raise e
+        raise e
 
     return model
 
@@ -155,9 +155,11 @@ def create_combined_visualization(
         x1, y1, x2, y2 = map(int, box)
 
         if team_id == 0:
-            color = pitch_viz.team1_color if pitch_viz else (255, 0, 0)
+            color = pitch_viz.team1_color if pitch_viz else (0, 0, 255)
         elif team_id == 1:
-            color = pitch_viz.team2_color if pitch_viz else (0, 0, 255)
+            color = pitch_viz.team2_color if pitch_viz else (255, 0, 0)
+        elif team_id == 2:  # officials (referee + linesmen)
+            color = pitch_viz.referee_color if pitch_viz else (0, 255, 255)
         else:
             color = pitch_viz.unknown_color if pitch_viz else (128, 128, 128)
 
@@ -179,7 +181,7 @@ def create_combined_visualization(
 def draw_pitch_overlay(
     frame: np.ndarray,
     homography: HomographyEstimator,
-    color: Tuple[int, int, int] = (255, 255, 0),  # Cyan
+    color: Tuple[int, int, int] = (255, 255, 0),  # cyan
     thickness: int = 2,
 ) -> np.ndarray:
     """
@@ -327,12 +329,13 @@ def main():
                 else:
                     homography_ok = False
 
-            # Run YOLO11 tracking with BoT-SORT
             results = player_detector.track(
                 frame, persist=True, tracker="botsort.yaml", verbose=False, classes=track_classes
             )
 
             tracks = []
+            pitch_positions = {}  # track_id -> (x, y) in meters
+
             if results and results[0].boxes.id is not None:
                 boxes = results[0].boxes.xyxy.cpu().numpy()
                 track_ids = results[0].boxes.id.int().cpu().numpy()
@@ -341,7 +344,13 @@ def main():
                 for box, track_id in zip(boxes, track_ids):
                     raw_tracks.append({'box': box.tolist(), 'id': int(track_id)})
 
-                tracks = team_classifier.update(raw_tracks, frame_rgb)
+                    # pitch position for linesman detection
+                    if homography_ok:
+                        pitch_pos = homography.project_player_to_pitch(box.tolist())
+                        if pitch_pos is not None:
+                            pitch_positions[int(track_id)] = pitch_pos
+
+                tracks = team_classifier.update(raw_tracks, frame_rgb, pitch_positions)
 
             current_observations = []
             for track in tracks:

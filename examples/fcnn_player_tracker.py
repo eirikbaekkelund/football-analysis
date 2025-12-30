@@ -25,7 +25,7 @@ def process_video(video_path: str, checkpoint_path: str, max_duration: float = N
     model.to(DEVICE)
     model.eval()
 
-    tracker = PlayerTracker(max_age=10, iou_threshold=0.3)
+    tracker = PlayerTracker(max_age=30, iou_threshold=0.3)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():

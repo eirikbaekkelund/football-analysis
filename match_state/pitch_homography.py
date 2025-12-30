@@ -1,53 +1,26 @@
-"""
-Homography estimation for projecting camera view to 2D pitch coordinates.
-
-Uses detected line keypoints from the line detector to compute a homography matrix
-that maps pixel coordinates to real-world pitch coordinates (in meters).
-
-Standard pitch dimensions (FIFA regulations):
-- Length: 105m (touchline)
-- Width: 68m (goal line)
-- Origin: center of pitch (0, 0)
-- X-axis: along touchline (-52.5 to 52.5)
-- Y-axis: along goal line (-34 to 34)
-"""
-
 import cv2
 import numpy as np
 import torch
+from pydantic import BaseModel
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass
 
 
-# Standard FIFA pitch dimensions (in meters)
+# pitch dimensions (in meters)
 PITCH_LENGTH = 105.0  # touchline length
 PITCH_WIDTH = 68.0  # goal line length
-
-# Derived measurements
 HALF_LENGTH = PITCH_LENGTH / 2  # 52.5m
 HALF_WIDTH = PITCH_WIDTH / 2  # 34m
-
-# Penalty area: 40.32m wide, 16.5m from goal line
 PENALTY_AREA_WIDTH = 40.32
 PENALTY_AREA_DEPTH = 16.5
-
-# Goal area: 18.32m wide, 5.5m from goal line
 GOAL_AREA_WIDTH = 18.32
 GOAL_AREA_DEPTH = 5.5
-
-# Center circle radius
 CENTER_CIRCLE_RADIUS = 9.15
-
-# Penalty spot distance from goal line
 PENALTY_SPOT_DISTANCE = 11.0
-
-# Goal dimensions
 GOAL_WIDTH = 7.32
 GOAL_HEIGHT = 2.44
 
 
-@dataclass
-class PitchPoint:
+class PitchPoint(BaseModel):
     """A point on the pitch in real-world coordinates (meters)."""
 
     x: float  # Along touchline, -52.5 (left) to 52.5 (right)
@@ -57,34 +30,27 @@ class PitchPoint:
         return np.array([self.x, self.y], dtype=np.float32)
 
 
-# Mapping from line class keypoints to pitch coordinates
-# Each line class maps to a list of (keypoint_index, PitchPoint) tuples
-# Based on SoccerNet calibration annotation conventions
-
 PITCH_LINE_COORDINATES: Dict[str, List[Tuple[int, PitchPoint]]] = {
-    # Side lines (touchlines)
     "Side line top": [
-        (0, PitchPoint(-HALF_LENGTH, HALF_WIDTH)),  # Top-left corner
-        (1, PitchPoint(HALF_LENGTH, HALF_WIDTH)),  # Top-right corner
+        (0, PitchPoint(-HALF_LENGTH, HALF_WIDTH)),  # top-left corner
+        (1, PitchPoint(HALF_LENGTH, HALF_WIDTH)),  # top-right corner
     ],
     "Side line bottom": [
-        (0, PitchPoint(-HALF_LENGTH, -HALF_WIDTH)),  # Bottom-left corner
-        (1, PitchPoint(HALF_LENGTH, -HALF_WIDTH)),  # Bottom-right corner
+        (0, PitchPoint(-HALF_LENGTH, -HALF_WIDTH)),  # bottom-left corner
+        (1, PitchPoint(HALF_LENGTH, -HALF_WIDTH)),  # bottom-right corner
     ],
     "Side line left": [
-        (0, PitchPoint(-HALF_LENGTH, -HALF_WIDTH)),  # Bottom-left corner
-        (1, PitchPoint(-HALF_LENGTH, HALF_WIDTH)),  # Top-left corner
+        (0, PitchPoint(-HALF_LENGTH, -HALF_WIDTH)),  # bottom-left corner
+        (1, PitchPoint(-HALF_LENGTH, HALF_WIDTH)),  # top-left corner
     ],
     "Side line right": [
-        (0, PitchPoint(HALF_LENGTH, -HALF_WIDTH)),  # Bottom-right corner
-        (1, PitchPoint(HALF_LENGTH, HALF_WIDTH)),  # Top-right corner
+        (0, PitchPoint(HALF_LENGTH, -HALF_WIDTH)),  # bottom-right corner
+        (1, PitchPoint(HALF_LENGTH, HALF_WIDTH)),  # top-right corner
     ],
-    # Middle line (halfway line)
     "Middle line": [
-        (0, PitchPoint(0, -HALF_WIDTH)),  # Bottom of halfway line
-        (1, PitchPoint(0, HALF_WIDTH)),  # Top of halfway line
+        (0, PitchPoint(0, -HALF_WIDTH)),  # bottom of halfway line
+        (1, PitchPoint(0, HALF_WIDTH)),  # top of halfway line
     ],
-    # Big rectangle (penalty area) - LEFT side
     "Big rect. left main": [
         (0, PitchPoint(-HALF_LENGTH + PENALTY_AREA_DEPTH, -PENALTY_AREA_WIDTH / 2)),
         (1, PitchPoint(-HALF_LENGTH + PENALTY_AREA_DEPTH, PENALTY_AREA_WIDTH / 2)),
@@ -97,7 +63,6 @@ PITCH_LINE_COORDINATES: Dict[str, List[Tuple[int, PitchPoint]]] = {
         (0, PitchPoint(-HALF_LENGTH, -PENALTY_AREA_WIDTH / 2)),
         (1, PitchPoint(-HALF_LENGTH + PENALTY_AREA_DEPTH, -PENALTY_AREA_WIDTH / 2)),
     ],
-    # Big rectangle (penalty area) - RIGHT side
     "Big rect. right main": [
         (0, PitchPoint(HALF_LENGTH - PENALTY_AREA_DEPTH, -PENALTY_AREA_WIDTH / 2)),
         (1, PitchPoint(HALF_LENGTH - PENALTY_AREA_DEPTH, PENALTY_AREA_WIDTH / 2)),
@@ -110,7 +75,6 @@ PITCH_LINE_COORDINATES: Dict[str, List[Tuple[int, PitchPoint]]] = {
         (0, PitchPoint(HALF_LENGTH - PENALTY_AREA_DEPTH, -PENALTY_AREA_WIDTH / 2)),
         (1, PitchPoint(HALF_LENGTH, -PENALTY_AREA_WIDTH / 2)),
     ],
-    # Small rectangle (goal area) - LEFT side
     "Small rect. left main": [
         (0, PitchPoint(-HALF_LENGTH + GOAL_AREA_DEPTH, -GOAL_AREA_WIDTH / 2)),
         (1, PitchPoint(-HALF_LENGTH + GOAL_AREA_DEPTH, GOAL_AREA_WIDTH / 2)),
@@ -123,7 +87,6 @@ PITCH_LINE_COORDINATES: Dict[str, List[Tuple[int, PitchPoint]]] = {
         (0, PitchPoint(-HALF_LENGTH, -GOAL_AREA_WIDTH / 2)),
         (1, PitchPoint(-HALF_LENGTH + GOAL_AREA_DEPTH, -GOAL_AREA_WIDTH / 2)),
     ],
-    # Small rectangle (goal area) - RIGHT side
     "Small rect. right main": [
         (0, PitchPoint(HALF_LENGTH - GOAL_AREA_DEPTH, -GOAL_AREA_WIDTH / 2)),
         (1, PitchPoint(HALF_LENGTH - GOAL_AREA_DEPTH, GOAL_AREA_WIDTH / 2)),
@@ -136,20 +99,18 @@ PITCH_LINE_COORDINATES: Dict[str, List[Tuple[int, PitchPoint]]] = {
         (0, PitchPoint(HALF_LENGTH - GOAL_AREA_DEPTH, -GOAL_AREA_WIDTH / 2)),
         (1, PitchPoint(HALF_LENGTH, -GOAL_AREA_WIDTH / 2)),
     ],
-    # Goals - LEFT
     "Goal left crossbar": [
         (0, PitchPoint(-HALF_LENGTH, -GOAL_WIDTH / 2)),
         (1, PitchPoint(-HALF_LENGTH, GOAL_WIDTH / 2)),
     ],
     "Goal left post left ": [
         (0, PitchPoint(-HALF_LENGTH, -GOAL_WIDTH / 2)),
-        (1, PitchPoint(-HALF_LENGTH, -GOAL_WIDTH / 2)),  # Same point (vertical post)
+        (1, PitchPoint(-HALF_LENGTH, -GOAL_WIDTH / 2)),
     ],
     "Goal left post right": [
         (0, PitchPoint(-HALF_LENGTH, GOAL_WIDTH / 2)),
         (1, PitchPoint(-HALF_LENGTH, GOAL_WIDTH / 2)),
     ],
-    # Goals - RIGHT
     "Goal right crossbar": [
         (0, PitchPoint(HALF_LENGTH, -GOAL_WIDTH / 2)),
         (1, PitchPoint(HALF_LENGTH, GOAL_WIDTH / 2)),
@@ -164,8 +125,7 @@ PITCH_LINE_COORDINATES: Dict[str, List[Tuple[int, PitchPoint]]] = {
     ],
 }
 
-# Circle keypoints - sampled around the circle
-# Circles have ~9 keypoints in SoccerNet annotations
+
 def _get_circle_points(
     center_x: float, center_y: float, radius: float, n_points: int = 9
 ) -> List[Tuple[int, PitchPoint]]:
@@ -479,14 +439,18 @@ class PitchVisualizer:
         self.margin = margin
         self.scale = scale
 
-        # Colors
-        self.pitch_color = (34, 139, 34)  # Forest green
-        self.line_color = (255, 255, 255)  # White
-        self.team1_color = (0, 0, 255)  # Red (BGR)
-        self.team2_color = (255, 0, 0)  # Blue (BGR)
-        self.unknown_color = (128, 128, 128)  # Gray
+        self.pitch_color = (34, 139, 34)  # green
+        self.line_color = (255, 255, 255)  # white
+        self.team1_color = (0, 0, 255)  # red
+        self.team2_color = (255, 0, 0)  # blue
+        self.referee_color = (0, 255, 255)  # yellow
+        self.unknown_color = (128, 128, 128)  # gray
 
-        # Create base pitch image
+        # spatial topology smoothing params
+        self.prev_inf_t0 = None
+        self.prev_inf_t1 = None
+        self.heatmap_alpha = 0.1
+
         self.base_pitch = self._draw_pitch()
 
     def _pitch_to_pixel(self, x: float, y: float) -> Tuple[int, int]:
@@ -616,6 +580,8 @@ class PitchVisualizer:
                 color = self.team1_color
             elif team_id == 1:
                 color = self.team2_color
+            elif team_id == 2:
+                color = self.referee_color
             else:
                 color = self.unknown_color
 
@@ -719,7 +685,6 @@ class PitchVisualizer:
                 gray = int(100 + 155 * alpha)
                 cv2.line(img, p1, p2, (gray, gray, gray), 2)
 
-        # 3. Draw players and vectors
         for x, y, vx, vy, track_id, team_id in pitch_positions:
             if abs(x) > HALF_LENGTH + 5 or abs(y) > HALF_WIDTH + 5:
                 continue
@@ -730,12 +695,12 @@ class PitchVisualizer:
                 color = self.team1_color
             elif team_id == 1:
                 color = self.team2_color
+            elif team_id == 2:
+                color = self.referee_color
             else:
                 color = self.unknown_color
 
-            # Draw velocity vector
             if draw_vectors and (abs(vx) > 0.1 or abs(vy) > 0.1):
-                # Scale velocity for visualization (e.g. 1 second projection)
                 end_x = x + vx * 15  # 15 frames projection (~0.5s)
                 end_y = y + vy * 15
                 px_end, py_end = self._pitch_to_pixel(end_x, end_y)
@@ -752,13 +717,10 @@ class PitchVisualizer:
         Compute spatial dominance map based on player positions and velocities.
         Returns raw influence maps for Team 0 and Team 1.
         """
-        # Create grid covering the full image area (including margins)
-        # We need to map pixels back to meters to evaluate the Gaussian
-
+        # we need to map pixels back to meters to evaluate the Gaussian
         h_img, w_img = self.height + 2 * self.margin, self.width + 2 * self.margin
 
-        # Create coordinate grid in pixels
-        # Downsample for speed
+        # first we create a pixel grid and downsample for speed
         scale_factor = 0.25
         h_small, w_small = int(h_img * scale_factor), int(w_img * scale_factor)
 
@@ -766,14 +728,9 @@ class PitchVisualizer:
         y_indices = np.arange(h_small)
         X_pix, Y_pix = np.meshgrid(x_indices, y_indices)
 
-        # Convert pixel coordinates to pitch coordinates (meters)
-        # Inverse of _pitch_to_pixel logic
-        # px = margin + (x + HALF_LENGTH) * scale
-        # x = (px - margin) / scale - HALF_LENGTH
-
+        # pixel coordinates to pitch coordinates (meters)
+        # is inverse of _pitch_to_pixel logic
         X_meters = (X_pix / scale_factor - self.margin) / self.scale - HALF_LENGTH
-        # py = margin + (y + HALF_WIDTH) * scale
-        # y = (py - margin) / scale - HALF_WIDTH
         Y_meters = (Y_pix / scale_factor - self.margin) / self.scale - HALF_WIDTH
 
         influence_t0 = np.zeros_like(X_meters)
@@ -783,37 +740,46 @@ class PitchVisualizer:
             if team_id not in [0, 1]:
                 continue
 
-            # Gaussian parameters
+            # gaussian ball of pixel velocity influence
             speed = np.sqrt(vx**2 + vy**2)
-            angle = np.arctan2(vy, vx)  # Note: vy is in pitch coords (meters/frame)
+            angle = np.arctan2(vy, vx)  # NOTE: angle is used for directional influence
 
-            # Shift center based on momentum (0.5s projection)
-            # This makes influence extend forward and lag behind
+            # center based on momentum (0.5s projection)
+            # this makes influence extend forward and lag behind
             mu_x = px + vx * 15.0  # 15 frames ~ 0.5s
             mu_y = py + vy * 15.0
 
-            # Base influence radius (meters)
-            sigma_x = 4.0 * (1 + speed * 0.5)  # Elongate with speed
-            sigma_y = 4.0
+            # base influence radius (meters)
+            # elongate in direction of motion (momentum)
+            sigma_x = 4.0 * (1 + speed * 0.5)
+            # narrow cross-track influence as speed increases (harder to turn)
+            sigma_y = 4.0 / (1 + speed * 0.2)
 
-            # Rotate grid coordinates to align with player velocity
+            # rotate grid coordinates to align with player velocity
             dx = X_meters - mu_x
             dy = Y_meters - mu_y
 
-            # Standard rotation
+            # standard rotation for 2D points (i.e., rotate grid by -angle)
             dx_rot = dx * np.cos(angle) + dy * np.sin(angle)
             dy_rot = -dx * np.sin(angle) + dy * np.cos(angle)
 
-            # Compute Gaussian
-            g = np.exp(-(dx_rot**2 / (2 * sigma_x**2) + dy_rot**2 / (2 * sigma_y**2)))
+            gaussian = np.exp(-(dx_rot**2 / (2 * sigma_x**2) + dy_rot**2 / (2 * sigma_y**2)))
 
             if team_id == 0:
-                influence_t0 += g
+                influence_t0 += gaussian
             else:
-                influence_t1 += g
+                influence_t1 += gaussian
 
-        # Resize back to full image size
+        # resize back to full image size
         inf_t0_full = cv2.resize(influence_t0, (w_img, h_img))
         inf_t1_full = cv2.resize(influence_t1, (w_img, h_img))
+
+        # temporal smoothing
+        if self.prev_inf_t0 is not None:
+            inf_t0_full = self.prev_inf_t0 * (1 - self.heatmap_alpha) + inf_t0_full * self.heatmap_alpha
+            inf_t1_full = self.prev_inf_t1 * (1 - self.heatmap_alpha) + inf_t1_full * self.heatmap_alpha
+
+        self.prev_inf_t0 = inf_t0_full
+        self.prev_inf_t1 = inf_t1_full
 
         return inf_t0_full, inf_t1_full

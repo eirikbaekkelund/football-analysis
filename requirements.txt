@@ -1,11 +1,10 @@
-# Core dependencies (CUDA packages installed separately)
 SoccerNet
 numpy
 pandas
 scikit-learn
 scipy
-
-# Note: torch and opencv-python are installed via:
+pydantic
+# NOTE: torch and opencv-python are installed via:
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 #   pip install opencv-python
 # OpenCV CUDA requires building from source or using opencv-contrib-python-headless
