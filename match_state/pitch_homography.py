@@ -21,8 +21,6 @@ GOAL_HEIGHT = 2.44
 
 
 class PitchPoint(BaseModel):
-    """A point on the pitch in real-world coordinates (meters)."""
-
     x: float  # Along touchline, -52.5 (left) to 52.5 (right)
     y: float  # Along goal line, -34 (bottom) to 34 (top)
 
@@ -32,96 +30,96 @@ class PitchPoint(BaseModel):
 
 PITCH_LINE_COORDINATES: Dict[str, List[Tuple[int, PitchPoint]]] = {
     "Side line top": [
-        (0, PitchPoint(-HALF_LENGTH, HALF_WIDTH)),  # top-left corner
-        (1, PitchPoint(HALF_LENGTH, HALF_WIDTH)),  # top-right corner
+        (0, PitchPoint(x=-HALF_LENGTH, y=HALF_WIDTH)),  # top-left corner
+        (1, PitchPoint(x=HALF_LENGTH, y=HALF_WIDTH)),  # top-right corner
     ],
     "Side line bottom": [
-        (0, PitchPoint(-HALF_LENGTH, -HALF_WIDTH)),  # bottom-left corner
-        (1, PitchPoint(HALF_LENGTH, -HALF_WIDTH)),  # bottom-right corner
+        (0, PitchPoint(x=-HALF_LENGTH, y=-HALF_WIDTH)),  # bottom-left corner
+        (1, PitchPoint(x=HALF_LENGTH, y=-HALF_WIDTH)),  # bottom-right corner
     ],
     "Side line left": [
-        (0, PitchPoint(-HALF_LENGTH, -HALF_WIDTH)),  # bottom-left corner
-        (1, PitchPoint(-HALF_LENGTH, HALF_WIDTH)),  # top-left corner
+        (0, PitchPoint(x=-HALF_LENGTH, y=-HALF_WIDTH)),  # bottom-left corner
+        (1, PitchPoint(x=-HALF_LENGTH, y=HALF_WIDTH)),  # top-left corner
     ],
     "Side line right": [
-        (0, PitchPoint(HALF_LENGTH, -HALF_WIDTH)),  # bottom-right corner
-        (1, PitchPoint(HALF_LENGTH, HALF_WIDTH)),  # top-right corner
+        (0, PitchPoint(x=HALF_LENGTH, y=-HALF_WIDTH)),  # bottom-right corner
+        (1, PitchPoint(x=HALF_LENGTH, y=HALF_WIDTH)),  # top-right corner
     ],
     "Middle line": [
-        (0, PitchPoint(0, -HALF_WIDTH)),  # bottom of halfway line
-        (1, PitchPoint(0, HALF_WIDTH)),  # top of halfway line
+        (0, PitchPoint(x=0, y=-HALF_WIDTH)),  # bottom of halfway line
+        (1, PitchPoint(x=0, y=HALF_WIDTH)),  # top of halfway line
     ],
     "Big rect. left main": [
-        (0, PitchPoint(-HALF_LENGTH + PENALTY_AREA_DEPTH, -PENALTY_AREA_WIDTH / 2)),
-        (1, PitchPoint(-HALF_LENGTH + PENALTY_AREA_DEPTH, PENALTY_AREA_WIDTH / 2)),
+        (0, PitchPoint(x=-HALF_LENGTH + PENALTY_AREA_DEPTH, y=-PENALTY_AREA_WIDTH / 2)),
+        (1, PitchPoint(x=-HALF_LENGTH + PENALTY_AREA_DEPTH, y=PENALTY_AREA_WIDTH / 2)),
     ],
     "Big rect. left top": [
-        (0, PitchPoint(-HALF_LENGTH, PENALTY_AREA_WIDTH / 2)),
-        (1, PitchPoint(-HALF_LENGTH + PENALTY_AREA_DEPTH, PENALTY_AREA_WIDTH / 2)),
+        (0, PitchPoint(x=-HALF_LENGTH, y=PENALTY_AREA_WIDTH / 2)),
+        (1, PitchPoint(x=-HALF_LENGTH + PENALTY_AREA_DEPTH, y=PENALTY_AREA_WIDTH / 2)),
     ],
     "Big rect. left bottom": [
-        (0, PitchPoint(-HALF_LENGTH, -PENALTY_AREA_WIDTH / 2)),
-        (1, PitchPoint(-HALF_LENGTH + PENALTY_AREA_DEPTH, -PENALTY_AREA_WIDTH / 2)),
+        (0, PitchPoint(x=-HALF_LENGTH, y=-PENALTY_AREA_WIDTH / 2)),
+        (1, PitchPoint(x=-HALF_LENGTH + PENALTY_AREA_DEPTH, y=-PENALTY_AREA_WIDTH / 2)),
     ],
     "Big rect. right main": [
-        (0, PitchPoint(HALF_LENGTH - PENALTY_AREA_DEPTH, -PENALTY_AREA_WIDTH / 2)),
-        (1, PitchPoint(HALF_LENGTH - PENALTY_AREA_DEPTH, PENALTY_AREA_WIDTH / 2)),
+        (0, PitchPoint(x=HALF_LENGTH - PENALTY_AREA_DEPTH, y=-PENALTY_AREA_WIDTH / 2)),
+        (1, PitchPoint(x=HALF_LENGTH - PENALTY_AREA_DEPTH, y=PENALTY_AREA_WIDTH / 2)),
     ],
     "Big rect. right top": [
-        (0, PitchPoint(HALF_LENGTH - PENALTY_AREA_DEPTH, PENALTY_AREA_WIDTH / 2)),
-        (1, PitchPoint(HALF_LENGTH, PENALTY_AREA_WIDTH / 2)),
+        (0, PitchPoint(x=HALF_LENGTH - PENALTY_AREA_DEPTH, y=PENALTY_AREA_WIDTH / 2)),
+        (1, PitchPoint(x=HALF_LENGTH, y=PENALTY_AREA_WIDTH / 2)),
     ],
     "Big rect. right bottom": [
-        (0, PitchPoint(HALF_LENGTH - PENALTY_AREA_DEPTH, -PENALTY_AREA_WIDTH / 2)),
-        (1, PitchPoint(HALF_LENGTH, -PENALTY_AREA_WIDTH / 2)),
+        (0, PitchPoint(x=HALF_LENGTH - PENALTY_AREA_DEPTH, y=-PENALTY_AREA_WIDTH / 2)),
+        (1, PitchPoint(x=HALF_LENGTH, y=-PENALTY_AREA_WIDTH / 2)),
     ],
     "Small rect. left main": [
-        (0, PitchPoint(-HALF_LENGTH + GOAL_AREA_DEPTH, -GOAL_AREA_WIDTH / 2)),
-        (1, PitchPoint(-HALF_LENGTH + GOAL_AREA_DEPTH, GOAL_AREA_WIDTH / 2)),
+        (0, PitchPoint(x=-HALF_LENGTH + GOAL_AREA_DEPTH, y=-GOAL_AREA_WIDTH / 2)),
+        (1, PitchPoint(x=-HALF_LENGTH + GOAL_AREA_DEPTH, y=GOAL_AREA_WIDTH / 2)),
     ],
     "Small rect. left top": [
-        (0, PitchPoint(-HALF_LENGTH, GOAL_AREA_WIDTH / 2)),
-        (1, PitchPoint(-HALF_LENGTH + GOAL_AREA_DEPTH, GOAL_AREA_WIDTH / 2)),
+        (0, PitchPoint(x=-HALF_LENGTH, y=GOAL_AREA_WIDTH / 2)),
+        (1, PitchPoint(x=-HALF_LENGTH + GOAL_AREA_DEPTH, y=GOAL_AREA_WIDTH / 2)),
     ],
     "Small rect. left bottom": [
-        (0, PitchPoint(-HALF_LENGTH, -GOAL_AREA_WIDTH / 2)),
-        (1, PitchPoint(-HALF_LENGTH + GOAL_AREA_DEPTH, -GOAL_AREA_WIDTH / 2)),
+        (0, PitchPoint(x=-HALF_LENGTH, y=-GOAL_AREA_WIDTH / 2)),
+        (1, PitchPoint(x=-HALF_LENGTH + GOAL_AREA_DEPTH, y=-GOAL_AREA_WIDTH / 2)),
     ],
     "Small rect. right main": [
-        (0, PitchPoint(HALF_LENGTH - GOAL_AREA_DEPTH, -GOAL_AREA_WIDTH / 2)),
-        (1, PitchPoint(HALF_LENGTH - GOAL_AREA_DEPTH, GOAL_AREA_WIDTH / 2)),
+        (0, PitchPoint(x=HALF_LENGTH - GOAL_AREA_DEPTH, y=-GOAL_AREA_WIDTH / 2)),
+        (1, PitchPoint(x=HALF_LENGTH - GOAL_AREA_DEPTH, y=GOAL_AREA_WIDTH / 2)),
     ],
     "Small rect. right top": [
-        (0, PitchPoint(HALF_LENGTH - GOAL_AREA_DEPTH, GOAL_AREA_WIDTH / 2)),
-        (1, PitchPoint(HALF_LENGTH, GOAL_AREA_WIDTH / 2)),
+        (0, PitchPoint(x=HALF_LENGTH - GOAL_AREA_DEPTH, y=GOAL_AREA_WIDTH / 2)),
+        (1, PitchPoint(x=HALF_LENGTH, y=GOAL_AREA_WIDTH / 2)),
     ],
     "Small rect. right bottom": [
-        (0, PitchPoint(HALF_LENGTH - GOAL_AREA_DEPTH, -GOAL_AREA_WIDTH / 2)),
-        (1, PitchPoint(HALF_LENGTH, -GOAL_AREA_WIDTH / 2)),
+        (0, PitchPoint(x=HALF_LENGTH - GOAL_AREA_DEPTH, y=-GOAL_AREA_WIDTH / 2)),
+        (1, PitchPoint(x=HALF_LENGTH, y=-GOAL_AREA_WIDTH / 2)),
     ],
     "Goal left crossbar": [
-        (0, PitchPoint(-HALF_LENGTH, -GOAL_WIDTH / 2)),
-        (1, PitchPoint(-HALF_LENGTH, GOAL_WIDTH / 2)),
+        (0, PitchPoint(x=-HALF_LENGTH, y=-GOAL_WIDTH / 2)),
+        (1, PitchPoint(x=-HALF_LENGTH, y=GOAL_WIDTH / 2)),
     ],
     "Goal left post left ": [
-        (0, PitchPoint(-HALF_LENGTH, -GOAL_WIDTH / 2)),
-        (1, PitchPoint(-HALF_LENGTH, -GOAL_WIDTH / 2)),
+        (0, PitchPoint(x=-HALF_LENGTH, y=-GOAL_WIDTH / 2)),
+        (1, PitchPoint(x=-HALF_LENGTH, y=-GOAL_WIDTH / 2)),
     ],
     "Goal left post right": [
-        (0, PitchPoint(-HALF_LENGTH, GOAL_WIDTH / 2)),
-        (1, PitchPoint(-HALF_LENGTH, GOAL_WIDTH / 2)),
+        (0, PitchPoint(x=-HALF_LENGTH, y=GOAL_WIDTH / 2)),
+        (1, PitchPoint(x=-HALF_LENGTH, y=GOAL_WIDTH / 2)),
     ],
     "Goal right crossbar": [
-        (0, PitchPoint(HALF_LENGTH, -GOAL_WIDTH / 2)),
-        (1, PitchPoint(HALF_LENGTH, GOAL_WIDTH / 2)),
+        (0, PitchPoint(x=HALF_LENGTH, y=-GOAL_WIDTH / 2)),
+        (1, PitchPoint(x=HALF_LENGTH, y=GOAL_WIDTH / 2)),
     ],
     "Goal right post left": [
-        (0, PitchPoint(HALF_LENGTH, -GOAL_WIDTH / 2)),
-        (1, PitchPoint(HALF_LENGTH, -GOAL_WIDTH / 2)),
+        (0, PitchPoint(x=HALF_LENGTH, y=-GOAL_WIDTH / 2)),
+        (1, PitchPoint(x=HALF_LENGTH, y=-GOAL_WIDTH / 2)),
     ],
     "Goal right post right": [
-        (0, PitchPoint(HALF_LENGTH, GOAL_WIDTH / 2)),
-        (1, PitchPoint(HALF_LENGTH, GOAL_WIDTH / 2)),
+        (0, PitchPoint(x=HALF_LENGTH, y=GOAL_WIDTH / 2)),
+        (1, PitchPoint(x=HALF_LENGTH, y=GOAL_WIDTH / 2)),
     ],
 }
 
@@ -135,7 +133,7 @@ def _get_circle_points(
         angle = 2 * np.pi * i / n_points
         x = center_x + radius * np.cos(angle)
         y = center_y + radius * np.sin(angle)
-        points.append((i, PitchPoint(x, y)))
+        points.append((i, PitchPoint(x=x, y=y)))
     return points
 
 
