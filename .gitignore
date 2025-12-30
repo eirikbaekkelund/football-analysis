@@ -4,6 +4,7 @@ __pycache__/
 .DS_Store
 *.pt
 *.pth
+*.onnx
 *.mp4
 *.zip
 soccernet/tracking/*
