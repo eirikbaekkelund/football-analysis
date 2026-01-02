@@ -167,7 +167,7 @@ class HomographyEstimator:
         ransac_reproj_threshold: float = 3.0,
         confidence_threshold: float = 0.5,
         visibility_threshold: float = 0.5,
-        smoothing_alpha: float = 0.3,
+        smoothing_alpha: float = 0.15,  # Lower = smoother (was 0.3)
     ):
         """
         Args:
@@ -191,10 +191,35 @@ class HomographyEstimator:
         self.inliers: Optional[np.ndarray] = None
         self.num_inliers: int = 0
 
-        # Import line classes
+        # self-correction: temporal fallback tracking
+        self.frames_since_valid: int = 0
+        self.max_fallback_frames: int = 15
+        self.last_valid_H: Optional[np.ndarray] = None
+
         from soccernet.calibration_data import LINE_CLASSES
 
         self.line_classes = LINE_CLASSES
+
+    def _project_with_H(self, points: np.ndarray, H: np.ndarray) -> Optional[np.ndarray]:
+        """Project image points to pitch using specific homography matrix."""
+        if H is None:
+            return None
+
+        points = np.asarray(points, dtype=np.float32)
+        if points.ndim == 1:
+            points = points.reshape(1, 2)
+
+        ones = np.ones((points.shape[0], 1), dtype=np.float32)
+        points_h = np.hstack([points, ones])
+
+        projected = (H @ points_h.T).T
+
+        # Avoid division by zero
+        w = projected[:, 2:3]
+        if np.any(np.abs(w) < 1e-6):
+            return None
+
+        return projected[:, :2] / w
 
     def estimate(
         self,
@@ -291,16 +316,46 @@ class HomographyEstimator:
             self.num_inliers = inliers1
 
         if self.H is None:
-            # print("Homography computation failed")
+            # Self-correction: Use fallback if available
+            self.frames_since_valid += 1
+            if self.last_valid_H is not None and self.frames_since_valid <= self.max_fallback_frames:
+                # Decay confidence: apply slight blur to old H as time passes
+                decay = 1.0 - (self.frames_since_valid / self.max_fallback_frames) * 0.1
+                self.H_smoothed = self.last_valid_H * decay
+                return True  # Use fallback
             return False
 
         # Require minimum inliers for a reliable homography
         if self.num_inliers < self.min_inliers:
             print(f"Not enough inliers: {self.num_inliers} < {self.min_inliers}")
+            self.frames_since_valid += 1
             # Keep previous homography if available
-            if self.H_smoothed is not None:
+            if self.last_valid_H is not None and self.frames_since_valid <= self.max_fallback_frames:
+                self.H_smoothed = self.last_valid_H
                 return True  # Use old homography
             return False
+
+        # Reset fallback counter on successful estimation
+        self.frames_since_valid = 0
+
+        # Check if new homography would cause extreme position changes
+        if self.H_smoothed is not None:
+            # Test with a few reference points
+            test_points = np.array([[640, 360], [320, 540], [960, 540]], dtype=np.float32)
+
+            # Project with old and new H
+            old_pts = self._project_with_H(test_points, self.H_smoothed)
+            new_pts = self._project_with_H(test_points, self.H)
+
+            if old_pts is not None and new_pts is not None:
+                # Check max displacement
+                displacements = np.linalg.norm(new_pts - old_pts, axis=1)
+                max_disp = np.max(displacements)
+
+                if max_disp > 20.0:  # More than 20m jump is suspicious
+                    # print(f"Rejecting homography with {max_disp:.1f}m displacement")
+                    # Keep old homography
+                    return True
 
         # Temporal smoothing: blend with previous homography
         if self.H_smoothed is None:
@@ -308,6 +363,9 @@ class HomographyEstimator:
         else:
             # Blend new homography with old (exponential moving average)
             self.H_smoothed = (1 - self.smoothing_alpha) * self.H_smoothed + self.smoothing_alpha * self.H
+
+        # Self-correction: Store as last valid for fallback
+        self.last_valid_H = self.H_smoothed.copy()
 
         # Compute inverse for projecting pitch to image
         try:
@@ -418,12 +476,21 @@ class HomographyEstimator:
 
         x, y = float(projected[0, 0]), float(projected[0, 1])
 
-        # Reject unrealistic positions (far outside pitch bounds)
-        # Pitch is 105m x 68m, allow some margin
-        if abs(x) > 60 or abs(y) > 40:
+        # Self-correction: Validate and clamp projection coordinates
+        # Pitch is 105m x 68m centered at origin: x in [-52.5, 52.5], y in [-34, 34]
+        # Allow margin for players slightly off-pitch (touchlines, behind goals)
+        MAX_X = HALF_LENGTH + 5.0  # 57.5m from center
+        MAX_Y = HALF_WIDTH + 5.0  # 39m from center
+
+        # Reject completely invalid projections (numerical errors)
+        if abs(x) > MAX_X * 2 or abs(y) > MAX_Y * 2:
             return None
 
-        return x, y
+        # Clamp to extended pitch bounds (soft correction)
+        x_clamped = np.clip(x, -MAX_X, MAX_X)
+        y_clamped = np.clip(y, -MAX_Y, MAX_Y)
+
+        return x_clamped, y_clamped
 
 
 class PitchVisualizer:
@@ -470,7 +537,6 @@ class PitchVisualizer:
         h_img = self.height + 2 * self.margin
         w_img = self.width + 2 * self.margin
 
-        # Downsample for speed
         self.scale_factor = 0.25
         h_small = int(h_img * self.scale_factor)
         w_small = int(w_img * self.scale_factor)
@@ -479,16 +545,13 @@ class PitchVisualizer:
         self.h_img = h_img
         self.w_img = w_img
 
-        # Create coordinate grids in meters (on GPU)
         x_indices = torch.arange(w_small, device=self.device, dtype=torch.float32)
         y_indices = torch.arange(h_small, device=self.device, dtype=torch.float32)
         Y_pix, X_pix = torch.meshgrid(y_indices, x_indices, indexing='ij')
 
-        # Convert to pitch coordinates (meters)
         self.X_meters = (X_pix / self.scale_factor - self.margin) / self.scale - HALF_LENGTH
         self.Y_meters = (Y_pix / self.scale_factor - self.margin) / self.scale - HALF_WIDTH
 
-        # Pre-allocate influence tensors
         self.inf_t0_gpu = torch.zeros((h_small, w_small), device=self.device, dtype=torch.float32)
         self.inf_t1_gpu = torch.zeros((h_small, w_small), device=self.device, dtype=torch.float32)
 
@@ -511,7 +574,6 @@ class PitchVisualizer:
         self.alpha_mask = np.zeros((self.h_img, self.w_img), dtype=np.float32)
         self.alpha_mask[self.pitch_mask > 0] = 0.4
 
-        # Pre-allocate overlay buffer for heatmap
         self.overlay_buffer = np.zeros((self.h_img, self.w_img, 3), dtype=np.uint8)
 
     def _pitch_to_pixel(self, x: float, y: float) -> Tuple[int, int]:

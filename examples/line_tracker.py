@@ -156,7 +156,7 @@ def process_video(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Line Detection on Video")
-    parser.add_argument("--input", type=str, default="videos/croatia_czechia.mp4", help="Path to input video file")
+    parser.add_argument("--video", type=str, default="videos/croatia_czechia.mp4", help="Path to input video file")
     parser.add_argument(
         "--model", type=str, default="models/line_detection/keypoint_detector.pth", help="Path to model checkpoint"
     )
@@ -165,4 +165,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    process_video(args.input, args.model, args.duration, threshold=args.threshold)
+    process_video(args.video, args.model, args.duration, threshold=args.threshold)

@@ -12,8 +12,8 @@ from PIL import Image
 
 from model.cls_hrnet import get_cls_net
 from model.cls_hrnet_l import get_cls_net as get_cls_net_l
-from models.pnl_calib.utils.calib import FramebyFrameCalib
-from models.pnl_calib.utils.heatmap import (
+from models.pitch.utils.calib import FramebyFrameCalib
+from models.pitch.utils.heatmap import (
     get_keypoints_from_heatmap_batch_maxpool,
     get_keypoints_from_heatmap_batch_maxpool_l,
     complete_keypoints,

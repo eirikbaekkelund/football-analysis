@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 from typing import List
 from sklearn.mixture import GaussianMixture
+from sklearn.cluster import MiniBatchKMeans
 from scipy.optimize import linear_sum_assignment
 
 from utils.timing import timed
@@ -77,6 +78,99 @@ def get_jersey_color_feature(image_rgb: np.ndarray, box: List[float]) -> np.ndar
     shorts_y1 = y1 + int(bbox_h * 0.40)
     shorts_y2 = y1 + int(bbox_h * 0.90)
     shorts_feat = extract_region_mean(shorts_y1, shorts_y2)
+
+    return np.concatenate([shirt_feat, shorts_feat])
+
+
+@timed
+def get_dominant_color_feature(image_rgb: np.ndarray, box: List[float]) -> np.ndarray:
+    """
+    Extracts a robust 6D color feature using K-Means clustering on non-green pixels.
+
+    Strategy:
+    1. Extract player crop (center 50% width).
+    2. Filter out green background pixels.
+    3. Cluster remaining pixels into 2 groups (Shirt, Shorts).
+    4. Sort clusters by vertical position (Upper=Shirt, Lower=Shorts).
+    5. Return [shirt_L, shirt_a, shirt_b, shorts_L, shorts_a, shorts_b].
+
+    This is more robust to pose variations (bending, falling) than fixed crops.
+    """
+    x1, y1, x2, y2 = map(int, box)
+    h_img, w_img, _ = image_rgb.shape
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w_img, x2), min(h_img, y2)
+
+    bbox_h = y2 - y1
+    bbox_w = x2 - x1
+
+    if bbox_h < 15 or bbox_w < 5:
+        return np.zeros(6, dtype=np.float32)
+
+    # Crop center 50% width to avoid background
+    crop_x1 = x1 + int(bbox_w * 0.25)
+    crop_x2 = x2 - int(bbox_w * 0.25)
+
+    crop = image_rgb[y1:y2, crop_x1:crop_x2]
+    if crop.size == 0:
+        return np.zeros(6, dtype=np.float32)
+
+    # 1. Filter Green
+    hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+    h = hsv[:, :, 0].astype(np.float32)
+    s = hsv[:, :, 1].astype(np.float32) / 255.0
+
+    green_center = 60
+    hue_dist = np.minimum(np.abs(h - green_center), 180 - np.abs(h - green_center))
+    # Harder mask for clustering: keep pixels far from green or low saturation (white/black)
+    # Keep if hue_dist > 20 OR saturation < 0.25
+    mask = (hue_dist > 20) | (s < 0.25)
+
+    if mask.sum() < 50:
+        # Fallback to simple mean if not enough pixels
+        return get_jersey_color_feature(image_rgb, box)
+
+    # 2. Prepare data for K-Means
+    # We want to cluster based on Color (Lab) AND Position (Y)
+    # But primarily Color. Let's cluster on Lab first.
+    lab = cv2.cvtColor(crop, cv2.COLOR_RGB2Lab).astype(np.float32)
+
+    valid_pixels = lab[mask]
+    valid_coords = np.argwhere(mask)  # (y, x) relative to crop
+
+    # Need at least some pixels for K-Means
+    if len(valid_pixels) < 10:
+        return get_jersey_color_feature(image_rgb, box)
+
+    # Subsample if too many pixels to speed up
+    if len(valid_pixels) > 1000:
+        indices = np.random.choice(len(valid_pixels), 1000, replace=False)
+        valid_pixels = valid_pixels[indices]
+        valid_coords = valid_coords[indices]
+
+    # 3. K-Means (K=2)
+    try:
+        kmeans = MiniBatchKMeans(n_clusters=2, n_init=3, batch_size=min(256, len(valid_pixels)), random_state=42).fit(
+            valid_pixels
+        )
+        centers = kmeans.cluster_centers_
+        labels = kmeans.labels_
+    except Exception:
+        return get_jersey_color_feature(image_rgb, box)
+
+    # 4. Determine which cluster is Upper (Shirt) and Lower (Shorts)
+    # Calculate mean Y position for each cluster
+    y_coords = valid_coords[:, 0]
+
+    mean_y_0 = y_coords[labels == 0].mean() if (labels == 0).any() else 0
+    mean_y_1 = y_coords[labels == 1].mean() if (labels == 1).any() else bbox_h
+
+    if mean_y_0 < mean_y_1:
+        shirt_feat = centers[0]
+        shorts_feat = centers[1]
+    else:
+        shirt_feat = centers[1]
+        shorts_feat = centers[0]
 
     return np.concatenate([shirt_feat, shorts_feat])
 
@@ -216,12 +310,16 @@ class TeamClassifier:
         self.frame_idx = 0
 
     def _color_distance(self, feat1: np.ndarray, feat2: np.ndarray) -> float:
-        """Euclidean distance between two 6D color features."""
+        """Weighted Euclidean distance between two 6D color features."""
         if feat1 is None or feat2 is None:
             return float('inf')
         if np.linalg.norm(feat1) == 0 or np.linalg.norm(feat2) == 0:
             return float('inf')
-        return float(np.linalg.norm(feat1 - feat2))
+
+        diff = feat1 - feat2
+        # Weights: L=1, a=2.5, b=2.5 for both shirt and shorts (Color is more important than Lightness)
+        weights = np.array([1.0, 2.5, 2.5, 1.0, 2.5, 2.5], dtype=np.float32)
+        return float(np.sqrt(np.sum((diff**2) * weights)))
 
     def _initialize_centers(self, track_ids: List[int], linesman_ids: set) -> bool:
         """
@@ -249,12 +347,12 @@ class TeamClassifier:
         tids = list(features.keys())
         feats = np.array([features[t] for t in tids])
 
-        # Find two most distant tracks as initial seeds
+        # Find two most distant tracks as initial seeds using weighted distance
         max_dist = 0
         seed1, seed2 = 0, 1
         for i in range(len(feats)):
             for j in range(i + 1, len(feats)):
-                d = np.linalg.norm(feats[i] - feats[j])
+                d = self._color_distance(feats[i], feats[j])
                 if d > max_dist:
                     max_dist = d
                     seed1, seed2 = i, j
@@ -271,8 +369,8 @@ class TeamClassifier:
         for _ in range(5):
             cluster0, cluster1 = [], []
             for feat in feats:
-                d0 = np.linalg.norm(feat - center0)
-                d1 = np.linalg.norm(feat - center1)
+                d0 = self._color_distance(feat, center0)
+                d1 = self._color_distance(feat, center1)
                 if d0 < d1:
                     cluster0.append(feat)
                 else:
@@ -307,10 +405,43 @@ class TeamClassifier:
 
             state = self.track_state[tid]
             feat = state['color_feature']
+
+            # Check voting history - only use if consistently voted for one team
+            votes = state['vote_history']
+            if len(votes) < 5:
+                continue
+
+            recent_votes = [v for _, v in votes[-10:]]
+            if not recent_votes:
+                continue
+
+            # Must be 100% consistent in recent history to update center
+            if all(v == self.TEAM_0 for v in recent_votes):
+                team0_feats.append(feat)
+            elif all(v == self.TEAM_1 for v in recent_votes):
+                team1_feats.append(feat)
+
+        # Update centers with EMA
+        alpha = 0.05
+        if team0_feats:
+            mean_feat = np.mean(team0_feats, axis=0)
+            self.team_centers[0] = (1 - alpha) * self.team_centers[0] + alpha * mean_feat
+
+        if team1_feats:
+            mean_feat = np.mean(team1_feats, axis=0)
+            self.team_centers[1] = (1 - alpha) * self.team_centers[1] + alpha * mean_feat
+
+        for tid in track_ids:
+            if tid in exclude_ids:
+                continue
+            if tid not in self.track_state:
+                continue
+
+            state = self.track_state[tid]
+            feat = state['color_feature']
             if np.linalg.norm(feat) == 0:
                 continue
 
-            # Only use tracks with strong voting history (>70% for one team)
             votes = [v for _, v in state['vote_history'] if v in [self.TEAM_0, self.TEAM_1]]
             if len(votes) < 15:
                 continue
@@ -345,11 +476,10 @@ class TeamClassifier:
         There is exactly ONE linesman per touchline (near side y<0, far side y>0).
         Returns set of track_ids identified as linesmen (will be classified as REFEREE).
         """
-        # Touchline is at 34m, linesmen typically stand 0-2m outside
+        # touchline is at 34m, linesmen typically stand 0-2m outside
         touchline_threshold = self.HALF_WIDTH - 2  # 32m from center
         strict_touchline = self.HALF_WIDTH - 0.5  # 33.5m - definitely outside pitch
 
-        # Collect candidates for each side
         near_candidates = []  # (track_id, score, avg_y, near_ratio, outside_ratio) for y < 0
         far_candidates = []  # (track_id, score, avg_y, near_ratio, outside_ratio) for y > 0
 
@@ -360,16 +490,13 @@ class TeamClassifier:
             state = self.track_state[tid]
             pos_history = state.get('position_history', [])
 
-            # For early detection: use current position if not enough history
             current_y = None
             if pitch_positions and tid in pitch_positions:
                 _, current_y = pitch_positions[tid]
 
-            # If we have very little history but current position is clearly on touchline
             if len(pos_history) < 10:
                 if current_y is not None and abs(current_y) >= strict_touchline:
-                    # Immediate linesman candidate based on current position
-                    candidate = (tid, 1.0, abs(current_y), 1.0, 1.0)  # High score for being clearly outside
+                    candidate = (tid, 1.0, abs(current_y), 1.0, 1.0)
                     if current_y < 0:
                         near_candidates.append(candidate)
                     else:
@@ -433,7 +560,10 @@ class TeamClassifier:
 
         max_min_dist = 0
         referee_id = -1
-        threshold = 18  # Minimum distance to be considered outlier
+        # Threshold for weighted distance.
+        # With weights ~2.0, distances are larger.
+        # We want to catch the ref even if they are somewhat close to a team.
+        threshold = 15.0
 
         for tid in active_ids:
             if tid in exclude_ids:
@@ -465,20 +595,17 @@ class TeamClassifier:
         """
         outside_ids = set()
 
-        # Pitch boundaries
         max_x = 52.5 + 3  # HALF_LENGTH + 3m margin
-        max_y = self.HALF_WIDTH + 1  # 35m - outside touchline
+        max_y = self.HALF_WIDTH + 1  # HALF_WIDTH + 1m margin
 
-        # Strict boundary - definitely not a player
         strict_max_y = self.HALF_WIDTH + 2  # 36m - way outside
 
         for tid in active_ids:
-            if tid in exclude_ids:  # Skip already classified linesmen
+            if tid in exclude_ids:
                 continue
             if tid not in self.track_state:
                 continue
 
-            # Check 1: Current position - IMMEDIATE classification if way outside
             if pitch_positions and tid in pitch_positions:
                 x, y = pitch_positions[tid]
                 if abs(y) > strict_max_y or abs(x) > max_x + 2:
@@ -490,10 +617,9 @@ class TeamClassifier:
             state = self.track_state[tid]
             pos_history = state.get('position_history', [])
 
-            if len(pos_history) < 10:  # Reduced from 15 for faster detection
+            if len(pos_history) < 10:
                 continue
 
-            # Check 2: Historical position - if >40% outside, classify as non-player
             outside_count = sum(1 for x, y in pos_history if abs(x) > max_x or abs(y) > max_y)
             outside_ratio = outside_count / len(pos_history)
 
@@ -513,7 +639,7 @@ class TeamClassifier:
         self,
         tracks: List[dict],
         image_rgb: np.ndarray,
-        pitch_positions: dict = None,  # track_id -> (x, y) for linesman detection
+        pitch_positions: dict = None,
     ) -> List[dict]:
         """
         Update team classification for the given tracks.
@@ -529,7 +655,6 @@ class TeamClassifier:
         self.frame_idx += 1
         active_ids = []
 
-        # Phase 1: Extract features and update track state
         for track in tracks:
             track_id = track['id']
             box = track['box']
@@ -545,7 +670,6 @@ class TeamClassifier:
                     'last_seen': self.frame_idx,
                 }
             else:
-                # EMA for color feature
                 old_feat = self.track_state[track_id]['color_feature']
                 if np.linalg.norm(color_feat) > 0:
                     if np.linalg.norm(old_feat) > 0:
@@ -554,37 +678,26 @@ class TeamClassifier:
                         self.track_state[track_id]['color_feature'] = color_feat
                 self.track_state[track_id]['last_seen'] = self.frame_idx
 
-            # Update position history if we have pitch coordinates
             if pitch_positions and track_id in pitch_positions:
                 x, y = pitch_positions[track_id]
                 self.track_state[track_id]['position_history'].append((x, y))
-                # Keep last 5 seconds of position history
                 max_pos_history = self.window_size
                 if len(self.track_state[track_id]['position_history']) > max_pos_history:
                     self.track_state[track_id]['position_history'] = self.track_state[track_id]['position_history'][
                         -max_pos_history:
                     ]
 
-        # Phase 2: Detect linesmen based on position (near touchlines)
         linesman_ids = self._detect_linesmen(active_ids, pitch_positions)
-
-        # Phase 3: Detect people outside pitch (coaches, cameramen, etc.)
         outside_pitch_ids = self._detect_outside_pitch(active_ids, linesman_ids, pitch_positions)
-
-        # Phase 4: Initialize centers ONCE (excluding linesmen and outside-pitch people)
         exclude_from_init = linesman_ids | outside_pitch_ids
         if not self.centers_initialized:
             self._initialize_centers(active_ids, exclude_from_init)
 
-        # Phase 5: Detect main referee by color (excluding linesmen and outside-pitch)
         referee_id = self._detect_referee(active_ids, exclude_from_init)
-
-        # All officials/non-players (linesmen + main referee + outside pitch)
         all_officials = linesman_ids | outside_pitch_ids
         if referee_id >= 0:
             all_officials.add(referee_id)
 
-        # Phase 5: Assign votes based on distance to centers
         if self.centers_initialized:
             for tid in active_ids:
                 if tid not in self.track_state:
@@ -596,25 +709,32 @@ class TeamClassifier:
                 if np.linalg.norm(feat) == 0:
                     continue
 
-                # Determine vote - linesmen and referee all become REFEREE
                 if tid in all_officials:
                     vote = self.REFEREE
                 else:
                     d0 = self._color_distance(feat, self.team_centers[0])
                     d1 = self._color_distance(feat, self.team_centers[1])
-                    vote = self.TEAM_0 if d0 < d1 else self.TEAM_1
+
+                    HYSTERESIS_MARGIN = 5.0  # Require 5-unit distance margin to switch
+
+                    recent_votes = [v for _, v in state['vote_history'][-10:] if v in [self.TEAM_0, self.TEAM_1]]
+                    current_team = max(set(recent_votes), key=recent_votes.count) if recent_votes else None
+
+                    if current_team is not None:
+                        if current_team == self.TEAM_0:
+                            vote = self.TEAM_1 if (d1 < d0 - HYSTERESIS_MARGIN) else self.TEAM_0
+                        else:
+                            vote = self.TEAM_0 if (d0 < d1 - HYSTERESIS_MARGIN) else self.TEAM_1
+                    else:
+                        vote = self.TEAM_0 if d0 < d1 else self.TEAM_1
 
                 state['vote_history'].append((self.frame_idx, vote))
-
-                # Trim history to window size
                 cutoff = self.frame_idx - self.window_size
                 state['vote_history'] = [(f, v) for f, v in state['vote_history'] if f > cutoff]
 
-        # Phase 6: Update centers incrementally (excluding all officials)
         if self.frame_idx % 15 == 0:
             self._update_centers_incremental(active_ids, all_officials)
 
-        # Phase 7: Assign final team based on majority vote in window
         for track in tracks:
             tid = track['id']
             if tid not in self.track_state:
@@ -627,7 +747,6 @@ class TeamClassifier:
             if not votes:
                 track['team'] = self.TEAM_0
             else:
-                # Count votes: [team0, team1, referee]
                 counts = [0, 0, 0]
                 for v in votes:
                     if v < len(counts):
@@ -639,7 +758,6 @@ class TeamClassifier:
                         f"[DEBUG] Track {tid} final -> REFEREE (votes: T0={counts[0]}, T1={counts[1]}, REF={counts[2]})"
                     )
 
-        # Cleanup stale tracks
         stale_ids = [tid for tid, state in self.track_state.items() if self.frame_idx - state['last_seen'] > 300]
         for tid in stale_ids:
             del self.track_state[tid]
@@ -798,4 +916,180 @@ class PlayerTracker:
                     }
                 )
 
+        return results
+
+
+class OfflineTeamClassifier:
+    """
+    Offline classifier that uses Bag-of-Colors (BoC) to cluster teams.
+
+    Strategy:
+    1. Learn a Global Color Palette (Codebook) from ALL player detections in the video.
+       - This captures the specific shades of Red, Blue, White, Skin, Grass, etc. present in this match.
+    2. Represent each track as a Histogram over this Palette.
+       - e.g., "Track 1 is 60% Palette_A (Red) and 40% Palette_B (White)".
+    3. Cluster these Histograms to find the two Teams.
+    4. Identify the Referee as the track with the most distinct Histogram.
+
+    This is superior to mean-color because it preserves multi-modal distributions (e.g., striped kits).
+    """
+
+    def __init__(self, n_teams: int = 2, palette_size: int = 12):
+        self.n_teams = n_teams
+        self.palette_size = palette_size
+        # GMM for clustering the Histograms
+        self.gmm = GaussianMixture(n_components=n_teams, covariance_type='full', random_state=42, n_init=5)
+        # KMeans for learning the Palette
+        self.palette_model = MiniBatchKMeans(n_clusters=palette_size, n_init=3, batch_size=1024, random_state=42)
+        self.team_labels = {}
+
+    def fit_predict(self, tracks_data: dict, debug: bool = True) -> dict:
+        """
+        Args:
+            tracks_data: dict {track_id: list of np.ndarray (6D color features)}
+            debug: Whether to print debug information
+
+        Returns:
+            dict {track_id: team_id} where team_id is 0, 1, or -1 (referee)
+        """
+        # 1. Collect all valid features to learn the Global Palette
+        all_features = []
+        track_ids = []
+        track_sample_counts = {}  # For debug
+
+        # Filter short tracks
+        valid_tracks = {tid: feats for tid, feats in tracks_data.items() if len(feats) >= 5}
+
+        if debug:
+            print(f"[DEBUG] Total tracks received: {len(tracks_data)}")
+            print(f"[DEBUG] Tracks with >= 5 samples: {len(valid_tracks)}")
+            short_tracks = [(tid, len(feats)) for tid, feats in tracks_data.items() if len(feats) < 5]
+            if short_tracks:
+                print(
+                    f"[DEBUG] Short tracks (filtered out): {short_tracks[:10]}..."
+                    if len(short_tracks) > 10
+                    else f"[DEBUG] Short tracks (filtered out): {short_tracks}"
+                )
+
+        for tid, features in valid_tracks.items():
+            valid_feats = [f for f in features if np.linalg.norm(f) > 0]
+            if valid_feats:
+                all_features.extend(valid_feats)
+                track_ids.append(tid)
+                track_sample_counts[tid] = len(valid_feats)
+
+        if not all_features:
+            return {}
+
+        X_all = np.array(all_features)
+
+        # 2. Learn Global Palette (Codebook)
+        # We cluster the 6D features into 'palette_size' representative colors/configurations
+        print(f"Learning Global Palette from {len(X_all)} samples...")
+        self.palette_model.fit(X_all)
+
+        if debug:
+            print(f"[DEBUG] Palette centers (6D Lab features):")
+            for i, center in enumerate(self.palette_model.cluster_centers_):
+                # Format: [shirt_L, shirt_a, shirt_b, shorts_L, shorts_a, shorts_b]
+                print(
+                    f"  Palette {i}: Shirt=({center[0]:.0f}, {center[1]:.0f}, {center[2]:.0f}) Shorts=({center[3]:.0f}, {center[4]:.0f}, {center[5]:.0f})"
+                )
+
+        # 3. Compute Histogram for each track
+        track_histograms = []
+
+        for tid in track_ids:
+            features = valid_tracks[tid]
+            valid_feats = [f for f in features if np.linalg.norm(f) > 0]
+
+            if not valid_feats:
+                track_histograms.append(np.zeros(self.palette_size))
+                continue
+
+            # Assign each frame's feature to the nearest Palette entry
+            labels = self.palette_model.predict(np.array(valid_feats))
+
+            # Compute histogram
+            hist, _ = np.histogram(labels, bins=range(self.palette_size + 1), density=True)
+            track_histograms.append(hist)
+
+        X_hist = np.array(track_histograms)
+
+        # 4. Cluster Histograms to find Teams
+        self.gmm.fit(X_hist)
+        team_centers = self.gmm.means_  # Shape: (2, palette_size)
+
+        if debug:
+            print(f"[DEBUG] Team Histogram Centers (distribution over {self.palette_size} palette entries):")
+            for team_idx, center in enumerate(team_centers):
+                # Find top 3 palette entries for each team
+                top_indices = np.argsort(center)[::-1][:3]
+                top_vals = [(idx, center[idx]) for idx in top_indices]
+                print(f"  Team {team_idx}: Top palettes = {top_vals}")
+
+        # 5. Predict and find Referee
+        # Referee is the track whose histogram is most different from both team centers
+        # We use Jensen-Shannon distance or simple Euclidean on histograms
+
+        results = {}
+        candidates = []
+
+        for i, tid in enumerate(track_ids):
+            hist = X_hist[i]
+
+            # Euclidean distance between histograms
+            d0 = np.linalg.norm(hist - team_centers[0])
+            d1 = np.linalg.norm(hist - team_centers[1])
+
+            min_dist = min(d0, d1)
+            closest_team = 0 if d0 < d1 else 1
+
+            candidates.append({'tid': tid, 'min_dist': min_dist, 'team': closest_team})
+
+        # Sort by distance descending (furthest first)
+        candidates.sort(key=lambda x: x['min_dist'], reverse=True)
+
+        if debug:
+            print(f"[DEBUG] Top 5 Referee Candidates (by distance from team centers):")
+            for i, c in enumerate(candidates[:5]):
+                tid = c['tid']
+                samples = track_sample_counts.get(tid, 0)
+                print(
+                    f"  {i+1}. Track {tid}: min_dist={c['min_dist']:.3f}, closest_team={c['team']}, samples={samples}"
+                )
+
+            print(f"[DEBUG] Bottom 5 (most confidently assigned to teams):")
+            for i, c in enumerate(candidates[-5:]):
+                tid = c['tid']
+                samples = track_sample_counts.get(tid, 0)
+                print(f"  Track {tid}: min_dist={c['min_dist']:.3f}, team={c['team']}, samples={samples}")
+
+        if candidates:
+            referee = candidates[0]
+
+            if debug:
+                print(f"[DEBUG] Selected Referee: Track {referee['tid']} (min_dist={referee['min_dist']:.3f})")
+
+            results[referee['tid']] = -1
+
+            for c in candidates[1:]:
+                results[c['tid']] = c['team']
+
+        self.team_labels = results
+        return results
+
+        # Sort by distance descending (furthest first)
+        candidates.sort(key=lambda x: x['min_dist'], reverse=True)
+
+        # The top candidate is the Referee
+        if candidates:
+            referee = candidates[0]
+            results[referee['tid']] = -1  # Referee ID
+
+            # Everyone else is assigned to their closest team
+            for c in candidates[1:]:
+                results[c['tid']] = c['team']
+
+        self.team_labels = results
         return results

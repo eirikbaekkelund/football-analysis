@@ -1,3 +1,13 @@
+"""
+Pitch Projection Demo
+
+Combines player tracking with pitch homography estimation to project
+player positions onto a 2D pitch visualization.
+
+Usage:
+    python examples/pitch_projection_demo.py --video videos/match.mp4 --duration 60
+"""
+
 import argparse
 import cv2
 import torch
@@ -8,8 +18,10 @@ from typing import Dict, List, Tuple
 
 from match_state.player_tracker import TeamClassifier
 from match_state.pitch_homography import HomographyEstimator, PitchVisualizer, PITCH_LINE_COORDINATES
-from models.pnl_calib.wrapper import PnLCalibWrapper
+from models.pitch.wrapper import PnLCalibWrapper
 from utils.timing import timed, print_timing_stats, _timing_stats
+from utils.video import VideoReader, VideoWriter, ProgressTracker
+from utils.visualization import TrackVisualizer
 
 
 class PitchTrackManager:
@@ -102,7 +114,7 @@ class PitchTrackManager:
 
 def load_pnl_calib(device: torch.device):
     """Load the PnLCalib model."""
-    base_path = os.path.join("models", "pnl_calib")
+    base_path = os.path.join("models", "pitch")
     weights_kp = os.path.join(base_path, "weights", "SV_kp")
     weights_line = os.path.join(base_path, "weights", "SV_lines")
     config_kp = os.path.join(base_path, "config", "hrnetv2_w48.yaml")
@@ -232,10 +244,10 @@ def draw_pitch_overlay(
 
 def main():
     parser = argparse.ArgumentParser(description="Player tracking with pitch projection")
-    parser.add_argument("--video", type=str, default="videos/croatia_czechia.mp4", help="Input video path")
-    parser.add_argument("--output", type=str, default="output_2d_test.mp4", help="Output video path")
+    parser.add_argument("--video", type=str, default="videos/go_baerum.mp4", help="Input video path")
+    parser.add_argument("--output", type=str, default=None, help="Output video path (auto-generated if not set)")
     parser.add_argument(
-        "--model", type=str, default="models/tracking/yolo/yolov11_player_tracker.pt", help="Path to YOLO model"
+        "--model", type=str, default="models/player/yolo/yolov11_player_tracker.pt", help="Path to YOLO model"
     )
     parser.add_argument("--classes", type=int, nargs="+", default=None, help="Classes to track (default: auto)")
     parser.add_argument("--homography-interval", type=int, default=5, help="Frames between homography updates")
@@ -253,6 +265,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    # Load models
     pnl_calib = load_pnl_calib(device)
     player_detector = load_player_detector(args.model, device)
 
@@ -265,8 +278,10 @@ def main():
             track_classes = list(names.keys())
     print(f"Tracking classes: {track_classes}")
 
+    # Initialize components
     team_classifier = TeamClassifier()
     track_manager = PitchTrackManager(max_missing_frames=args.ghost_frames, smoothing_alpha=args.smooth_alpha)
+    track_visualizer = TrackVisualizer()
 
     homography = HomographyEstimator(
         min_correspondences=6,
@@ -275,143 +290,131 @@ def main():
     )
     pitch_viz = PitchVisualizer()
 
-    cap = cv2.VideoCapture(args.video)
-    cap = cv2.VideoCapture(args.video)
-    if not cap.isOpened():
-        print(f"Error: Could not open video {args.video}")
-        return
+    with VideoReader(args.video, max_duration=args.duration) as reader:
+        meta = reader.metadata
 
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
-    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        # Calculate output dimensions (video + pitch side by side)
+        pitch_h, pitch_w = pitch_viz.base_pitch.shape[:2]
+        scale = meta.height / pitch_h
+        output_w = meta.width + int(pitch_w * scale)
 
-    max_frames = min(fps * args.duration, total_frames)
+        # Output path
+        output_path = args.output or f"output_pitch_{meta.width}x{meta.height}_{args.duration}s.avi"
+        if not output_path.endswith('.avi'):
+            output_path = output_path.rsplit('.', 1)[0] + '.avi'
 
-    print(f"Video: {frame_w}x{frame_h} @ {fps}fps, {total_frames} frames")
-    print(f"Output limited to {args.duration}s ({max_frames} frames)")
+        print(f"Input: {meta.width}x{meta.height} @ {meta.fps}fps")
+        print(f"Output: {output_w}x{meta.height} (video + pitch)")
+        print(f"Processing {reader.max_frames} frames...")
 
-    pitch_h, pitch_w = pitch_viz.base_pitch.shape[:2]
-    scale = frame_h / pitch_h
-    output_w = frame_w + int(pitch_w * scale)
+        progress = ProgressTracker(reader.max_frames, log_interval=100)
+        homography_ok = False
+        frame_idx = 0
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(args.output, fourcc, fps, (output_w, frame_h))
+        with VideoWriter(output_path, meta.fps, (output_w, meta.height)) as writer:
+            try:
+                for frame in reader:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    frame_idx = 0
-    homography_ok = False
+                    # Update homography periodically
+                    if frame_idx % args.homography_interval == 0:
+                        P = pnl_calib.process_frame(frame)
+                        if P is not None:
+                            H_inv = P[:, [0, 1, 3]]
+                            if H_inv[2, 2] != 0:
+                                H_inv /= H_inv[2, 2]
+                            homography.H_inv = H_inv
+                            try:
+                                homography.H = np.linalg.inv(H_inv)
+                                homography_ok = True
+                            except np.linalg.LinAlgError:
+                                homography_ok = False
+                        else:
+                            homography_ok = False
 
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+                    # YOLO tracking
+                    _track_start = time.perf_counter()
+                    results = player_detector.track(
+                        frame, persist=True, tracker="botsort.yaml", verbose=False, classes=track_classes
+                    )
+                    _track_elapsed = (time.perf_counter() - _track_start) * 1000
+                    if 'yolo_track' not in _timing_stats:
+                        _timing_stats['yolo_track'] = {'count': 0, 'total': 0, 'max': 0}
+                    _timing_stats['yolo_track']['count'] += 1
+                    _timing_stats['yolo_track']['total'] += _track_elapsed
+                    _timing_stats['yolo_track']['max'] = max(_timing_stats['yolo_track']['max'], _track_elapsed)
 
-            if frame_idx >= max_frames:
-                break
+                    # Extract tracks
+                    tracks = []
+                    pitch_positions = {}
 
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    if results and results[0].boxes.id is not None:
+                        boxes = results[0].boxes.xyxy.cpu().numpy()
+                        track_ids = results[0].boxes.id.int().cpu().numpy()
 
-            if frame_idx % args.homography_interval == 0:
-                P = pnl_calib.process_frame(frame)
-                if P is not None:
-                    # P maps (x, y, 0, 1) to (u, v, w)
-                    # H maps (x, y, 1) to (u, v, w)
-                    # s.t. H is columns 0, 1, 3 of P
-                    H_inv = P[:, [0, 1, 3]]
+                        raw_tracks = []
+                        for box, track_id in zip(boxes, track_ids):
+                            raw_tracks.append({'box': box.tolist(), 'id': int(track_id)})
+                            if homography_ok:
+                                pitch_pos = homography.project_player_to_pitch(box.tolist())
+                                if pitch_pos is not None:
+                                    pitch_positions[int(track_id)] = pitch_pos
 
-                    # H_inv normalization
-                    if H_inv[2, 2] != 0:
-                        H_inv /= H_inv[2, 2]
+                        tracks = team_classifier.update(raw_tracks, frame_rgb, pitch_positions)
 
-                    homography.H_inv = H_inv
-                    try:
-                        homography.H = np.linalg.inv(H_inv)
-                        homography_ok = True
-                    except np.linalg.LinAlgError:
-                        homography_ok = False
-                else:
-                    homography_ok = False
+                    # Update pitch track manager
+                    current_observations = []
+                    for track in tracks:
+                        if homography_ok:
+                            pitch_pos = homography.project_player_to_pitch(track["box"])
+                            if pitch_pos is not None:
+                                x, y = pitch_pos
+                                current_observations.append((x, y, track["id"], track.get("team")))
 
-            _track_start = time.perf_counter()
-            results = player_detector.track(
-                frame, persist=True, tracker="botsort.yaml", verbose=False, classes=track_classes
-            )
+                    active_pitch_positions = track_manager.update(current_observations, frame_idx)
 
-            # Time YOLO tracking manually (can't decorate external function)
-            _track_elapsed = (time.perf_counter() - _track_start) * 1000
-            if 'yolo_track' not in _timing_stats:
-                _timing_stats['yolo_track'] = {'count': 0, 'total': 0, 'max': 0}
-            _timing_stats['yolo_track']['count'] += 1
-            _timing_stats['yolo_track']['total'] += _track_elapsed
-            _timing_stats['yolo_track']['max'] = max(_timing_stats['yolo_track']['max'], _track_elapsed)
+                    # Draw pitch visualization
+                    if active_pitch_positions:
+                        pitch_img = pitch_viz.draw_with_trails(
+                            active_pitch_positions,
+                            track_manager.get_history(),
+                            draw_vectors=not args.no_vectors,
+                            draw_dominance=not args.no_dominance,
+                        )
+                    else:
+                        pitch_img = pitch_viz.base_pitch.copy()
 
-            tracks = []
-            pitch_positions = {}  # track_id -> (x, y) in meters
+                    # Draw pitch overlay on video frame
+                    if args.debug_overlay and homography_ok:
+                        frame = draw_pitch_overlay(frame, homography)
 
-            if results and results[0].boxes.id is not None:
-                boxes = results[0].boxes.xyxy.cpu().numpy()
-                track_ids = results[0].boxes.id.int().cpu().numpy()
+                    # Create combined visualization
+                    combined = create_combined_visualization(
+                        frame, pitch_img, tracks, homography_ok, num_inliers=0, pitch_viz=pitch_viz
+                    )
 
-                raw_tracks = []
-                for box, track_id in zip(boxes, track_ids):
-                    raw_tracks.append({'box': box.tolist(), 'id': int(track_id)})
+                    writer.write(combined)
 
-                    # pitch position for linesman detection
-                    if homography_ok:
-                        pitch_pos = homography.project_player_to_pitch(box.tolist())
-                        if pitch_pos is not None:
-                            pitch_positions[int(track_id)] = pitch_pos
+                    if args.show:
+                        cv2.imshow("Pitch Projection", cv2.resize(combined, (1600, 600)))
+                        if cv2.waitKey(1) & 0xFF == ord("q"):
+                            break
 
-                tracks = team_classifier.update(raw_tracks, frame_rgb, pitch_positions)
+                    frame_idx += 1
+                    progress.update()
 
-            current_observations = []
-            for track in tracks:
-                if homography_ok:
-                    pitch_pos = homography.project_player_to_pitch(track["box"])
-                    if pitch_pos is not None:
-                        x, y = pitch_pos
-                        current_observations.append((x, y, track["id"], track.get("team")))
+                    if progress.should_log():
+                        print(progress.status())
 
-            active_pitch_positions = track_manager.update(current_observations, frame_idx)
+            finally:
+                try:
+                    cv2.destroyAllWindows()
+                except cv2.error:
+                    pass
 
-            if active_pitch_positions:
-                pitch_img = pitch_viz.draw_with_trails(
-                    active_pitch_positions,
-                    track_manager.get_history(),
-                    draw_vectors=not args.no_vectors,
-                    draw_dominance=not args.no_dominance,
-                )
-            else:
-                pitch_img = pitch_viz.base_pitch.copy()
-
-            if args.debug_overlay and homography_ok:
-                frame = draw_pitch_overlay(frame, homography)
-
-            combined = create_combined_visualization(
-                frame, pitch_img, tracks, homography_ok, num_inliers=0, pitch_viz=pitch_viz
-            )
-
-            out.write(combined)
-
-            if args.show:
-                cv2.imshow("Pitch Projection", cv2.resize(combined, (1600, 600)))
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
-
-            frame_idx += 1
-            if frame_idx % 100 == 0:
-                print(f"Processed {frame_idx}/{total_frames} frames")
-
-    finally:
-        cap.release()
-        out.release()
-        cv2.destroyAllWindows()
-
-    print(f"\nSaved output to {args.output}")
-    print(f"Processed {frame_idx} frames")
-
-    print_timing_stats()
+        print(f"\n{progress.summary()}")
+        print(f"Output saved to {output_path}")
+        print_timing_stats()
 
 
 if __name__ == "__main__":
