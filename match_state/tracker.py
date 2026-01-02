@@ -1,26 +1,11 @@
-"""
-Offline Tracker with 2D Trajectory Smoothing and Identity Assignment
-
-This module implements a multi-pass offline analysis pipeline:
-1. Pass 1: Detection + Tracking + Homography projection
-2. Pass 2: Bidirectional trajectory smoothing with velocity constraints
-3. Pass 3: Global identity assignment (11v11 + goalies + referee)
-
-Physical constraints:
-- Max player speed: ~10 m/s (sprint) = ~36 km/h
-- Typical cruising: ~4-6 m/s
-- Pitch dimensions: 105m x 68m
-"""
-
 import numpy as np
 from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass, field
+from pydantic import BaseModel, ConfigDict
 from collections import defaultdict
 from scipy.ndimage import gaussian_filter1d
 from sklearn.mixture import GaussianMixture
 
 
-# Physical constants
 MAX_PLAYER_SPEED_MS = 12.0  # m/s (generous for sprints)
 TYPICAL_PLAYER_SPEED_MS = 6.0  # m/s
 PENALTY_AREA_X = 52.5 - 16.5  # 36m from center = inside penalty area
@@ -28,34 +13,24 @@ HALF_LENGTH = 52.5  # m
 HALF_WIDTH = 34.0  # m
 
 
-@dataclass
-class TrackObservation:
-    """Single observation of a track at a specific frame."""
-
+class TrackObservation(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
     frame_idx: int
-    box: np.ndarray  # [x1, y1, x2, y2] in image coords
-    pitch_pos: Optional[Tuple[float, float]] = None  # (x, y) in meters
-    color_feature: Optional[np.ndarray] = None  # 6D Lab feature
+    box: np.ndarray
+    pitch_pos: Optional[Tuple[float, float]] = None
+    color_feature: Optional[np.ndarray] = None
 
 
-@dataclass
-class TrackData:
-    """All data for a single track across the video."""
-
+class TrackData(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
     track_id: int
-    observations: List[TrackObservation] = field(default_factory=list)
-
-    # Computed after smoothing (now done AFTER 2D projection)
-    smoothed_positions: Optional[np.ndarray] = None  # (N, 2) array in pitch coords
-    smoothed_frames: Optional[np.ndarray] = None  # frame indices
-
-    # Assigned after clustering (using majority vote across lifetime)
-    role: Optional[str] = None  # 'player', 'goalie', 'referee', 'linesman', 'other'
-    team: Optional[int] = None  # 0 or 1 for players/goalies, -1 for officials
-    player_id: Optional[int] = None  # 1-11 within team
-
-    # Per-frame team votes for majority voting
-    frame_team_votes: Optional[List[int]] = None  # List of team votes per frame
+    observations: List[TrackObservation] = []
+    smoothed_positions: Optional[np.ndarray] = None
+    smoothed_frames: Optional[np.ndarray] = None
+    role: Optional[str] = None
+    team: Optional[int] = None
+    player_id: Optional[int] = None
+    frame_team_votes: Optional[List[int]] = None
 
     def duration_frames(self) -> int:
         return len(self.observations)
@@ -99,6 +74,7 @@ class TrajectoryStore:
         self.fps = fps
         self.tracks: Dict[int, TrackData] = {}
         self.total_frames = 0
+        self.frame_homographies: Dict[int, np.ndarray] = {}  # Cache H_inv per frame
 
     def add_observation(
         self,
@@ -192,10 +168,7 @@ class FallbackProjector:
         bboxes = np.array(bboxes)
         pitches = np.array(pitches)
 
-        # Compute bbox features
         cx = (bboxes[:, 0] + bboxes[:, 2]) / 2  # center x
-        cy = (bboxes[:, 1] + bboxes[:, 3]) / 2  # center y
-        h = bboxes[:, 3] - bboxes[:, 1]  # height
 
         # Fit linear model: pitch_x ~ cx, pitch_y ~ cy, h
         # Using simple linear regression
@@ -210,13 +183,6 @@ class FallbackProjector:
         if len(result[0]) >= 2:
             self.ref_scale_x = result[0][0]
             self.ref_offset_x = result[0][1]
-
-        # Y: bbox height + center_y -> pitch_y
-        # Larger bbox = closer to camera = smaller pitch_y (if camera at bottom)
-        # Or vice versa depending on camera position
-        cy_norm = cy / self.image_height
-        h_norm = h / self.image_height
-
         # Try combined feature: bottom of bbox correlates with depth
         bottom = bboxes[:, 3] / self.image_height  # normalized bottom y
 
@@ -236,17 +202,14 @@ class FallbackProjector:
             return None
 
         cx = (box[0] + box[2]) / 2
-        cy = (box[1] + box[3]) / 2
         bottom = box[3]
 
-        # Apply calibration
         cx_norm = cx / self.image_width
         bottom_norm = bottom / self.image_height
 
         pitch_x = self.ref_scale_x * cx_norm + self.ref_offset_x
         pitch_y = self.ref_scale_y * bottom_norm + self.ref_offset_y
 
-        # Clamp to pitch bounds
         pitch_x = np.clip(pitch_x, -self.pitch_length / 2, self.pitch_length / 2)
         pitch_y = np.clip(pitch_y, -self.pitch_width / 2, self.pitch_width / 2)
 
@@ -254,6 +217,114 @@ class FallbackProjector:
 
     def is_calibrated(self) -> bool:
         return self.ref_scale_x is not None and self.ref_scale_y is not None
+
+
+class SimpleIoUTracker:
+    """
+    Lightweight IoU-based tracker for offline analysis.
+
+    Only does detection-to-track association. No team assignment, no GMM,
+    no Kalman filtering. Just simple IoU matching + track persistence.
+
+    Team/identity assignment happens later in the offline pipeline.
+    """
+
+    def __init__(self, max_age: int = 30, iou_threshold: float = 0.3):
+        self.max_age = max_age
+        self.iou_threshold = iou_threshold
+        self.tracks: Dict[int, Dict] = {}  # track_id -> {box, age}
+        self.next_id = 1
+
+    def _iou(self, box_a: np.ndarray, box_b: np.ndarray) -> float:
+        """Calculate IoU between two boxes."""
+        xA = max(box_a[0], box_b[0])
+        yA = max(box_a[1], box_b[1])
+        xB = min(box_a[2], box_b[2])
+        yB = min(box_a[3], box_b[3])
+
+        inter = max(0, xB - xA) * max(0, yB - yA)
+        area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+        area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+
+        return inter / (area_a + area_b - inter + 1e-6)
+
+    def update(self, detections: List[np.ndarray]) -> List[Tuple[int, np.ndarray]]:
+        """
+        Update tracks with new detections.
+
+        Args:
+            detections: List of [x1, y1, x2, y2] or [x1, y1, x2, y2, score] boxes
+
+        Returns:
+            List of (track_id, box) tuples for active tracks
+        """
+        from scipy.optimize import linear_sum_assignment
+
+        # Convert detections to numpy arrays, strip score if present
+        det_boxes = []
+        for det in detections:
+            box = np.array(det[:4])
+            det_boxes.append(box)
+
+        # Increment age for all tracks
+        for tid in self.tracks:
+            self.tracks[tid]['age'] += 1
+
+        if not det_boxes:
+            # No detections - just age out tracks
+            self._prune_old_tracks()
+            return [(tid, t['box']) for tid, t in self.tracks.items() if t['age'] <= 1]
+
+        if not self.tracks:
+            # No existing tracks - create new ones for all detections
+            results = []
+            for box in det_boxes:
+                tid = self.next_id
+                self.next_id += 1
+                self.tracks[tid] = {'box': box, 'age': 0}
+                results.append((tid, box))
+            return results
+
+        # Build cost matrix (negative IoU for Hungarian)
+        track_ids = list(self.tracks.keys())
+        cost_matrix = np.zeros((len(track_ids), len(det_boxes)))
+
+        for i, tid in enumerate(track_ids):
+            for j, det_box in enumerate(det_boxes):
+                cost_matrix[i, j] = -self._iou(self.tracks[tid]['box'], det_box)
+
+        # Hungarian matching
+        row_inds, col_inds = linear_sum_assignment(cost_matrix)
+
+        matched_tracks = set()
+        matched_dets = set()
+
+        for r, c in zip(row_inds, col_inds):
+            if -cost_matrix[r, c] >= self.iou_threshold:
+                tid = track_ids[r]
+                self.tracks[tid]['box'] = det_boxes[c]
+                self.tracks[tid]['age'] = 0
+                matched_tracks.add(tid)
+                matched_dets.add(c)
+
+        # Create new tracks for unmatched detections
+        for j, det_box in enumerate(det_boxes):
+            if j not in matched_dets:
+                tid = self.next_id
+                self.next_id += 1
+                self.tracks[tid] = {'box': det_box, 'age': 0}
+
+        # Prune old tracks
+        self._prune_old_tracks()
+
+        # Return active tracks (age <= 1 means recently matched)
+        return [(tid, t['box']) for tid, t in self.tracks.items() if t['age'] <= 1]
+
+    def _prune_old_tracks(self):
+        """Remove tracks that haven't been seen for max_age frames."""
+        to_remove = [tid for tid, t in self.tracks.items() if t['age'] > self.max_age]
+        for tid in to_remove:
+            del self.tracks[tid]
 
 
 class TrajectorySmootherVelocityConstrained:
@@ -423,7 +494,7 @@ class IdentityAssigner:
     def __init__(self, fps: float = 30.0, debug: bool = True):
         self.fps = fps
         self.debug = debug
-        self.gmm = None  # Fitted GMM for per-frame voting
+        self.gmm = None  # GMM for per-frame voting
         self.team_a_cluster = None
         self.team_b_cluster = None
         self.ref_cluster = None
@@ -435,12 +506,11 @@ class IdentityAssigner:
         Returns:
             Dict mapping track_id -> {'role': str, 'team': int, 'player_id': int}
         """
-        tracks = store.get_long_tracks(min_frames=30)  # At least 1 second
+        tracks = store.get_long_tracks(min_frames=30)
 
         if self.debug:
             print(f"[IdentityAssigner] Processing {len(tracks)} long tracks")
 
-        # Step 1: Compute position stats for each track
         track_stats = {}
         for track in tracks:
             stats = track.pitch_position_stats()
@@ -450,23 +520,15 @@ class IdentityAssigner:
         if not track_stats:
             return {}
 
-        # Step 2: Identify goalies by position
         goalie_candidates = self._find_goalie_candidates(track_stats)
-
-        # Step 3: Identify linesmen by position (sidelines)
         linesman_candidates = self._find_linesman_candidates(track_stats, exclude=goalie_candidates)
-
-        # Step 4: Cluster remaining tracks by color
         remaining_ids = [
             tid for tid in track_stats.keys() if tid not in goalie_candidates and tid not in linesman_candidates
         ]
 
         team_assignments, referee_id = self._cluster_by_color(store, remaining_ids)
-
-        # Step 5: Assign goalies to teams based on which side they're on
         goalie_teams = self._assign_goalie_teams(goalie_candidates, track_stats, team_assignments)
 
-        # Step 6: Build final assignments
         results = {}
 
         for tid in track_stats.keys():
@@ -476,7 +538,7 @@ class IdentityAssigner:
                 results[tid] = {
                     'role': 'goalie',
                     'team': goalie_teams.get(tid, -1),
-                    'player_id': 1,  # Goalies are usually #1
+                    'player_id': 1,
                 }
                 track.role = 'goalie'
                 track.team = goalie_teams.get(tid, -1)
@@ -504,7 +566,7 @@ class IdentityAssigner:
                 results[tid] = {
                     'role': 'player',
                     'team': team,
-                    'player_id': None,  # Would need jersey OCR for this
+                    'player_id': None,  # need jersey OCR for this
                 }
                 track.role = 'player'
                 track.team = team
@@ -522,7 +584,7 @@ class IdentityAssigner:
             mean_x = stats['mean_x']
             std_x = stats['std_x']
 
-            # Goalie criteria:
+            # fair assumption criteria
             # 1. Average position in penalty area (|x| > 36m)
             # 2. Low x-variance (stays in area)
             # 3. Enough samples
@@ -549,7 +611,7 @@ class IdentityAssigner:
             mean_y = stats['mean_y']
             std_y = stats['std_y']
 
-            # Linesman criteria:
+            # fair assumption criteria
             # 1. Average position near sideline (|y| > 32m)
             # 2. Low y-variance (stays on line)
             # 3. High x-variance (runs along line)
@@ -567,22 +629,89 @@ class IdentityAssigner:
 
         return candidates
 
-    def _fit_color_gmm(self, store: TrajectoryStore, track_ids: List[int]) -> bool:
+    def _cluster_by_color(self, store: TrajectoryStore, track_ids: List[int]) -> Tuple[Dict[int, int], Optional[int]]:
         """
-        Fit GMM on ALL color observations across all tracks.
-        This creates a global color model for per-frame voting.
+        Cluster tracks by color features using per-frame voting with majority.
+        Returns (team_assignments, referee_id).
+
+        Approach:
+        1. Fit GMM with 2 clusters (just the two teams) on ALL color observations
+        2. Per-frame voting: classify each frame to team 0 or 1
+        3. Identify referee as the track whose color is most OUTLIER from both teams
+           (high Mahalanobis distance from both cluster centers)
+        4. Linesmen are near sidelines, center referee is central
         """
         if not track_ids:
-            return False
+            return {}, None
 
-        # Collect ALL color features from all frames
-        all_features = []
+        if not self._fit_color_gmm_2_clusters(store, track_ids):
+            return {tid: 0 for tid in track_ids}, None
+
+        team_assignments = {}
+        track_outlier_scores = {}  # track_id -> average outlier score
 
         for tid in track_ids:
             track = store.get_track(tid)
             if not track:
                 continue
 
+            majority_team, confidence, outlier_score = self._vote_per_frame_with_outlier(track)
+            team_assignments[tid] = majority_team
+            track_outlier_scores[tid] = outlier_score
+
+            if self.debug and outlier_score > 1.5:
+                print(f"[DEBUG] Track {tid}: team={majority_team}, conf={confidence:.2f}, outlier={outlier_score:.2f}")
+
+        # Step 3: Find referee = track with highest outlier score that's NOT near sidelines
+        referee_id = None
+        best_outlier = 0.0
+
+        for tid, outlier_score in track_outlier_scores.items():
+            track = store.get_track(tid)
+            if not track:
+                continue
+
+            stats = track.pitch_position_stats()
+            if not stats:
+                continue
+
+            # Exclude sideline tracks (linesmen)
+            mean_y = abs(stats.get('mean_y', 0))
+            if mean_y > 30:  # Near sideline = linesman, not center referee
+                if self.debug and outlier_score > 1.0:
+                    print(f"[DEBUG] Track {tid} -> LINESMAN (|mean_y|={mean_y:.1f}m, outlier={outlier_score:.2f})")
+                continue
+
+            # Also require some mobility (referee runs around)
+            mobility = stats.get('std_x', 0) + stats.get('std_y', 0)
+            if mobility < 2.0:  # Too static = probably not referee
+                continue
+
+            # Referee should have high outlier score AND be on the pitch
+            if outlier_score > best_outlier:
+                best_outlier = outlier_score
+                referee_id = tid
+
+        if referee_id is not None:
+            team_assignments[referee_id] = -1  # Mark as referee
+            if self.debug:
+                print(f"[DEBUG] Selected referee: Track {referee_id} (outlier={best_outlier:.2f})")
+
+        return team_assignments, referee_id
+
+    def _fit_color_gmm_2_clusters(self, store: TrajectoryStore, track_ids: List[int]) -> bool:
+        """
+        Fit GMM with just 2 clusters (the two teams).
+        Referee will be detected as color outlier, not as a separate cluster.
+        """
+        if not track_ids:
+            return False
+
+        all_features = []
+        for tid in track_ids:
+            track = store.get_track(tid)
+            if not track:
+                continue
             for obs in track.observations:
                 if obs.color_feature is not None and np.linalg.norm(obs.color_feature) > 0:
                     all_features.append(obs.color_feature)
@@ -594,31 +723,34 @@ class IdentityAssigner:
 
         X = np.array(all_features, dtype=np.float64)
 
-        # Fit GMM with 3 clusters (2 teams + 1 referee/other)
         try:
+            # Only 2 clusters for the two teams
             self.gmm = GaussianMixture(
-                n_components=3,
+                n_components=2,
                 covariance_type='diag',
                 random_state=42,
                 n_init=10,
                 reg_covar=1e-3,
             )
             self.gmm.fit(X)
+
+            # Store cluster means and covariances for outlier detection
+            self.team_means = self.gmm.means_
+            self.team_covs = self.gmm.covariances_
+
             labels = self.gmm.predict(X)
+            cluster_counts = np.bincount(labels, minlength=2)
 
-            # Find cluster sizes
-            cluster_counts = np.bincount(labels, minlength=3)
+            # Larger cluster = team A, smaller = team B (arbitrary)
             sorted_clusters = np.argsort(cluster_counts)[::-1]
-
             self.team_a_cluster = sorted_clusters[0]
             self.team_b_cluster = sorted_clusters[1]
-            self.ref_cluster = sorted_clusters[2]
+            self.ref_cluster = None  # No dedicated referee cluster
 
             if self.debug:
-                print(f"[DEBUG] GMM fitted on {len(all_features)} color samples")
+                print(f"[DEBUG] GMM fitted on {len(all_features)} color samples (2 clusters)")
                 print(f"[DEBUG] Team A cluster={self.team_a_cluster} ({cluster_counts[self.team_a_cluster]} samples)")
                 print(f"[DEBUG] Team B cluster={self.team_b_cluster} ({cluster_counts[self.team_b_cluster]} samples)")
-                print(f"[DEBUG] Referee cluster={self.ref_cluster} ({cluster_counts[self.ref_cluster]} samples)")
 
             return True
 
@@ -627,17 +759,21 @@ class IdentityAssigner:
                 print(f"[DEBUG] GMM fitting failed: {e}")
             return False
 
-    def _vote_per_frame(self, track: TrackData) -> Tuple[int, float]:
+    def _vote_per_frame_with_outlier(self, track: TrackData) -> Tuple[int, float, float]:
         """
-        Do per-frame voting for a track using the fitted GMM.
-        Returns (majority_team, confidence) where:
-          - majority_team: 0, 1, or -1 (referee)
-          - confidence: fraction of frames voting for majority
+        Per-frame voting with outlier score calculation.
+
+        Returns:
+            (majority_team, confidence, outlier_score)
+
+        outlier_score = average Mahalanobis distance from BOTH team centroids.
+        High score = color doesn't fit either team well = likely referee.
         """
         if self.gmm is None:
-            return 0, 0.0
+            return 0, 0.0, 0.0
 
-        votes = []  # List of (team, confidence) per frame
+        votes = []
+        outlier_scores = []
 
         for obs in track.observations:
             if obs.color_feature is None or np.linalg.norm(obs.color_feature) == 0:
@@ -648,111 +784,39 @@ class IdentityAssigner:
             label = np.argmax(probs)
             conf = probs[label]
 
+            # Compute outlier score: how far from both clusters?
+            # Use negative log probability as distance metric
+            max_prob = max(probs)
+            outlier = -np.log(max_prob + 1e-10)  # High when max_prob is low
+            outlier_scores.append(outlier)
+
             # Map cluster to team
             if label == self.team_a_cluster:
                 team = 0
-            elif label == self.team_b_cluster:
-                team = 1
             else:
-                team = -1  # Referee cluster
+                team = 1
 
             votes.append((team, conf))
 
         if not votes:
-            return 0, 0.0
+            return 0, 0.0, 0.0
 
-        # Count votes for each team (weighted by confidence)
-        team_scores = {0: 0.0, 1: 0.0, -1: 0.0}
+        # Count votes
+        team_scores = {0: 0.0, 1: 0.0}
         for team, conf in votes:
             team_scores[team] += conf
 
-        # Majority vote
         majority_team = max(team_scores, key=team_scores.get)
         total_votes = sum(team_scores.values())
         confidence = team_scores[majority_team] / total_votes if total_votes > 0 else 0.0
 
-        # Store per-frame votes on the track for backtracking
+        # Average outlier score
+        avg_outlier = np.mean(outlier_scores) if outlier_scores else 0.0
+
+        # Store per-frame votes
         track.frame_team_votes = [v[0] for v in votes]
 
-        return majority_team, confidence
-
-    def _cluster_by_color(self, store: TrajectoryStore, track_ids: List[int]) -> Tuple[Dict[int, int], Optional[int]]:
-        """
-        Cluster tracks by color features using per-frame voting with majority.
-        Returns (team_assignments, referee_id).
-
-        New approach:
-        1. Fit GMM on ALL color observations (global color model)
-        2. Per-frame voting: classify each frame independently
-        3. Majority vote across track lifetime to determine final identity
-        4. Pick referee from tracks with high referee-cluster votes
-        """
-        if not track_ids:
-            return {}, None
-
-        # Step 1: Fit global GMM on all color observations
-        if not self._fit_color_gmm(store, track_ids):
-            # Fallback to simple assignment
-            return {tid: 0 for tid in track_ids}, None
-
-        # Step 2: Per-frame voting for each track
-        team_assignments = {}
-        referee_candidates = []  # (track_id, ref_vote_fraction)
-
-        for tid in track_ids:
-            track = store.get_track(tid)
-            if not track:
-                continue
-
-            majority_team, confidence = self._vote_per_frame(track)
-
-            if majority_team == -1 and confidence > 0.3:
-                # Strong referee signal
-                referee_candidates.append((tid, confidence))
-                team_assignments[tid] = -1  # Tentatively referee
-            elif confidence > 0.5:
-                team_assignments[tid] = majority_team
-            else:
-                # Low confidence - assign to team with most votes anyway
-                team_assignments[tid] = majority_team if majority_team >= 0 else 0
-
-        # Step 3: Pick single best CENTER referee based on mobility + central position
-        # Exclude tracks near sidelines (those are linesmen, not center referee)
-        referee_id = None
-        if referee_candidates:
-            best_score = -float('inf')
-            for tid, ref_conf in referee_candidates:
-                track = store.get_track(tid)
-                stats = track.pitch_position_stats() if track else {}
-                if stats:
-                    # Exclude if near sideline (linesmen are near sidelines)
-                    mean_y = abs(stats.get('mean_y', 0))
-                    if mean_y > 30:  # Near sideline - skip, this is a linesman
-                        continue
-
-                    # Center referee score: high mobility + central position + not near sidelines
-                    mobility = stats.get('std_x', 0) + stats.get('std_y', 0)
-                    centrality = 1.0 / (1.0 + abs(stats.get('mean_x', 50)))
-                    y_centrality = 1.0 / (1.0 + mean_y / 10)  # Prefer center of pitch
-                    score = mobility * centrality * y_centrality * (1 + ref_conf)
-
-                    if score > best_score:
-                        best_score = score
-                        referee_id = tid
-
-            # Reassign other referee candidates to nearest team
-            for tid, _ in referee_candidates:
-                if tid != referee_id:
-                    # Re-vote without referee cluster
-                    track = store.get_track(tid)
-                    votes_0 = sum(1 for v in track.frame_team_votes if v == 0)
-                    votes_1 = sum(1 for v in track.frame_team_votes if v == 1)
-                    team_assignments[tid] = 0 if votes_0 >= votes_1 else 1
-
-        if self.debug and referee_id:
-            print(f"[DEBUG] Selected referee: Track {referee_id}")
-
-        return team_assignments, referee_id
+        return majority_team, confidence, avg_outlier
 
     def _assign_goalie_teams(self, goalie_ids: set, track_stats: Dict, team_assignments: Dict) -> Dict[int, int]:
         """Assign goalies to teams based on which side they defend."""
@@ -808,38 +872,30 @@ class IdentityAssigner:
         print(f"  Teams: Team 0: {team_counts[0]}, Team 1: {team_counts[1]}")
 
 
-@dataclass
-class PlayerSlot:
-    """A fixed slot for a player on the 2D pitch view."""
+class PlayerSlot(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    slot_id: int  # 0-10 for team, or special IDs for referee
-    team: int  # 0 or 1, -1 for referee
-    position: Tuple[float, float]  # Current (x, y) on pitch
-    last_observed_frame: int  # Last frame this slot was updated
-    assigned_track_ids: List[int] = field(default_factory=list)  # All tracks assigned to this slot
-    color_feature: Optional[np.ndarray] = None  # Average color for this slot
+    slot_id: int
+    team: int
+    position: Tuple[float, float]
+    last_observed_frame: int
+    assigned_track_ids: List[int] = []
+    color_feature: Optional[np.ndarray] = None
     is_goalie: bool = False
 
 
 class PitchSlotManager:
     """
-    Manages fixed 11v11 + 1 referee slots on the 2D pitch.
-
-    Key features:
-    - Maintains exactly 11 slots per team + 1 referee (23 total)
-    - Maps fragmented tracks to consistent slot IDs
-    - Keeps players at last known position when not observed
-    - Uses position + color + team to match tracks to slots
+    Manages fixed 11v11 + 1 optional referee slot(s) on the 2D homographic pitch.
+    Responsible for assigning tracks to slots based on identity assignments
+    and merging fragmented tracks that likely belong to the same player.
     """
 
     def __init__(self, fps: float = 30.0, debug: bool = False):
         self.fps = fps
         self.debug = debug
-
-        # 11 slots per team + 1 referee
         self.slots: Dict[str, PlayerSlot] = {}
 
-        # Initialize team slots
         for team in [0, 1]:
             for i in range(11):
                 slot_key = f"T{team}_{i}"
@@ -850,18 +906,13 @@ class PitchSlotManager:
                     last_observed_frame=-1,
                 )
 
-        # Referee slot
         self.slots["REF"] = PlayerSlot(
             slot_id=0,
             team=-1,
             position=(0.0, 0.0),
             last_observed_frame=-1,
         )
-
-        # Track ID -> Slot key mapping
         self.track_to_slot: Dict[int, str] = {}
-
-        # Frame-by-frame slot positions for output
         self.frame_slot_positions: Dict[int, Dict[str, Tuple[float, float]]] = defaultdict(dict)
 
     def initialize_from_assignments(
@@ -975,41 +1026,51 @@ class PitchSlotManager:
         tracks: List[Tuple[int, TrackData, Dict]],
         store: TrajectoryStore,
         max_gap_frames: int = 30,  # Max frames between tracks to merge
-        max_distance: float = 10.0,  # Max meters between end of track A and start of track B
+        max_distance_px: float = 150.0,  # Max pixels between bbox centers
+        max_height_ratio: float = 1.5,  # Max ratio between bbox heights
     ) -> List[List[int]]:
         """
         Merge fragmented tracks that likely represent the same player.
 
-        Uses greedy matching: for each track, find the best previous track to connect to.
+        Uses 3D (IMAGE SPACE) matching - more robust to homography errors:
+        1. Temporal gap (tracks don't overlap)
+        2. Bbox center proximity (in pixels)
+        3. Bbox height similarity (similar size = similar depth)
         """
         if not tracks:
             return []
 
-        # Get track info: (tid, first_frame, last_frame, first_pos, last_pos)
+        # Get track info using BBOX coordinates (image space)
         track_info = []
         for tid, track, info in tracks:
             if not track.observations:
                 continue
 
-            first_obs = None
-            last_obs = None
-            for obs in track.observations:
-                if obs.pitch_pos is not None:
-                    if first_obs is None:
-                        first_obs = obs
-                    last_obs = obs
+            # Get first and last observations (any observation, not just with pitch_pos)
+            first_obs = track.observations[0]
+            last_obs = track.observations[-1]
 
-            if first_obs and last_obs:
-                track_info.append(
-                    {
-                        'tid': tid,
-                        'first_frame': first_obs.frame_idx,
-                        'last_frame': last_obs.frame_idx,
-                        'first_pos': first_obs.pitch_pos,
-                        'last_pos': last_obs.pitch_pos,
-                        'duration': track.duration_frames(),
-                    }
-                )
+            # Compute bbox centers and heights
+            first_box = first_obs.box
+            last_box = last_obs.box
+
+            first_center = ((first_box[0] + first_box[2]) / 2, (first_box[1] + first_box[3]) / 2)
+            last_center = ((last_box[0] + last_box[2]) / 2, (last_box[1] + last_box[3]) / 2)
+            first_height = first_box[3] - first_box[1]
+            last_height = last_box[3] - last_box[1]
+
+            track_info.append(
+                {
+                    'tid': tid,
+                    'first_frame': first_obs.frame_idx,
+                    'last_frame': last_obs.frame_idx,
+                    'first_center': first_center,
+                    'last_center': last_center,
+                    'first_height': first_height,
+                    'last_height': last_height,
+                    'duration': track.duration_frames(),
+                }
+            )
 
         # Sort by first frame
         track_info.sort(key=lambda x: x['first_frame'])
@@ -1040,16 +1101,23 @@ class PitchSlotManager:
                 if gap < 0 or gap > max_gap_frames:
                     continue
 
-                # Check spatial distance
-                dx = curr['first_pos'][0] - prev['last_pos'][0]
-                dy = curr['first_pos'][1] - prev['last_pos'][1]
+                # Check spatial distance in image space (pixels)
+                dx = curr['first_center'][0] - prev['last_center'][0]
+                dy = curr['first_center'][1] - prev['last_center'][1]
                 dist = np.sqrt(dx**2 + dy**2)
 
-                if dist > max_distance:
+                if dist > max_distance_px:
                     continue
 
-                # Score: prefer small gap and small distance
-                score = gap + dist * 2
+                # Check height similarity (size consistency)
+                height_ratio = max(curr['first_height'], prev['last_height']) / max(
+                    min(curr['first_height'], prev['last_height']), 1
+                )
+                if height_ratio > max_height_ratio:
+                    continue
+
+                # Score: prefer small gap and small distance, penalize height mismatch
+                score = gap + dist * 0.5 + (height_ratio - 1) * 50
                 if score < best_score:
                     best_score = score
                     best_match = prev['tid']
@@ -1158,45 +1226,83 @@ class PitchSlotManager:
 
     def build_all_frame_positions(self, store: TrajectoryStore, total_frames: int):
         """
-        Build frame positions for all frames using track observations.
-        Slots stay at last known position until updated.
+        Build frame positions for all frames using SMOOTHED track data.
+        Interpolates between observations for smooth movement.
         """
         if self.debug:
             print(f"\n[PitchSlotManager] Building positions for {total_frames} frames...")
 
-        # Build a quick lookup: (tid, frame_idx) -> pitch_pos
-        observation_lookup: Dict[Tuple[int, int], Tuple[float, float]] = {}
+        # Build lookup from smoothed data when available, otherwise raw observations
+        # Format: tid -> {frame_idx -> (x, y)}
+        track_frame_positions: Dict[int, Dict[int, Tuple[float, float]]] = {}
+
         for tid in self.track_to_slot:
             track = store.get_track(tid)
-            if track:
+            if not track:
+                continue
+
+            track_frame_positions[tid] = {}
+
+            # Prefer smoothed positions if available (from Pass 2)
+            if track.smoothed_positions is not None and track.smoothed_frames is not None:
+                for i, frame_idx in enumerate(track.smoothed_frames):
+                    pos = (track.smoothed_positions[i, 0], track.smoothed_positions[i, 1])
+                    track_frame_positions[tid][int(frame_idx)] = pos
+            else:
+                # Fallback to raw observations
                 for obs in track.observations:
                     if obs.pitch_pos is not None:
-                        observation_lookup[(tid, obs.frame_idx)] = obs.pitch_pos
+                        track_frame_positions[tid][obs.frame_idx] = obs.pitch_pos
 
-        # Initialize slot positions from first observation
+        # For each slot, build interpolated positions across all frames
         for tid, slot_key in self.track_to_slot.items():
-            track = store.get_track(tid)
-            if track:
-                for obs in track.observations:
-                    if obs.pitch_pos is not None:
-                        self.slots[slot_key].position = obs.pitch_pos
-                        self.slots[slot_key].last_observed_frame = obs.frame_idx
-                        break
+            if tid not in track_frame_positions:
+                continue
 
-        # Process each frame
-        for frame_idx in range(total_frames):
-            for tid, slot_key in self.track_to_slot.items():
-                # Check if we have an observation at this frame
-                key = (tid, frame_idx)
-                if key in observation_lookup:
-                    pos = observation_lookup[key]
-                    self.slots[slot_key].position = pos
-                    self.slots[slot_key].last_observed_frame = frame_idx
-                    self.frame_slot_positions[frame_idx][slot_key] = pos
+            frame_pos = track_frame_positions[tid]
+            if not frame_pos:
+                continue
+
+            # Get sorted frames
+            frames = sorted(frame_pos.keys())
+            if not frames:
+                continue
+
+            # Initialize slot position
+            first_pos = frame_pos[frames[0]]
+            self.slots[slot_key].position = first_pos
+            self.slots[slot_key].last_observed_frame = frames[0]
+
+            # Interpolate for all frames in range
+            min_frame, max_frame = frames[0], frames[-1]
+
+            for frame_idx in range(min_frame, max_frame + 1):
+                if frame_idx in frame_pos:
+                    # Have exact position
+                    pos = frame_pos[frame_idx]
                 else:
-                    # No observation - use last known position if we have one
-                    if self.slots[slot_key].last_observed_frame >= 0:
-                        self.frame_slot_positions[frame_idx][slot_key] = self.slots[slot_key].position
+                    # Interpolate between nearest known frames
+                    prev_frame = max(f for f in frames if f < frame_idx)
+                    next_frame = min(f for f in frames if f > frame_idx)
+
+                    if prev_frame is not None and next_frame is not None:
+                        t = (frame_idx - prev_frame) / (next_frame - prev_frame)
+                        prev_pos = frame_pos[prev_frame]
+                        next_pos = frame_pos[next_frame]
+                        pos = (
+                            prev_pos[0] + t * (next_pos[0] - prev_pos[0]),
+                            prev_pos[1] + t * (next_pos[1] - prev_pos[1]),
+                        )
+                    else:
+                        pos = self.slots[slot_key].position
+
+                self.slots[slot_key].position = pos
+                self.slots[slot_key].last_observed_frame = frame_idx
+                self.frame_slot_positions[frame_idx][slot_key] = pos
+
+            # Extend last known position for frames after track ends
+            for frame_idx in range(max_frame + 1, total_frames):
+                self.frame_slot_positions[frame_idx][slot_key] = self.slots[slot_key].position
 
         if self.debug:
             obs_count = sum(len(positions) for positions in self.frame_slot_positions.values())

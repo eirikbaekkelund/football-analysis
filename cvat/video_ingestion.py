@@ -4,7 +4,7 @@ import hashlib
 import numpy as np
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple, Literal, Generator
+from typing import List, Dict, Optional, Tuple, Generator
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 from pydantic import BaseModel, Field
@@ -15,7 +15,6 @@ class VideoMetadata(BaseModel):
 
     video_id: str
     source_path: str
-    source_type: Literal["veo", "broadcast", "webcam", "drone", "other"]
     resolution: Tuple[int, int]
     fps: float
     total_frames: int
@@ -91,23 +90,6 @@ class VideoIngestionPipeline:
             file_hash = hashlib.md5(f.read(1024 * 1024)).hexdigest()[:8]
         filename = Path(video_path).stem
         return f"{filename}_{file_hash}"
-
-    def _detect_source_type(self, video_path: str) -> str:
-        """Detect the source type based on video properties."""
-        cap = cv2.VideoCapture(video_path)
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        cap.release()
-
-        # Veo typically uses 4K or specific aspect ratios
-        if width >= 3840 or (width == 2560 and height == 1440):
-            return "veo"
-        # Broadcast is usually 1080p at specific framerates
-        elif width == 1920 and height == 1080 and fps in [25, 29.97, 30, 50, 59.94, 60]:
-            return "broadcast"
-        else:
-            return "other"
 
     def _compute_frame_quality(self, frame: np.ndarray) -> float:
         """
@@ -195,7 +177,6 @@ class VideoIngestionPipeline:
         metadata = VideoMetadata(
             video_id=video_id,
             source_path=video_path,
-            source_type=source_type or self._detect_source_type(video_path),
             resolution=(width, height),
             fps=fps,
             total_frames=total_frames,
@@ -334,101 +315,3 @@ class VideoIngestionPipeline:
                 results[video_id] = frame_paths
 
         return results
-
-
-class VeoVideoProcessor(VideoIngestionPipeline):
-    """
-    Specialized processor for Veo camera exports.
-
-    Handles Veo-specific features:
-    - Wide-angle lens distortion correction
-    - Multi-camera stitching awareness
-    - Veo metadata extraction
-    """
-
-    def __init__(self, output_dir: str, veo_api_key: Optional[str] = None):
-        super().__init__(output_dir)
-        self.veo_api_key = veo_api_key
-
-        self.veo_distortion_coeffs = {
-            "veo_cam_2": np.array([-0.15, 0.05, 0, 0, 0]),  # Veo Cam 2
-            "veo_cam_3": np.array([-0.12, 0.04, 0, 0, 0]),  # Veo Cam 3
-        }
-
-    def undistort_frame(
-        self,
-        frame: np.ndarray,
-        camera_model: str = "veo_cam_2",
-    ) -> np.ndarray:
-        """Apply lens distortion correction for Veo cameras."""
-        h, w = frame.shape[:2]
-
-        focal_length = w * 0.8
-        camera_matrix = np.array([[focal_length, 0, w / 2], [0, focal_length, h / 2], [0, 0, 1]], dtype=np.float32)
-
-        dist_coeffs = self.veo_distortion_coeffs.get(camera_model, self.veo_distortion_coeffs["veo_cam_2"])
-
-        undistorted = cv2.undistort(frame, camera_matrix, dist_coeffs)
-        return undistorted
-
-    def extract_veo_metadata(self, video_path: str) -> Dict:
-        """Extract Veo-specific metadata from video file or API."""
-        # TODO: Implement Veo API integration if API key provided
-
-        path = Path(video_path)
-        metadata = {
-            "filename": path.name,
-            "camera_model": "veo_cam_2",
-        }
-
-        name_parts = path.stem.split("_")
-        if len(name_parts) >= 4:
-            metadata["match_type"] = name_parts[0]
-
-        return metadata
-
-
-class BroadcastVideoProcessor(VideoIngestionPipeline):
-    """
-    Specialized processor for broadcast TV footage.
-
-    Handles broadcast-specific features:
-    - Commercial/replay detection and filtering
-    - Scoreboard/overlay region detection
-    - Camera angle classification
-    """
-
-    SCOREBOARD_REGIONS = [
-        (0.0, 0.0, 0.25, 0.1),
-        (0.75, 0.0, 1.0, 0.1),
-        (0.0, 0.9, 1.0, 1.0),
-    ]
-
-    def detect_camera_angle(self, frame: np.ndarray) -> str:
-        """
-        Classify the camera angle of a broadcast frame.
-
-        Returns:
-            Camera angle type: "wide", "medium", "close", "goal", "aerial", "replay"
-        """
-        h, w = frame.shape[:2]
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray, 50, 150)
-
-        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 100, minLineLength=100, maxLineGap=10)
-
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        green_mask = cv2.inRange(hsv, (35, 40, 40), (85, 255, 255))
-        green_ratio = np.sum(green_mask > 0) / (h * w)
-
-        num_lines = len(lines) if lines is not None else 0
-
-        if green_ratio > 0.4 and num_lines > 10:
-            return "wide"
-        elif green_ratio > 0.3:
-            return "medium"
-        elif green_ratio < 0.1:
-            return "close"  # Player close-up or crowd
-        else:
-            return "other"

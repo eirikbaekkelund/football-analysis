@@ -405,6 +405,8 @@ class Client:
         task_id: int,
         video_path: str,
         frame_step: int = 1,
+        start_frame: int = 0,
+        stop_frame: Optional[int] = None,
         wait_for_completion: bool = True,
     ) -> None:
         """
@@ -414,6 +416,8 @@ class Client:
             task_id: Target task ID
             video_path: Path to video file
             frame_step: Extract every Nth frame
+            start_frame: First frame to extract (0-indexed)
+            stop_frame: Last frame to extract (exclusive), None for all
             wait_for_completion: Wait for processing to complete
         """
         with open(video_path, "rb") as f:
@@ -423,7 +427,10 @@ class Client:
             data = {
                 "image_quality": 70,
                 "frame_filter": f"step={frame_step}",
+                "start_frame": start_frame,
             }
+            if stop_frame is not None:
+                data["stop_frame"] = stop_frame
 
             self.session.headers.pop("Content-Type", None)
 

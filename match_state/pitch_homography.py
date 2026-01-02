@@ -19,6 +19,13 @@ CENTER_CIRCLE_RADIUS = 9.15
 PENALTY_SPOT_DISTANCE = 11.0
 GOAL_WIDTH = 7.32
 GOAL_HEIGHT = 2.44
+COLOR_MAP = {
+    "team_1": (0, 0, 255),  # Red
+    "team_2": (255, 0, 0),  # Blue
+    "referee": (0, 255, 0),  # Green
+    "ball": (255, 255, 255),  # White
+    "unknown": (200, 200, 200),  # Light gray
+}
 
 
 class PitchPoint:
@@ -242,7 +249,6 @@ class HomographyEstimator:
         """
         h, w = image_size
 
-        # Convert tensors to numpy
         if isinstance(keypoints, torch.Tensor):
             keypoints = keypoints.cpu().numpy()
         if isinstance(visibility, torch.Tensor):
@@ -250,33 +256,28 @@ class HomographyEstimator:
         if isinstance(confidence, torch.Tensor):
             confidence = confidence.cpu().numpy()
 
-        # Collect point correspondences
         src_points = []  # Image points (pixels)
         dst_points = []  # Pitch points (meters)
 
         for class_idx, class_name in enumerate(self.line_classes):
-            # Skip low confidence classes
             if confidence[class_idx] < self.confidence_threshold:
                 continue
 
-            # Skip classes we don't have pitch coordinates for
             if class_name not in PITCH_LINE_COORDINATES:
                 continue
 
             pitch_coords = PITCH_LINE_COORDINATES[class_name]
 
             for kp_idx, pitch_point in pitch_coords:
-                # Check if this keypoint is visible
                 if kp_idx >= keypoints.shape[1]:
                     continue
                 if visibility[class_idx, kp_idx] < self.visibility_threshold:
                     continue
-
-                # Get image coordinates (denormalize)
+                # scale normalized coords to image size
                 img_x = keypoints[class_idx, kp_idx, 0] * w
                 img_y = keypoints[class_idx, kp_idx, 1] * h
 
-                # Skip invalid coordinates
+                # skip invalid coordinates
                 if img_x < 0 or img_x > w or img_y < 0 or img_y > h:
                     continue
 
@@ -292,21 +293,18 @@ class HomographyEstimator:
         src_points = np.array(src_points, dtype=np.float32)
         dst_points = np.array(dst_points, dtype=np.float32)
 
-        # Strategy 1: Standard RANSAC
+        # ransac homography estimation
         H1, mask1 = cv2.findHomography(src_points, dst_points, cv2.RANSAC, self.ransac_reproj_threshold)
         inliers1 = np.sum(mask1.ravel() == 1) if H1 is not None else 0
 
-        # Strategy 2: Mirrored RANSAC (Try swapping Left/Right sides)
-        # This handles cases where the model confuses left/right penalty areas
+        # mirrored ransac homography estimation
         dst_points_mirrored = dst_points.copy()
-        dst_points_mirrored[:, 0] *= -1  # Negate X coordinate
+        dst_points_mirrored[:, 0] *= -1
 
         H2, mask2 = cv2.findHomography(src_points, dst_points_mirrored, cv2.RANSAC, self.ransac_reproj_threshold)
         inliers2 = np.sum(mask2.ravel() == 1) if H2 is not None else 0
 
-        # Select best homography
         if inliers2 > inliers1 and inliers2 >= self.min_inliers:
-            # print(f"  Using mirrored homography ({inliers2} vs {inliers1} inliers)")
             self.H = H2
             self.inliers = mask2.ravel() == 1
             self.num_inliers = inliers2
@@ -316,58 +314,44 @@ class HomographyEstimator:
             self.num_inliers = inliers1
 
         if self.H is None:
-            # Self-correction: Use fallback if available
             self.frames_since_valid += 1
             if self.last_valid_H is not None and self.frames_since_valid <= self.max_fallback_frames:
-                # Decay confidence: apply slight blur to old H as time passes
                 decay = 1.0 - (self.frames_since_valid / self.max_fallback_frames) * 0.1
                 self.H_smoothed = self.last_valid_H * decay
-                return True  # Use fallback
+                return True
             return False
 
-        # Require minimum inliers for a reliable homography
         if self.num_inliers < self.min_inliers:
             print(f"Not enough inliers: {self.num_inliers} < {self.min_inliers}")
             self.frames_since_valid += 1
-            # Keep previous homography if available
             if self.last_valid_H is not None and self.frames_since_valid <= self.max_fallback_frames:
                 self.H_smoothed = self.last_valid_H
-                return True  # Use old homography
+                return True
             return False
 
-        # Reset fallback counter on successful estimation
+        # reset fallback counter on successful estimation
         self.frames_since_valid = 0
 
-        # Check if new homography would cause extreme position changes
+        # check if new homography would cause extreme position changes
         if self.H_smoothed is not None:
-            # Test with a few reference points
             test_points = np.array([[640, 360], [320, 540], [960, 540]], dtype=np.float32)
-
-            # Project with old and new H
             old_pts = self._project_with_H(test_points, self.H_smoothed)
             new_pts = self._project_with_H(test_points, self.H)
 
             if old_pts is not None and new_pts is not None:
-                # Check max displacement
                 displacements = np.linalg.norm(new_pts - old_pts, axis=1)
                 max_disp = np.max(displacements)
 
-                if max_disp > 20.0:  # More than 20m jump is suspicious
-                    # print(f"Rejecting homography with {max_disp:.1f}m displacement")
-                    # Keep old homography
+                if max_disp > 15.0:  # meters
                     return True
 
-        # Temporal smoothing: blend with previous homography
         if self.H_smoothed is None:
             self.H_smoothed = self.H.copy()
         else:
-            # Blend new homography with old (exponential moving average)
             self.H_smoothed = (1 - self.smoothing_alpha) * self.H_smoothed + self.smoothing_alpha * self.H
 
-        # Self-correction: Store as last valid for fallback
         self.last_valid_H = self.H_smoothed.copy()
 
-        # Compute inverse for projecting pitch to image
         try:
             self.H_inv = np.linalg.inv(self.H_smoothed)
         except np.linalg.LinAlgError:
@@ -452,7 +436,7 @@ class HomographyEstimator:
         """
         x1, y1, x2, y2 = bbox
         foot_x = (x1 + x2) / 2
-        foot_y = y2  # Bottom of bounding box
+        foot_y = y2  # bottom of bounding box
         return foot_x, foot_y
 
     def project_player_to_pitch(
@@ -550,7 +534,8 @@ class PitchVisualizer:
         Y_pix, X_pix = torch.meshgrid(y_indices, x_indices, indexing='ij')
 
         self.X_meters = (X_pix / self.scale_factor - self.margin) / self.scale - HALF_LENGTH
-        self.Y_meters = (Y_pix / self.scale_factor - self.margin) / self.scale - HALF_WIDTH
+        # Y is flipped: top of image (small Y_pix) = positive pitch Y (HALF_WIDTH)
+        self.Y_meters = HALF_WIDTH - (Y_pix / self.scale_factor - self.margin) / self.scale
 
         self.inf_t0_gpu = torch.zeros((h_small, w_small), device=self.device, dtype=torch.float32)
         self.inf_t1_gpu = torch.zeros((h_small, w_small), device=self.device, dtype=torch.float32)
@@ -579,7 +564,7 @@ class PitchVisualizer:
     def _pitch_to_pixel(self, x: float, y: float) -> Tuple[int, int]:
         """Convert pitch coordinates (meters) to pixel coordinates."""
         px = int(self.margin + (x + HALF_LENGTH) * self.scale)
-        py = int(self.margin + (y + HALF_WIDTH) * self.scale)  # flip y-axis to reflect image coords
+        py = int(self.margin + (HALF_WIDTH - y) * self.scale)  # flip y-axis: positive y -> top of image
         return px, py
 
     def _draw_pitch(self) -> np.ndarray:
@@ -804,11 +789,17 @@ class PitchVisualizer:
 
     def _draw_players(self, img: np.ndarray, pitch_positions: list, draw_vectors: bool):
         """Draw player dots and velocity vectors."""
+        h_img, w_img = img.shape[:2]
+
         for x, y, vx, vy, track_id, team_id in pitch_positions:
             if abs(x) > HALF_LENGTH + 5 or abs(y) > HALF_WIDTH + 5:
                 continue
 
             px, py = self._pitch_to_pixel(x, y)
+
+            # Skip if player position is outside image bounds
+            if not (0 <= px < w_img and 0 <= py < h_img):
+                continue
 
             if team_id == 0:
                 color = self.team1_color
@@ -820,10 +811,18 @@ class PitchVisualizer:
                 color = self.unknown_color
 
             if draw_vectors and (abs(vx) > 0.1 or abs(vy) > 0.1):
-                end_x = x + vx * 15
-                end_y = y + vy * 15
+                end_x = x + vx * 2
+                end_y = y + vy * 2
+                # Clip end position to pitch boundaries (meters)
+                end_x = max(-HALF_LENGTH, min(HALF_LENGTH, end_x))
+                end_y = max(-HALF_WIDTH, min(HALF_WIDTH, end_y))
                 px_end, py_end = self._pitch_to_pixel(end_x, end_y)
-                cv2.arrowedLine(img, (px, py), (px_end, py_end), color, 2, tipLength=0.3)
+                # Clamp to image boundaries (pixels)
+                px_end = max(0, min(w_img - 1, px_end))
+                py_end = max(0, min(h_img - 1, py_end))
+                # Only draw if there's a visible vector
+                if px != px_end or py != py_end:
+                    cv2.arrowedLine(img, (px, py), (px_end, py_end), color, 2, tipLength=0.3)
 
             cv2.circle(img, (px, py), 8, color, -1)
             cv2.circle(img, (px, py), 8, (0, 0, 0), 2)
@@ -901,13 +900,17 @@ class PitchVisualizer:
         speed = torch.sqrt(vx**2 + vy**2)
         angle = torch.atan2(vy, vx)
 
-        # Momentum-shifted centers
-        mu_x = px + vx * 15.0
-        mu_y = py + vy * 15.0
+        # Momentum-shifted centers (scaled reasonably - ~0.5-1s lookahead)
+        # Clamp speed influence to prevent extreme shifts
+        clamped_speed = torch.clamp(speed, 0, 8.0)  # Cap at 8 m/s for influence
+        lookahead_time = 0.5  # seconds
+        mu_x = px + vx * lookahead_time
+        mu_y = py + vy * lookahead_time
 
-        # Anisotropic sigma
-        sigma_x = 4.0 * (1 + speed * 0.5)
-        sigma_y = 4.0 / (1 + speed * 0.2)
+        # Anisotropic sigma - more conservative scaling
+        # Base radius ~4m, extends up to ~8m at max speed in movement direction
+        sigma_x = 4.0 + clamped_speed * 0.5  # 4-8m along movement
+        sigma_y = 4.0 / (1 + clamped_speed * 0.1)  # 4-3.2m perpendicular
 
         # Pre-compute trig values
         cos_angle = torch.cos(angle)
