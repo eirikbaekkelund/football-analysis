@@ -3,7 +3,17 @@ numpy
 pandas
 scikit-learn
 scipy
+tqdm
+fsspec
+Pillow
+requests
+cvat-sdk>=2.0.0
+ffmpeg-python
+
 # NOTE: torch and opencv-python are installed via:
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 #   pip install opencv-python
 # OpenCV CUDA requires building from source or using opencv-contrib-python-headless
+
+# Optional: For Veo API integration (if using Veo cloud exports)
+# veo-sdk  # Install separately if needed

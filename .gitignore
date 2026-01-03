@@ -6,6 +6,7 @@ __pycache__/
 *.pth
 *.onnx
 *.mp4
+*.avi
 *.zip
 soccernet/tracking/*
 soccernet/calibration/*
@@ -15,5 +16,7 @@ yolo_dataset/
 SV_*
 *.csv
 *.jpg
+*.json
 *.jpeg
 logs/
+*.env
