@@ -263,13 +263,13 @@ def dataset(
     help="Frames between homography updates (1=every frame).",
 )
 @click.option(
-    "--no-overlay",
-    is_flag=True,
+    "--overlay",
+    is_flag=False,
     help="Disable pitch line overlay on video.",
 )
 @click.option(
-    "--no-dominance",
-    is_flag=True,
+    "--dominance",
+    is_flag=False,
     help="Disable space control heatmap.",
 )
 def analyze(
@@ -290,7 +290,7 @@ def analyze(
     Example:
         $ torchkick analyze -v match.mp4
         $ torchkick analyze -v match.mp4 --model-type yolo --duration 60
-        $ torchkick analyze -v match.mp4 --no-dominance
+        $ torchkick analyze -v match.mp4 --dominance
     """
     from torchkick.inference import run_analysis
 
