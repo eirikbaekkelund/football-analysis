@@ -734,8 +734,8 @@ if __name__ == "__main__":
     parser.add_argument("--model-type", type=str, default="fcnn", choices=["yolo", "fcnn"])
     parser.add_argument("--duration", type=float, default=None, help="Max duration in seconds")
     parser.add_argument("--homography-interval", type=int, default=1)
-    parser.add_argument("--no-overlay", action="store_true")
-    parser.add_argument("--no-dominance", action="store_true")
+    parser.add_argument("--overlay", action="store_true")
+    parser.add_argument("--dominance", action="store_true")
     args = parser.parse_args()
 
     run_analysis(
@@ -744,6 +744,6 @@ if __name__ == "__main__":
         model_type=args.model_type,
         duration=args.duration,
         homography_interval=args.homography_interval,
-        draw_overlay=not args.no_overlay,
-        draw_dominance=not args.no_dominance,
+        draw_overlay=args.no_overlay,
+        draw_dominance=args.no_dominance,
     )
