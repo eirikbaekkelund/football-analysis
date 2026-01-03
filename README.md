@@ -1,6 +1,6 @@
 # torchkick
 
-A Computer vision toolkit for football video analysis. Detects players, tracks them across frames, and projects positions onto a 2D pitch map. Personal project that may or may not turn useful one day.
+A Computer vision toolkit for football video analysis. Detects players, tracks them across frames, and projects positions onto a 2D pitch map. Personal project that may or may not turn useful one day. As you can see below, there's still some refinement to do.
 
 ![Demo](examples/images/demo.gif)
 
