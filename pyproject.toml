@@ -1,3 +1,99 @@
+[tool.uv]
+index-url = "https://pypi.org/simple"
+extra-index-url = ["https://download.pytorch.org/whl/cu128"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "torchkick"
+dynamic = ["version"]
+description = "Computer vision toolkit for football/soccer spatio-temporal analysis"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Eirik Bækkelund", email = "eirikaab@icloud.com" }
+]
+keywords = [
+    "football",
+    "soccer",
+    "computer-vision",
+    "object-detection",
+    "tracking",
+    "sports-analytics",
+    "pytorch",
+]
+dependencies = [
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
+    "scipy>=1.10.0",
+    "scikit-learn>=1.2.0",
+    "Pillow>=9.0.0",
+    "pydantic>=2.0.0",
+    "tqdm>=4.65.0",
+    "fsspec>=2023.1.0",
+    "requests>=2.28.0",
+    "click>=8.1.0",
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0",
+    "opencv-python>=4.7.0",
+    "torch>=2.9.1",
+    "torchvision>=0.24.1",
+]
+
+[project.optional-dependencies]
+cvat = [
+    "cvat-sdk>=2.0.0",
+    "ffmpeg-python>=0.2.0",
+]
+soccernet = [
+    "SoccerNet>=0.1.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "mypy>=1.0.0",
+    "ruff>=0.1.0",
+]
+all = [
+    "torchkick[cvat,soccernet,dev]",
+]
+
+[project.scripts]
+torchkick = "torchkick.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/eirikb/torchkick"
+Documentation = "https://github.com/eirikb/torchkick#readme"
+Repository = "https://github.com/eirikb/torchkick.git"
+Issues = "https://github.com/eirikb/torchkick/issues"
+
+[tool.hatch.version]
+path = "src/torchkick/_version.py"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/README.md",
+    "/LICENSE",
+]
+exclude = [
+    "*.pt",
+    "*.pth",
+    "*.onnx",
+    "/data",
+    "/videos",
+    "/soccernet/tracking",
+    "/soccernet/calibration",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/torchkick"]
+
 [tool.black]
 line-length = 120
 skip-string-normalization = true
@@ -14,13 +110,24 @@ ensure_newline_before_comments = true
 all = true
 exclude = "__init__.py"
 
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
+
 [tool.semantic_release]
-version_variables = ["_version.py:__version__"]
-changelog_file = "CHANGELOG.md"                            # changelog file
-upload_to_release = false                                  # auto-create GitHub release
-upload_to_pypi = false                                     # don't auto-upload to PyPI
-patch_without_tag = true                                   # patch release by default
-commit_message = "{version} <- New Version Bump [skip ci]" # custom commit msg'
+version_variables = ["src/torchkick/_version.py:__version__"]
+changelog_file = "CHANGELOG.md"
+upload_to_release = false
+upload_to_pypi = false
+patch_without_tag = true
+commit_message = "{version} <- New Version Bump [skip ci]"
 
 [tool.semantic_release.branches.develop]
 match = "develop"
