@@ -20,7 +20,7 @@ import cv2
 import numpy as np
 import torch
 
-from torchkick.tracking.homography import (
+from torchkick.bbox_tracking.homography import (
     CENTER_CIRCLE_RADIUS,
     GOAL_AREA_DEPTH,
     GOAL_AREA_WIDTH,

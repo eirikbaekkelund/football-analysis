@@ -20,12 +20,12 @@ from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 from sklearn.mixture import GaussianMixture
 
-from torchkick.tracking.models import (
+from torchkick.bbox_tracking.models import (
     PENALTY_AREA_X,
     PlayerSlot,
     TrackData,
 )
-from torchkick.tracking.trajectory import TrajectoryStore
+from torchkick.bbox_tracking.trajectory import TrajectoryStore
 
 
 class IdentityAssigner:

@@ -21,7 +21,7 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
-from torchkick.tracking.models import BallState
+from torchkick.bbox_tracking.models import BallState
 
 
 class BallKalmanTrack:

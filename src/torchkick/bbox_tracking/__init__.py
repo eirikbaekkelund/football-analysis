@@ -37,7 +37,7 @@ Example:
 from __future__ import annotations
 
 # Data models
-from torchkick.tracking.models import (
+from torchkick.bbox_tracking.models import (
     MAX_PLAYER_SPEED_MS,
     TYPICAL_PLAYER_SPEED_MS,
     PENALTY_AREA_X,
@@ -50,29 +50,29 @@ from torchkick.tracking.models import (
 )
 
 # Trajectory management
-from torchkick.tracking.trajectory import (
+from torchkick.bbox_tracking.trajectory import (
     TrajectoryStore,
     TrajectorySmoother,
     FallbackProjector,
 )
 
 # Detection linking
-from torchkick.tracking.iou_tracker import SimpleIoUTracker
+from torchkick.bbox_tracking.iou_tracker import SimpleIoUTracker
 
 # Identity and team assignment
-from torchkick.tracking.identity import (
+from torchkick.bbox_tracking.identity import (
     IdentityAssigner,
     PitchSlotManager,
 )
 
 # Ball tracking
-from torchkick.tracking.ball import (
+from torchkick.bbox_tracking.ball import (
     BallKalmanTrack,
     BallTracker,
 )
 
 # Homography and projection
-from torchkick.tracking.homography import (
+from torchkick.bbox_tracking.homography import (
     PITCH_LENGTH,
     PITCH_WIDTH,
     PitchPoint,
@@ -81,7 +81,7 @@ from torchkick.tracking.homography import (
 )
 
 # Visualization
-from torchkick.tracking.pitch_viz import (
+from torchkick.bbox_tracking.pitch_viz import (
     COLOR_TEAM_1,
     COLOR_TEAM_2,
     COLOR_REFEREE,
@@ -89,7 +89,7 @@ from torchkick.tracking.pitch_viz import (
 )
 
 # Color features
-from torchkick.tracking.color_features import (
+from torchkick.bbox_tracking.color_features import (
     get_jersey_color_feature,
     get_dominant_color_feature,
 )

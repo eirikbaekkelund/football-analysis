@@ -20,3 +20,5 @@ SV_*
 *.jpeg
 logs/
 *.env
+*.gz
+*.safetensors

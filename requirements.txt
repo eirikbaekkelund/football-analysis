@@ -9,7 +9,13 @@ Pillow
 requests
 cvat-sdk>=2.0.0
 ffmpeg-python
-
+# TODO: make optional for sam3 mlx
+mlx>=0.30.0
+ftfy>=6.3.1
+iopath
+regex>=2025.11.3
+scikit-image>=0.25.2
+requests
 # NOTE: torch and opencv-python are installed via:
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 #   pip install opencv-python

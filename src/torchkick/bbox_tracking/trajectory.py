@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 
-from torchkick.tracking.models import (
+from torchkick.bbox_tracking.models import (
     MAX_PLAYER_SPEED_MS,
     TrackData,
     TrackObservation,

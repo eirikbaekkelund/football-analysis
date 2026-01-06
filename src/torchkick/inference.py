@@ -46,7 +46,7 @@ import cv2
 import numpy as np
 import torch
 
-from torchkick.tracking import (
+from torchkick.bbox_tracking import (
     TrajectoryStore,
     TrajectorySmoother,
     SimpleIoUTracker,

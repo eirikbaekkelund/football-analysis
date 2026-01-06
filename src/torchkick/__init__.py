@@ -57,7 +57,7 @@ from torchkick.utils import (
 )
 
 # Tracking components commonly used at top level
-from torchkick.tracking import (
+from torchkick.bbox_tracking import (
     SimpleIoUTracker,
     HomographyEstimator,
     PitchVisualizer,
