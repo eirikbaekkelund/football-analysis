@@ -105,14 +105,14 @@ def _apply_augmentations(image: np.ndarray, boxes: np.ndarray, input_size: int) 
         transform = A.Compose(
             [
                 A.LongestMaxSize(max_size=input_size),
-                A.PadIfNeeded(input_size, input_size, border_mode=cv2.BORDER_CONSTANT, value=114),
+                A.PadIfNeeded(input_size, input_size, border_mode=cv2.BORDER_CONSTANT, fill=114),
                 A.HorizontalFlip(p=0.5),
                 A.Perspective(scale=(0.05, 0.1), p=0.3),
                 A.Affine(shear=(-5, 5), p=0.3),
                 A.MotionBlur(blur_limit=5, p=0.2),
                 # Weak color augmentation: preserve jersey colors
                 A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.02, p=0.5),
-                A.CoarseDropout(max_holes=4, max_height=32, max_width=32, p=0.2),
+                A.CoarseDropout(num_holes_range=(1, 4), hole_height_range=(8, 32), hole_width_range=(8, 32), p=0.2),
             ],
             bbox_params=A.BboxParams(format="pascal_voc", label_fields=["labels"], min_visibility=0.3),
         )

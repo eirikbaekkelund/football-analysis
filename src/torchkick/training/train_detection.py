@@ -163,7 +163,7 @@ def train_detection(
     except ImportError:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    scaler = torch.cuda.amp.GradScaler() if dev.type == "cuda" else None
+    scaler = torch.amp.GradScaler("cuda") if dev.type == "cuda" else None
 
     best_val_loss = float("inf")
     best_ckpt = str(save_path / "rtdetr_best.pth")
@@ -192,7 +192,7 @@ def train_detection(
                     boxes_cxcywh = boxes
                 hf_labels.append({"class_labels": labels_t, "boxes": boxes_cxcywh})
 
-            with torch.cuda.amp.autocast(enabled=(scaler is not None)):
+            with torch.amp.autocast("cuda", enabled=(scaler is not None)):
                 outputs = model(pixel_values=images, labels=hf_labels)
                 loss = outputs.loss / grad_accumulation
 
@@ -240,7 +240,7 @@ def train_detection(
                     else:
                         boxes_cxcywh = boxes
                     hf_labels.append({"class_labels": labels_t, "boxes": boxes_cxcywh})
-                with torch.cuda.amp.autocast(enabled=(scaler is not None)):
+                with torch.amp.autocast("cuda", enabled=(scaler is not None)):
                     out = model(pixel_values=images, labels=hf_labels)
                 val_loss += out.loss.item()
 
