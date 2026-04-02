@@ -1,16 +1,23 @@
 """
-Trajectory storage and analysis.
+Trajectory storage and IMM Kalman smoothing.
 
-This module provides the TrajectoryStore for accumulating track
-observations and the TrajectorySmootherVelocityConstrained for
-applying physics-based smoothing to trajectories.
+IMMKalmanSmoother replaces the old post-hoc Gaussian smoother with an
+online Interacting Multiple Models (IMM) Kalman filter that runs two
+concurrent dynamic models:
+
+  - CV  (constant velocity, low process noise): steady-state running/jogging
+  - Man (maneuvering, high process noise): acceleration, sharp direction changes
+
+At each observation the filter blends both models weighted by likelihood,
+automatically switching to the maneuvering model during sprints and cuts and
+back to CV for straight-line running.  Gap filling uses the fused Kalman
+velocity estimate (linear extrapolation) which is physically correct and
+avoids the cubic-spline overshoot artefacts of the previous approach.
 
 Example:
     >>> from torchkick.tracking import TrajectoryStore, TrajectorySmoother
-    >>> 
     >>> store = TrajectoryStore(fps=30.0)
     >>> store.add_observation(track_id=1, frame_idx=0, box=box, pitch_pos=(0, 0))
-    >>> 
     >>> smoother = TrajectorySmoother(fps=30.0)
     >>> smoother.smooth_all(store)
 """
@@ -20,7 +27,6 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from scipy.ndimage import gaussian_filter1d
 
 from torchkick.tracking.models import (
     MAX_PLAYER_SPEED_MS,
@@ -57,7 +63,7 @@ class TrajectoryStore:
         frame_idx: int,
         box: np.ndarray,
         pitch_pos: Optional[Tuple[float, float]] = None,
-        color_feature: Optional[np.ndarray] = None,
+        rep_mask: Optional[np.ndarray] = None,
     ) -> None:
         """
         Add a single observation for a track.
@@ -67,7 +73,7 @@ class TrajectoryStore:
             frame_idx: Frame number.
             box: Bounding box [x1, y1, x2, y2].
             pitch_pos: Optional pitch position in meters.
-            color_feature: Optional color feature vector.
+            rep_mask: Optional representative mask (stored every N frames).
         """
         if track_id not in self.tracks:
             self.tracks[track_id] = TrackData(track_id=track_id)
@@ -76,7 +82,7 @@ class TrajectoryStore:
             frame_idx=frame_idx,
             box=box,
             pitch_pos=pitch_pos,
-            color_feature=color_feature,
+            rep_mask=rep_mask,
         )
         self.tracks[track_id].observations.append(obs)
         self.total_frames = max(self.total_frames, frame_idx + 1)
@@ -102,161 +108,242 @@ class TrajectoryStore:
         return [t for t in self.tracks.values() if t.duration_frames() >= min_frames]
 
 
-class TrajectorySmoother:
+class IMMKalmanSmoother:
     """
-    Smooth 2D trajectories with physics-based velocity constraints.
+    Interacting Multiple Models (IMM) Kalman smoother for 2D player trajectories.
 
-    Applies:
-    1. Outlier rejection (impossible speed jumps)
-    2. Gaussian smoothing for noise reduction
-    3. Velocity clamping to physical limits
+    Maintains two concurrent dynamic models over the 4D state [x, y, vx, vy]:
+
+      Model 0 — CV  (constant velocity): small velocity process noise (σ_v=0.3 m/s).
+                Correct for straight-line running and jogging.
+      Model 1 — Man (maneuvering):       large velocity process noise (σ_v=2.0 m/s).
+                Correct for direction changes, acceleration bursts, sharp cuts.
+
+    At each observation the filter blends both estimates weighted by measurement
+    likelihood.  The maneuvering model activates automatically during fast
+    direction changes and returns to near-zero probability once the player is
+    running steadily again.
+
+    Gap filling between observation frames uses the fused Kalman velocity
+    estimate for linear extrapolation — physically correct and free from the
+    cubic-spline overshoot artefacts of the old Gaussian smoother.
 
     Args:
-        fps: Video frame rate.
-        max_speed_ms: Maximum player speed in m/s.
-        smooth_sigma: Gaussian smoothing sigma in frames.
-        outlier_threshold_ms: Speed threshold for outlier rejection.
+        fps: Video frame rate (Hz).
+        max_speed_ms: Hard speed cap in m/s (applied per step).
+        smooth_sigma: Ignored; kept for backward-compatible call sites.
 
     Example:
-        >>> smoother = TrajectorySmoother(fps=30.0)
+        >>> smoother = IMMKalmanSmoother(fps=30.0)
         >>> smoother.smooth_all(store, min_frames=10)
     """
+
+    # Velocity process-noise std for the two models (m/s per root-frame)
+    _CV_VEL_STD: float = 0.3
+    _MAN_VEL_STD: float = 2.0
+    # Measurement noise std (m) — captures homography uncertainty
+    _MEAS_STD: float = 0.5
+    # Markov model-switch probability per frame
+    _SWITCH_PROB: float = 0.1
 
     def __init__(
         self,
         fps: float = 30.0,
         max_speed_ms: float = MAX_PLAYER_SPEED_MS,
-        smooth_sigma: float = 2.0,
-        outlier_threshold_ms: float = 15.0,
+        smooth_sigma: float = 2.0,  # unused; API compatibility with old TrajectorySmoother
     ) -> None:
         self.fps = fps
-        self.max_speed_ms = max_speed_ms
-        self.max_speed_per_frame = max_speed_ms / fps
-        self.smooth_sigma = smooth_sigma
-        self.outlier_threshold = outlier_threshold_ms / fps
+        self.dt = 1.0 / fps
+        self.max_speed_per_frame = max_speed_ms * self.dt
 
-    def _remove_outliers(
+        dt = self.dt
+        # State-transition matrix F: [x, y, vx, vy]
+        self._F = np.array(
+            [[1, 0, dt, 0], [0, 1, 0, dt], [0, 0, 1, 0], [0, 0, 0, 1]],
+            dtype=np.float64,
+        )
+        # Measurement matrix H: observe [x, y] only
+        self._H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float64)
+        # Measurement noise covariance
+        self._R = np.eye(2, dtype=np.float64) * self._MEAS_STD**2
+        # Per-model process-noise covariances
+        self._Q = [
+            np.diag([0.0, 0.0, self._CV_VEL_STD**2, self._CV_VEL_STD**2]),
+            np.diag([0.0, 0.0, self._MAN_VEL_STD**2, self._MAN_VEL_STD**2]),
+        ]
+        # Initial state covariance
+        self._P0 = np.diag([1.0, 1.0, 5.0, 5.0]).astype(np.float64)
+        # Markov transition matrix [2×2]
+        p = self._SWITCH_PROB
+        self._Pi = np.array([[1 - p, p], [p, 1 - p]], dtype=np.float64)
+        # Initial mode probabilities
+        self._mu0 = np.array([0.5, 0.5], dtype=np.float64)
+
+    # ------------------------------------------------------------------
+    # Core IMM step
+    # ------------------------------------------------------------------
+
+    def _imm_step(
         self,
-        positions: np.ndarray,
-        frames: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Remove positions representing impossible speed jumps."""
-        if len(positions) < 3:
-            return positions, frames
+        xs: List[np.ndarray],
+        Ps: List[np.ndarray],
+        mu: np.ndarray,
+        z: np.ndarray,
+        dt_scale: float,
+    ) -> Tuple[List[np.ndarray], List[np.ndarray], np.ndarray, np.ndarray]:
+        """
+        One IMM Kalman filter step.
 
-        valid_mask = np.ones(len(positions), dtype=bool)
+        Args:
+            xs: Per-model state vectors [4] each.
+            Ps: Per-model covariance matrices [4×4] each.
+            mu: Mode probabilities [2].
+            z:  Measurement [x, y].
+            dt_scale: Number of frames since last observation (handles gaps).
 
-        for i in range(1, len(positions) - 1):
-            dt_prev = max(1, frames[i] - frames[i - 1])
-            dt_next = max(1, frames[i + 1] - frames[i])
+        Returns:
+            (xs_new, Ps_new, mu_new, x_fused)
+        """
+        n = len(xs)
 
-            dx1 = positions[i, 0] - positions[i - 1, 0]
-            dy1 = positions[i, 1] - positions[i - 1, 1]
-            v1 = np.sqrt(dx1**2 + dy1**2) / dt_prev
+        # Predicted mode probabilities c̄_j = Σ_i Π_{ij} μ_i
+        c_bar = self._Pi.T @ mu  # [n]
+        # Mixing weights μ_{i|j} = Π_{ij} μ_i / c̄_j
+        mu_ij = (self._Pi * mu[:, np.newaxis]) / np.maximum(c_bar[np.newaxis, :], 1e-300)
 
-            dx2 = positions[i + 1, 0] - positions[i, 0]
-            dy2 = positions[i + 1, 1] - positions[i, 1]
-            v2 = np.sqrt(dx2**2 + dy2**2) / dt_next
+        # Scale F and Q for actual time gap
+        F = self._F.copy()
+        F[0, 2] = self.dt * dt_scale
+        F[1, 3] = self.dt * dt_scale
 
-            # If both velocities extreme, likely an outlier
-            if v1 > self.outlier_threshold and v2 > self.outlier_threshold:
-                valid_mask[i] = False
+        # Mixed initial conditions for each model
+        x_mix = [sum(mu_ij[i, j] * xs[i] for i in range(n)) for j in range(n)]
+        P_mix = [
+            sum(mu_ij[i, j] * (Ps[i] + np.outer(xs[i] - x_mix[j], xs[i] - x_mix[j])) for i in range(n))
+            for j in range(n)
+        ]
 
-        return positions[valid_mask], frames[valid_mask]
+        xs_new: List[np.ndarray] = []
+        Ps_new: List[np.ndarray] = []
+        likelihoods: List[float] = []
 
-    def _interpolate_gaps(
-        self,
-        positions: np.ndarray,
-        frames: np.ndarray,
-        total_frames: int,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Fill trajectory gaps with linear interpolation."""
-        if len(positions) < 2:
-            return positions, frames
+        for j in range(n):
+            Q_j = self._Q[j] * dt_scale
 
-        min_frame, max_frame = frames[0], frames[-1]
-        dense_frames = np.arange(min_frame, max_frame + 1)
+            # Predict
+            x_p = F @ x_mix[j]
+            P_p = F @ P_mix[j] @ F.T + Q_j
 
-        x_interp = np.interp(dense_frames, frames, positions[:, 0])
-        y_interp = np.interp(dense_frames, frames, positions[:, 1])
+            # Update
+            S = self._H @ P_p @ self._H.T + self._R
+            K = P_p @ self._H.T @ np.linalg.solve(S, np.eye(2))
+            innov = z - self._H @ x_p
+            x_u = x_p + K @ innov
+            P_u = (np.eye(4) - K @ self._H) @ P_p
 
-        return np.stack([x_interp, y_interp], axis=1), dense_frames
+            # Measurement likelihood via log-det for numerical stability
+            try:
+                sign, logdet = np.linalg.slogdet(S)
+                if sign > 0:
+                    maha = float(innov.T @ np.linalg.solve(S, innov))
+                    L = np.exp(-0.5 * maha - 0.5 * logdet - np.log(2 * np.pi))
+                else:
+                    L = 1e-300
+            except np.linalg.LinAlgError:
+                L = 1e-300
+
+            xs_new.append(x_u)
+            Ps_new.append(P_u)
+            likelihoods.append(max(float(L), 1e-300))
+
+        # Update mode probabilities
+        L_arr = np.array(likelihoods)
+        mu_raw = L_arr * c_bar
+        mu_sum = mu_raw.sum()
+        mu_new = mu_raw / mu_sum if mu_sum > 1e-300 else np.full(n, 1.0 / n)
+
+        # Fused state estimate
+        x_fused = sum(mu_new[j] * xs_new[j] for j in range(n))
+
+        return xs_new, Ps_new, mu_new, x_fused
+
+    # ------------------------------------------------------------------
+    # Public API (mirrors TrajectorySmoother)
+    # ------------------------------------------------------------------
 
     def smooth_track(self, track: TrackData, interpolate: bool = True) -> bool:
         """
-        Smooth a single track's trajectory.
+        Smooth a single track's trajectory via sequential IMM Kalman filtering.
 
         Args:
-            track: TrackData to smooth in-place.
-            interpolate: Whether to interpolate gaps.
+            track: TrackData to process in-place.
+            interpolate: Fill gaps between observations using Kalman velocity.
 
         Returns:
             True if successful, False if insufficient data.
         """
-        # Extract pitch positions
-        positions = []
-        frames = []
-
-        for obs in track.observations:
-            if obs.pitch_pos is not None:
-                positions.append(obs.pitch_pos)
-                frames.append(obs.frame_idx)
-
-        if len(positions) < 5:
+        obs_with_pos = [(obs.frame_idx, obs.pitch_pos) for obs in track.observations if obs.pitch_pos is not None]
+        if len(obs_with_pos) < 5:
             return False
 
-        positions = np.array(positions)
-        frames = np.array(frames)
+        obs_with_pos.sort(key=lambda x: x[0])
+        frames = [o[0] for o in obs_with_pos]
+        positions = [o[1] for o in obs_with_pos]
 
-        # Step 1: Remove outliers
-        positions, frames = self._remove_outliers(positions, frames)
-        if len(positions) < 5:
-            return False
+        # Initialise from first two observations
+        if len(positions) >= 2:
+            df = max(1, frames[1] - frames[0])
+            vx = (positions[1][0] - positions[0][0]) / (df * self.dt)
+            vy = (positions[1][1] - positions[0][1]) / (df * self.dt)
+        else:
+            vx, vy = 0.0, 0.0
 
-        # Step 2: Interpolate gaps
-        if interpolate and track.observations:
-            positions, frames = self._interpolate_gaps(positions, frames, track.observations[-1].frame_idx)
+        x0 = np.array([positions[0][0], positions[0][1], vx, vy], dtype=np.float64)
+        xs = [x0.copy(), x0.copy()]
+        Ps = [self._P0.copy(), self._P0.copy()]
+        mu = self._mu0.copy()
 
-        # Step 3: Gaussian smoothing
-        x_smooth = gaussian_filter1d(positions[:, 0], sigma=self.smooth_sigma)
-        y_smooth = gaussian_filter1d(positions[:, 1], sigma=self.smooth_sigma)
+        # (frame, x, y, vx, vy) at each observation
+        smoothed: List[Tuple[int, float, float, float, float]] = [(frames[0], positions[0][0], positions[0][1], vx, vy)]
 
-        # Step 4: Forward velocity clamping
-        for i in range(1, len(x_smooth)):
-            dt = max(1, frames[i] - frames[i - 1])
-            max_dist = self.max_speed_per_frame * dt
+        for i in range(1, len(obs_with_pos)):
+            frame_idx, pos = obs_with_pos[i]
+            dt_scale = float(max(1, frame_idx - frames[i - 1]))
+            z = np.array([pos[0], pos[1]], dtype=np.float64)
 
-            dx = x_smooth[i] - x_smooth[i - 1]
-            dy = y_smooth[i] - y_smooth[i - 1]
-            dist = np.sqrt(dx**2 + dy**2)
+            xs, Ps, mu, x_fused = self._imm_step(xs, Ps, mu, z, dt_scale)
 
-            if dist > max_dist:
+            # Hard speed constraint
+            px, py = smoothed[-1][1], smoothed[-1][2]
+            dx, dy = x_fused[0] - px, x_fused[1] - py
+            dist = np.hypot(dx, dy)
+            max_dist = self.max_speed_per_frame * dt_scale
+            if dist > max_dist and dist > 0:
                 scale = max_dist / dist
-                x_smooth[i] = x_smooth[i - 1] + dx * scale
-                y_smooth[i] = y_smooth[i - 1] + dy * scale
+                x_fused[0] = px + dx * scale
+                x_fused[1] = py + dy * scale
 
-        # Step 5: Backward velocity clamping
-        for i in range(len(x_smooth) - 2, -1, -1):
-            dt = max(1, frames[i + 1] - frames[i])
-            max_dist = self.max_speed_per_frame * dt
+            smoothed.append((frame_idx, x_fused[0], x_fused[1], x_fused[2], x_fused[3]))
 
-            dx = x_smooth[i] - x_smooth[i + 1]
-            dy = y_smooth[i] - y_smooth[i + 1]
-            dist = np.sqrt(dx**2 + dy**2)
+        # Build dense frame array (gap-fill via Kalman velocity)
+        if interpolate:
+            all_frames: List[int] = []
+            all_positions: List[Tuple[float, float]] = []
+            for i, (f, x, y, vxi, vyi) in enumerate(smoothed):
+                all_frames.append(f)
+                all_positions.append((x, y))
+                if i < len(smoothed) - 1:
+                    next_f = smoothed[i + 1][0]
+                    for gf in range(f + 1, next_f):
+                        t = gf - f
+                        all_frames.append(gf)
+                        all_positions.append((x + vxi * t * self.dt, y + vyi * t * self.dt))
+        else:
+            all_frames = [s[0] for s in smoothed]
+            all_positions = [(s[1], s[2]) for s in smoothed]
 
-            if dist > max_dist:
-                scale = max_dist / dist
-                x_smooth[i] = x_smooth[i + 1] + dx * scale
-                y_smooth[i] = y_smooth[i + 1] + dy * scale
-
-        # Step 6: Final smoothing pass
-        x_smooth = gaussian_filter1d(x_smooth, sigma=self.smooth_sigma / 2)
-        y_smooth = gaussian_filter1d(y_smooth, sigma=self.smooth_sigma / 2)
-
-        # Store results
-        track.smoothed_positions = np.stack([x_smooth, y_smooth], axis=1)
-        track.smoothed_frames = frames
-
+        track.smoothed_positions = np.array(all_positions, dtype=np.float32)
+        track.smoothed_frames = np.array(all_frames)
         return True
 
     def smooth_all(self, store: TrajectoryStore, min_frames: int = 10) -> int:
@@ -278,130 +365,12 @@ class TrajectorySmoother:
         return count
 
 
-class FallbackProjector:
-    """
-    Project bounding boxes to pitch when homography fails.
-
-    Uses calibration from frames with valid homography to estimate
-    positions from bounding box properties alone.
-
-    Args:
-        image_width: Frame width in pixels.
-        image_height: Frame height in pixels.
-        pitch_length: Pitch length in meters.
-        pitch_width: Pitch width in meters.
-
-    Example:
-        >>> projector = FallbackProjector(1920, 1080)
-        >>> projector.add_reference(box, (10.0, -5.0))
-        >>> position = projector.project(new_box)
-    """
-
-    def __init__(
-        self,
-        image_width: int = 1920,
-        image_height: int = 1080,
-        pitch_length: float = 105.0,
-        pitch_width: float = 68.0,
-    ) -> None:
-        self.image_width = image_width
-        self.image_height = image_height
-        self.pitch_length = pitch_length
-        self.pitch_width = pitch_width
-
-        # Calibration parameters
-        self.ref_scale_x: Optional[float] = None
-        self.ref_scale_y: Optional[float] = None
-        self.ref_offset_x: Optional[float] = None
-        self.ref_offset_y: Optional[float] = None
-
-        # Reference points for calibration
-        self.reference_points: List[Tuple[np.ndarray, Tuple[float, float]]] = []
-
-    def add_reference(
-        self,
-        box: np.ndarray,
-        pitch_pos: Tuple[float, float],
-    ) -> None:
-        """
-        Add a bbox -> pitch_pos correspondence for calibration.
-
-        Args:
-            box: Bounding box [x1, y1, x2, y2].
-            pitch_pos: Known pitch position in meters.
-        """
-        self.reference_points.append((box.copy(), pitch_pos))
-
-        if len(self.reference_points) >= 50:
-            self._calibrate()
-
-    def _calibrate(self) -> None:
-        """Compute calibration from reference points."""
-        if len(self.reference_points) < 20:
-            return
-
-        bboxes = []
-        pitches = []
-        for box, pitch in self.reference_points[-200:]:
-            bboxes.append(box)
-            pitches.append(pitch)
-
-        bboxes = np.array(bboxes)
-        pitches = np.array(pitches)
-
-        # X: center_x -> pitch_x
-        cx = (bboxes[:, 0] + bboxes[:, 2]) / 2
-        cx_norm = cx / self.image_width
-
-        A_x = np.column_stack([cx_norm, np.ones_like(cx_norm)])
-        result = np.linalg.lstsq(A_x, pitches[:, 0], rcond=None)
-        if len(result[0]) >= 2:
-            self.ref_scale_x = result[0][0]
-            self.ref_offset_x = result[0][1]
-
-        # Y: bottom_y -> pitch_y
-        bottom = bboxes[:, 3] / self.image_height
-
-        A_y = np.column_stack([bottom, np.ones_like(bottom)])
-        result = np.linalg.lstsq(A_y, pitches[:, 1], rcond=None)
-        if len(result[0]) >= 2:
-            self.ref_scale_y = result[0][0]
-            self.ref_offset_y = result[0][1]
-
-    def project(self, box: np.ndarray) -> Optional[Tuple[float, float]]:
-        """
-        Project bounding box to pitch coordinates.
-
-        Args:
-            box: Bounding box [x1, y1, x2, y2].
-
-        Returns:
-            (x, y) pitch position, or None if not calibrated.
-        """
-        if self.ref_scale_x is None or self.ref_scale_y is None:
-            return None
-
-        cx = (box[0] + box[2]) / 2
-        bottom = box[3]
-
-        cx_norm = cx / self.image_width
-        bottom_norm = bottom / self.image_height
-
-        pitch_x = self.ref_scale_x * cx_norm + self.ref_offset_x
-        pitch_y = self.ref_scale_y * bottom_norm + self.ref_offset_y
-
-        pitch_x = np.clip(pitch_x, -self.pitch_length / 2, self.pitch_length / 2)
-        pitch_y = np.clip(pitch_y, -self.pitch_width / 2, self.pitch_width / 2)
-
-        return (float(pitch_x), float(pitch_y))
-
-    def is_calibrated(self) -> bool:
-        """Check if projector has been calibrated."""
-        return self.ref_scale_x is not None and self.ref_scale_y is not None
+# Backward-compatible alias — existing code that imports TrajectorySmoother still works
+TrajectorySmoother = IMMKalmanSmoother
 
 
 __all__ = [
     "TrajectoryStore",
+    "IMMKalmanSmoother",
     "TrajectorySmoother",
-    "FallbackProjector",
 ]

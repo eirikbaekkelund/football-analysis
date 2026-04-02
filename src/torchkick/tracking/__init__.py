@@ -2,36 +2,29 @@
 Tracking module for football video analysis.
 
 This module provides comprehensive player and ball tracking capabilities,
-including IoU-based detection linking, Kalman filtering, team classification,
-identity assignment, and pitch projection.
+including BoT-SORT multi-object tracking, Kalman filtering, team classification
+via ReID embeddings, identity assignment, and pitch projection.
 
 Submodules:
     models: Core data models (TrackObservation, TrackData, PlayerSlot, BallState)
     trajectory: Trajectory storage and smoothing
-    iou_tracker: Simple IoU-based detection linking
+    iou_tracker: MaskIoUTracker (SAM3 mask tracking only)
     identity: Team classification and player ID assignment
     ball: Ball tracking with Kalman filtering
     homography: Pitch projection via keypoint homography
     pitch_viz: 2D pitch visualization
-    color_features: Jersey color extraction
 
 Example:
     >>> from torchkick.tracking import (
-    ...     SimpleIoUTracker,
+    ...     SoccerTracker,
     ...     IdentityAssigner,
     ...     HomographyEstimator,
     ...     BallTracker,
     ... )
-    >>> 
-    >>> # Initialize components
-    >>> tracker = SimpleIoUTracker(iou_threshold=0.3)
-    >>> identity = IdentityAssigner(n_teams=2)
+    >>>
+    >>> tracker = SoccerTracker()
     >>> homography = HomographyEstimator()
     >>> ball_tracker = BallTracker()
-    >>> 
-    >>> # Process frame
-    >>> track_ids = tracker.update(detections)
-    >>> identity.assign_teams(features, track_ids)
 """
 
 from __future__ import annotations
@@ -52,12 +45,15 @@ from torchkick.tracking.models import (
 # Trajectory management
 from torchkick.tracking.trajectory import (
     TrajectoryStore,
-    TrajectorySmoother,
-    FallbackProjector,
+    IMMKalmanSmoother,
+    TrajectorySmoother,  # backward-compat alias for IMMKalmanSmoother
 )
 
-# Detection linking
-from torchkick.tracking.iou_tracker import SimpleIoUTracker
+# SAM3 mask-based tracking only (SimpleIoUTracker removed — use SoccerTracker)
+from torchkick.tracking.iou_tracker import MaskIoUTracker
+
+# BoT-SORT multi-object tracker (primary MOT); ByteTracker is a compat alias
+from torchkick.tracking.mot_tracker import SoccerTracker, ByteTracker
 
 # Identity and team assignment
 from torchkick.tracking.identity import (
@@ -77,7 +73,10 @@ from torchkick.tracking.homography import (
     PITCH_WIDTH,
     PitchPoint,
     PITCH_LINE_COORDINATES,
+    CameraPoseKalmanFilter,
+    HomographyKalmanFilter,  # backward-compat alias
     HomographyEstimator,
+    GeometricConstraintSolver,
 )
 
 # Visualization
@@ -86,12 +85,6 @@ from torchkick.tracking.pitch_viz import (
     COLOR_TEAM_2,
     COLOR_REFEREE,
     PitchVisualizer,
-)
-
-# Color features
-from torchkick.tracking.color_features import (
-    get_jersey_color_feature,
-    get_dominant_color_feature,
 )
 
 __all__ = [
@@ -114,20 +107,22 @@ __all__ = [
     "PitchPoint",
     # Trajectory
     "TrajectoryStore",
+    "IMMKalmanSmoother",
     "TrajectorySmoother",
-    "FallbackProjector",
     # Tracking
-    "SimpleIoUTracker",
+    "SoccerTracker",
+    "ByteTracker",
+    "MaskIoUTracker",
     "IdentityAssigner",
     "PitchSlotManager",
     "BallKalmanTrack",
     "BallTracker",
     # Homography
     "PITCH_LINE_COORDINATES",
+    "CameraPoseKalmanFilter",
+    "HomographyKalmanFilter",
     "HomographyEstimator",
+    "GeometricConstraintSolver",
     # Visualization
     "PitchVisualizer",
-    # Features
-    "get_jersey_color_feature",
-    "get_dominant_color_feature",
 ]

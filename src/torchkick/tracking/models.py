@@ -35,14 +35,12 @@ class TrackObservation(BaseModel):
     """
     Single observation of a tracked object in one frame.
 
-    Stores bounding box, optional pitch position, and color features
-    for team classification.
+    Stores bounding box, optional pitch position, and ReID features.
 
     Attributes:
         frame_idx: Frame number in the video.
         box: Bounding box as [x1, y1, x2, y2] in pixels.
         pitch_pos: Optional (x, y) position on pitch in meters.
-        color_feature: Optional color feature vector for team classification.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -50,7 +48,16 @@ class TrackObservation(BaseModel):
     frame_idx: int
     box: np.ndarray
     pitch_pos: Optional[Tuple[float, float]] = None
-    color_feature: Optional[np.ndarray] = None
+    # Representative mask for this observation (optional, stored every N frames)
+    rep_mask: Optional[np.ndarray] = None
+    # ReID embedding from DINOv2-S/8 distilled model (384-dim)
+    reid_embedding: Optional[np.ndarray] = None
+    # Per-frame team classification probabilities [3] (home, away, ref).
+    # Confidence-weighted majority vote across all observations gives final label.
+    # Low-confidence frames (occlusion, blur) naturally contribute less weight.
+    team_probs: Optional[np.ndarray] = None
+    # Feet pixel coords from ViTPose ankle keypoints — more accurate than bbox center for projection
+    keypoint_feet_uv: Optional[Tuple[float, float]] = None
 
 
 class TrackData(BaseModel):
@@ -68,7 +75,6 @@ class TrackData(BaseModel):
         role: Detected role (player, goalie, referee, linesman).
         team: Team index (0 or 1) or -1 for referee.
         player_id: Jersey number if detected.
-        frame_team_votes: Per-frame team classification votes.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -80,7 +86,9 @@ class TrackData(BaseModel):
     role: Optional[str] = None
     team: Optional[int] = None
     player_id: Optional[int] = None
-    frame_team_votes: Optional[List[int]] = None
+    # Running EMA of team classification probabilities [3] across frames.
+    # Updated each time a new reid_embedding is classified; prevents per-frame label flipping.
+    team_probs_ema: Optional[np.ndarray] = None
 
     def duration_frames(self) -> int:
         """Number of frames this track has been observed."""

@@ -2,23 +2,22 @@
 Player identity and team assignment.
 
 This module provides tools for assigning player identities using
-color clustering and spatial priors, including team classification,
-goalie detection, and referee identification.
+ReID embeddings (when available) or color clustering as fallback,
+including team classification, goalie detection, and referee identification.
 
 Example:
     >>> from torchkick.tracking import IdentityAssigner
-    >>> 
+    >>>
     >>> assigner = IdentityAssigner(fps=30.0)
     >>> assignments = assigner.assign_roles(trajectory_store)
 """
 
 from __future__ import annotations
 
-from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple
+from collections import Counter, defaultdict
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 import numpy as np
-from sklearn.mixture import GaussianMixture
 
 from torchkick.tracking.models import (
     PENALTY_AREA_X,
@@ -27,19 +26,26 @@ from torchkick.tracking.models import (
 )
 from torchkick.tracking.trajectory import TrajectoryStore
 
+if TYPE_CHECKING:
+    from torchkick.models.reid import DINOv2ReIDEmbedder
+
 
 class IdentityAssigner:
     """
-    Assign player identities using color clustering and spatial priors.
+    Assign player identities using ReID embeddings or color clustering.
 
     Strategy:
-    1. Per-frame color voting to classify each observation
-    2. Majority vote across track lifetime for final assignment
+    1. If observations have reid_embedding set: use DINOv2 embedding clustering
+    2. Otherwise: fall back to color GMM (legacy path)
     3. Spatial analysis for goalies (penalty area) and linesmen (sidelines)
-    4. Outlier detection for referee (distinct color from both teams)
+    4. Outlier detection for referee
 
     Args:
         fps: Video frame rate.
+        embedder: Optional DINOv2ReIDEmbedder for unsupervised team clustering.
+            When provided and reid_embedding fields are populated in observations,
+            clustering uses cosine-similarity spectral clustering instead of GMM.
+            Falls back to color GMM when embeddings are absent.
         debug: Print debug information.
 
     Example:
@@ -49,14 +55,17 @@ class IdentityAssigner:
         ...     print(f"Track {tid}: {info['role']} Team {info['team']}")
     """
 
-    def __init__(self, fps: float = 30.0, debug: bool = True) -> None:
+    def __init__(
+        self,
+        fps: float = 30.0,
+        embedder: Optional["DINOv2ReIDEmbedder"] = None,
+        siglip_embedder: Optional["SigLIPTeamEmbedder"] = None,
+        debug: bool = True,
+    ) -> None:
         self.fps = fps
+        self.embedder = embedder
+        self.siglip_embedder = siglip_embedder
         self.debug = debug
-        self.gmm: Optional[GaussianMixture] = None
-        self.team_a_cluster: Optional[int] = None
-        self.team_b_cluster: Optional[int] = None
-        self.team_means: Optional[np.ndarray] = None
-        self.team_covs: Optional[np.ndarray] = None
 
     def assign_roles(
         self,
@@ -93,8 +102,19 @@ class IdentityAssigner:
             tid for tid in track_stats.keys() if tid not in goalie_candidates and tid not in linesman_candidates
         ]
 
-        # Cluster by color
-        team_assignments, referee_id = self._cluster_by_color(store, remaining_ids)
+        # Cluster: prefer team_probs/ReID embeddings; without them team classification is
+        # not possible — provide --reid-weights to enable it.
+        has_reid = self._has_reid_embeddings(store, remaining_ids)
+        if has_reid:
+            team_assignments, referee_id = self._cluster_by_reid(store, remaining_ids)
+        else:
+            if self.debug:
+                print(
+                    "[IdentityAssigner] No ReID embeddings — team classification unavailable. "
+                    "Run with --reid-weights to enable. Defaulting all to team 0."
+                )
+            team_assignments = {tid: 0 for tid in remaining_ids}
+            referee_id = None
 
         # Assign goalies to teams
         goalie_teams = self._assign_goalie_teams(goalie_candidates, track_stats, team_assignments)
@@ -173,7 +193,11 @@ class IdentityAssigner:
         return candidates
 
     def _find_linesman_candidates(self, track_stats: Dict, exclude: Set[int]) -> Set[int]:
-        """Find tracks predominantly on sidelines."""
+        """Find tracks predominantly on sidelines.
+
+        Requires all three: near sideline (high mean_y), low lateral variance
+        (stays on the line), AND high longitudinal variance (moves along the line).
+        """
         candidates = set()
 
         for tid, stats in track_stats.items():
@@ -182,28 +206,100 @@ class IdentityAssigner:
 
             mean_y = stats["mean_y"]
             std_y = stats["std_y"]
+            std_x = stats["std_x"]
 
             near_sideline = abs(mean_y) > 32
             low_y_var = std_y < 5
+            high_x_var = std_x > 5  # moves along touchline
 
-            if near_sideline and low_y_var and stats["n_samples"] > 50:
+            if near_sideline and low_y_var and high_x_var and stats["n_samples"] > 50:
                 candidates.add(tid)
                 if self.debug:
                     side = "TOP" if mean_y > 0 else "BOTTOM"
                     print(
                         f"[DEBUG] Track {tid} -> LINESMAN candidate ({side}): "
-                        f"mean_y={mean_y:.1f}m, std_y={std_y:.1f}m"
+                        f"mean_y={mean_y:.1f}m, std_y={std_y:.1f}m, std_x={std_x:.1f}m"
                     )
 
         return candidates
 
-    def _cluster_by_color(
+    # ------------------------------------------------------------------
+    # ReID-based clustering (primary path when embeddings are available)
+    # ------------------------------------------------------------------
+
+    def _has_reid_embeddings(self, store: TrajectoryStore, track_ids: List[int]) -> bool:
+        """Return True if at least one observation has a reid_embedding."""
+        for tid in track_ids:
+            track = store.get_track(tid)
+            if track and any(obs.reid_embedding is not None for obs in track.observations):
+                return True
+        return False
+
+    def _has_team_probs(self, store: TrajectoryStore, track_ids: List[int]) -> bool:
+        """Return True if at least one observation has team_probs stored."""
+        for tid in track_ids:
+            track = store.get_track(tid)
+            if track and any(obs.team_probs is not None for obs in track.observations):
+                return True
+        return False
+
+    def _vote_by_team_probs(
         self,
         store: TrajectoryStore,
         track_ids: List[int],
     ) -> Tuple[Dict[int, int], Optional[int]]:
         """
-        Cluster tracks by color using GMM.
+        Confidence-weighted majority vote from per-frame team_probs.
+
+        For each track: ``Σ(probs × max_prob) → argmax``.
+        Occluded/blurry frames have low max_prob and thus contribute
+        near-zero weight, making the vote robust to transient noise.
+
+        Returns:
+            (team_assignments, referee_id)
+        """
+        team_assignments: Dict[int, int] = {}
+        track_labels: Dict[int, int] = {}
+
+        for tid in track_ids:
+            track = store.get_track(tid)
+            if not track:
+                team_assignments[tid] = 0
+                continue
+
+            probs_list = [obs.team_probs for obs in track.observations if obs.team_probs is not None]
+            if not probs_list:
+                team_assignments[tid] = 0
+                continue
+
+            stacked = np.stack(probs_list)  # [T, 3]
+            confidence = stacked.max(axis=1, keepdims=True)  # [T, 1]
+            weighted = (stacked * confidence).sum(axis=0)  # [3]
+            label = int(weighted.argmax())
+            track_labels[tid] = label
+            team_assignments[tid] = label if label != 2 else -1
+
+        if self.debug:
+            label_counts = Counter(track_labels.values())
+            print(f"[DEBUG] Confidence-weighted vote: {dict(label_counts)}")
+
+        referee_id = None
+        ref_candidates = [tid for tid, l in track_labels.items() if l == 2]
+        if ref_candidates:
+            referee_id = self._pick_best_referee(ref_candidates, store, team_assignments)
+
+        return team_assignments, referee_id
+
+    def _cluster_by_reid(
+        self,
+        store: TrajectoryStore,
+        track_ids: List[int],
+    ) -> Tuple[Dict[int, int], Optional[int]]:
+        """
+        Cluster tracks by ReID embeddings or confidence-weighted majority vote.
+
+        Prefers per-frame team_probs (confidence-weighted vote) when stored.
+        Falls back to mean-pooled embedding clustering when probs are absent.
 
         Returns:
             (team_assignments, referee_id)
@@ -211,163 +307,112 @@ class IdentityAssigner:
         if not track_ids:
             return {}, None
 
-        if not self._fit_color_gmm(store, track_ids):
-            return {tid: 0 for tid in track_ids}, None
+        # Prefer confidence-weighted majority vote when team_probs are available
+        if self._has_team_probs(store, track_ids):
+            if self.debug:
+                print("[IdentityAssigner] Using confidence-weighted majority vote (team_probs)")
+            return self._vote_by_team_probs(store, track_ids)
 
-        team_assignments = {}
-        track_outlier_scores = {}
+        if self.debug:
+            print("[IdentityAssigner] Falling back to mean-pool embedding clustering")
+
+        # Mean-pool per-frame embeddings to get one vector per track
+        tids_with_emb: List[int] = []
+        track_embs: List[np.ndarray] = []
 
         for tid in track_ids:
             track = store.get_track(tid)
             if not track:
                 continue
+            embs = [obs.reid_embedding for obs in track.observations if obs.reid_embedding is not None]
+            if embs:
+                tids_with_emb.append(tid)
+                track_embs.append(np.mean(embs, axis=0))
 
-            majority_team, confidence, outlier_score = self._vote_per_frame(track)
-            team_assignments[tid] = majority_team
-            track_outlier_scores[tid] = outlier_score
+        if not tids_with_emb:
+            return {tid: 0 for tid in track_ids}, None
 
-            if self.debug and outlier_score > 1.5:
-                print(
-                    f"[DEBUG] Track {tid}: team={majority_team}, " f"conf={confidence:.2f}, outlier={outlier_score:.2f}"
-                )
+        emb_matrix = np.stack(track_embs)  # [N, dim]
 
-        # Find referee (highest outlier score, not near sideline)
-        referee_id = None
-        best_outlier = 0.0
+        # Get per-track cluster labels (0=home, 1=away, 2=ref)
+        if self.embedder is not None:
+            labels = self.embedder.cluster_teams(emb_matrix)
+        elif self.siglip_embedder is not None:
+            labels = self.siglip_embedder.cluster_teams(emb_matrix)
+        else:
+            # Fallback: cosine-normalised k-means, 3 clusters
+            try:
+                from sklearn.cluster import KMeans
 
-        for tid, outlier_score in track_outlier_scores.items():
-            track = store.get_track(tid)
-            if not track:
-                continue
+                norms = np.linalg.norm(emb_matrix, axis=1, keepdims=True) + 1e-8
+                normed = emb_matrix / norms
+                km = KMeans(n_clusters=3, random_state=42, n_init=10)
+                labels = km.fit_predict(normed)
+                # Assign label 2 to the smallest cluster (likely referee)
+                counts = np.bincount(labels, minlength=3)
+                labels = np.where(labels == np.argmin(counts), 2, labels)
+            except ImportError:
+                labels = np.zeros(len(tids_with_emb), dtype=int)
 
-            stats = track.pitch_position_stats()
-            if not stats:
-                continue
+        if self.debug:
+            unique, cnts = np.unique(labels, return_counts=True)
+            print(f"[DEBUG] ReID clusters: {dict(zip(unique.tolist(), cnts.tolist()))}")
 
-            # Skip sideline tracks
-            if abs(stats.get("mean_y", 0)) > 30:
-                continue
+        team_assignments: Dict[int, int] = {}
+        referee_id: Optional[int] = None
 
-            # Require mobility
-            mobility = stats.get("std_x", 0) + stats.get("std_y", 0)
-            if mobility < 2.0:
-                continue
+        # Tracks without embeddings fall back to most-common non-ref team
+        majority_team = (
+            int(np.bincount([l for l in labels if l != 2], minlength=2).argmax()) if any(l != 2 for l in labels) else 0
+        )
+        for tid in track_ids:
+            if tid not in tids_with_emb:
+                team_assignments[tid] = majority_team
 
-            if outlier_score > best_outlier:
-                best_outlier = outlier_score
-                referee_id = tid
+        for i, tid in enumerate(tids_with_emb):
+            label = int(labels[i])
+            if label == 2:
+                team_assignments[tid] = -1
+                if referee_id is None:
+                    # Prefer the mobile, non-sideline track most likely to be referee
+                    referee_id = self._pick_best_referee(
+                        [tids_with_emb[j] for j, l in enumerate(labels) if l == 2],
+                        store,
+                        team_assignments,
+                    )
+            else:
+                team_assignments[tid] = label
 
-        if referee_id is not None:
-            team_assignments[referee_id] = -1
-            if self.debug:
-                print(f"[DEBUG] Selected referee: Track {referee_id} (outlier={best_outlier:.2f})")
+        if referee_id is not None and self.debug:
+            print(f"[DEBUG] Selected referee: Track {referee_id} (ReID cluster 2)")
 
         return team_assignments, referee_id
 
-    def _fit_color_gmm(
+    def _pick_best_referee(
         self,
+        candidate_ids: List[int],
         store: TrajectoryStore,
-        track_ids: List[int],
-    ) -> bool:
-        """Fit 2-component GMM for team colors."""
-        if not track_ids:
-            return False
+        team_assignments: Dict[int, int],
+    ) -> Optional[int]:
+        """Return the most plausible referee from cluster-2 candidates."""
+        best_id: Optional[int] = None
+        best_mobility = -1.0
 
-        all_features = []
-        for tid in track_ids:
+        for tid in candidate_ids:
             track = store.get_track(tid)
             if not track:
                 continue
-            for obs in track.observations:
-                if obs.color_feature is not None and np.linalg.norm(obs.color_feature) > 0:
-                    all_features.append(obs.color_feature)
-
-        if len(all_features) < 100:
-            if self.debug:
-                print(f"[DEBUG] Not enough color samples ({len(all_features)}) for GMM")
-            return False
-
-        X = np.array(all_features, dtype=np.float64)
-
-        try:
-            self.gmm = GaussianMixture(
-                n_components=2,
-                covariance_type="diag",
-                random_state=42,
-                n_init=10,
-                reg_covar=1e-3,
-            )
-            self.gmm.fit(X)
-
-            self.team_means = self.gmm.means_
-            self.team_covs = self.gmm.covariances_
-
-            labels = self.gmm.predict(X)
-            cluster_counts = np.bincount(labels, minlength=2)
-
-            sorted_clusters = np.argsort(cluster_counts)[::-1]
-            self.team_a_cluster = sorted_clusters[0]
-            self.team_b_cluster = sorted_clusters[1]
-
-            if self.debug:
-                print(f"[DEBUG] GMM fitted on {len(all_features)} color samples")
-                print(f"[DEBUG] Team A: cluster {self.team_a_cluster} ({cluster_counts[self.team_a_cluster]} samples)")
-                print(f"[DEBUG] Team B: cluster {self.team_b_cluster} ({cluster_counts[self.team_b_cluster]} samples)")
-
-            return True
-
-        except Exception as e:
-            if self.debug:
-                print(f"[DEBUG] GMM fitting failed: {e}")
-            return False
-
-    def _vote_per_frame(
-        self,
-        track: TrackData,
-    ) -> Tuple[int, float, float]:
-        """
-        Per-frame voting with outlier score.
-
-        Returns:
-            (majority_team, confidence, outlier_score)
-        """
-        if self.gmm is None:
-            return 0, 0.0, 0.0
-
-        votes = []
-        outlier_scores = []
-
-        for obs in track.observations:
-            if obs.color_feature is None or np.linalg.norm(obs.color_feature) == 0:
+            stats = track.pitch_position_stats()
+            if not stats:
                 continue
+            if abs(stats.get("mean_y", 0)) > 30:
+                continue  # sideline — likely linesman
+            mobility = stats.get("std_x", 0) + stats.get("std_y", 0)
+            if mobility > best_mobility:
+                best_mobility = mobility
+                best_id = tid
 
-            feat = obs.color_feature.reshape(1, -1)
-            probs = self.gmm.predict_proba(feat)[0]
-            label = np.argmax(probs)
-            conf = probs[label]
-
-            max_prob = max(probs)
-            outlier = -np.log(max_prob + 1e-10)
-            outlier_scores.append(outlier)
-
-            team = 0 if label == self.team_a_cluster else 1
-            votes.append((team, conf))
-
-        if not votes:
-            return 0, 0.0, 0.0
-
-        team_scores = {0: 0.0, 1: 0.0}
-        for team, conf in votes:
-            team_scores[team] += conf
-
-        majority_team = max(team_scores, key=team_scores.get)
-        total = sum(team_scores.values())
-        confidence = team_scores[majority_team] / total if total > 0 else 0.0
-
-        avg_outlier = np.mean(outlier_scores) if outlier_scores else 0.0
-        track.frame_team_votes = [v[0] for v in votes]
-
-        return majority_team, confidence, avg_outlier
+        return best_id
 
     def _assign_goalie_teams(
         self,
@@ -727,10 +772,12 @@ class PitchSlotManager:
                     pos = frame_pos[frame_idx]
                 else:
                     # Interpolate between nearest known frames
-                    prev_frame = max(f for f in frames if f < frame_idx)
-                    next_frame = min(f for f in frames if f > frame_idx)
+                    prev_frames = [f for f in frames if f < frame_idx]
+                    next_frames = [f for f in frames if f > frame_idx]
 
-                    if prev_frame is not None and next_frame is not None:
+                    if prev_frames and next_frames:
+                        prev_frame = prev_frames[-1]  # max(prev_frames)
+                        next_frame = next_frames[0]  # min(next_frames)
                         t = (frame_idx - prev_frame) / (next_frame - prev_frame)
                         prev_pos = frame_pos[prev_frame]
                         next_pos = frame_pos[next_frame]
@@ -738,6 +785,10 @@ class PitchSlotManager:
                             prev_pos[0] + t * (next_pos[0] - prev_pos[0]),
                             prev_pos[1] + t * (next_pos[1] - prev_pos[1]),
                         )
+                    elif prev_frames:
+                        pos = frame_pos[prev_frames[-1]]
+                    elif next_frames:
+                        pos = frame_pos[next_frames[0]]
                     else:
                         pos = self.slots[slot_key].position
 

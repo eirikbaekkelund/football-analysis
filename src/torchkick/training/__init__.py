@@ -1,73 +1,42 @@
 """
 Training scripts for football analysis models.
 
-This module provides training pipelines for the various detection
-and tracking models used in torchkick.
-
 Submodules:
-    train_yolo: YOLO player detection training
-    train_fcnn: Faster R-CNN player detection training
-    train_rtdetr: RT-DETR player detection training
-    train_lines: Pitch line detection training
+    train_ball_detector: YOLOv9-nano ball detection training
+    train_detection: RT-DETR-X player/ball/referee detection
+    train_keypoints: ViTPose-L pitch landmark detection
+    train_reid: DINOv2+LoRA+ArcFace player re-identification
+    train_distill: Knowledge distillation ViT-L/14 → ViT-S/8
 
 Example:
-    Training via CLI (recommended for documentation):
-    
-    ```bash
-    # YOLO player detection
-    torchkick train yolo --data soccernet/tracking/train.zip --epochs 50
-    
-    # Faster R-CNN
-    torchkick train fcnn --data soccernet/tracking/train.zip --epochs 10
-    
-    # RT-DETR (transformer-based)
-    torchkick train rtdetr --data soccernet/tracking/train.zip --epochs 20
-    
-    # Pitch line detection
-    torchkick train lines --data path/to/annotations --epochs 100
-    ```
-    
-    Or via Python API:
-    
-    >>> from torchkick.training import train_yolo, train_fcnn
-    >>> 
-    >>> train_yolo.run_training(
-    ...     data_zip="soccernet/tracking/train.zip",
-    ...     epochs=50,
-    ...     batch_size=256,
-    ... )
+    >>> from torchkick.training import train_detection, train_yolo
+    >>> weights = train_detection(data_config=[...], epochs=50)
+    >>> ball_weights = train_yolo(data_zip="data/train.zip", epochs=30)
 """
 
-from torchkick.training.train_yolo import (
+from torchkick.training.train_ball_detector import (
     convert_to_yolo_format,
     train_yolo,
+    train_yolo_keypoints,
     get_jersey_color_class,
 )
-from torchkick.training.train_fcnn import (
-    get_player_detector_model,
-    train_fcnn,
-)
-from torchkick.training.train_rtdetr import (
-    get_rtdetr_model,
-    train_rtdetr,
-)
-from torchkick.training.train_lines import (
-    LineDetectionDataset,
-    train_lines,
-)
+from torchkick.training.train_detection import train_detection
+from torchkick.training.train_keypoints import train_keypoints
+from torchkick.training.train_reid import train_reid
+from torchkick.training.train_distill import train_distill
 
 __all__ = [
-    # YOLO
+    # Ball detector / YOLO-pose keypoints
     "convert_to_yolo_format",
     "train_yolo",
+    "train_yolo_keypoints",
     "get_jersey_color_class",
-    # FCNN
-    "get_player_detector_model",
-    "train_fcnn",
-    # RT-DETR
-    "get_rtdetr_model",
-    "train_rtdetr",
-    # Pitch lines
-    "LineDetectionDataset",
-    "train_lines",
+    # RT-DETR-X player/ball/referee detection
+    "train_detection",
+    # ViTPose-L pitch keypoints
+    "train_keypoints",
+    # DINOv2+LoRA+ArcFace ReID
+    "train_reid",
+    # Knowledge distillation ViT-L/14 → ViT-S/8
+    "train_distill",
 ]

@@ -121,7 +121,7 @@ class BallTracker:
     def __init__(
         self,
         max_age: int = 30,
-        min_hits: int = 3,
+        min_hits: int = 5,
         distance_threshold: float = 50.0,
         velocity_threshold: float = 100.0,
         occlusion_handler: bool = True,
@@ -192,19 +192,22 @@ class BallTracker:
         return True
 
     def _predict_occlusion_position(self) -> Optional[Tuple[float, float]]:
-        """Predict ball position during occlusion using physics."""
-        if not self.trajectory_buffer or len(self.trajectory_buffer) < 2:
+        """
+        Predict ball position during occlusion using the Kalman filter's linear
+        extrapolation from the primary track.
+
+        The Kalman constant-velocity model already extrapolates position correctly
+        via repeated predict() calls — no polynomial fitting needed.  Polynomial
+        fits in image-plane coordinates confuse horizontal displacement with the
+        z-height component of lofted passes; the Kalman state tracks image-plane
+        velocity and handles both rolling and airborne balls correctly.
+        """
+        if self.primary_track_id is None:
             return None
-
-        vx, vy = self.last_known_velocity
-        last_pos = self.trajectory_buffer[-1]
-
-        # Simple physics with gravity
-        gravity_effect = 0.5 * self.occlusion_frames
-        predicted_y = last_pos[1] + vy * self.occlusion_frames + gravity_effect
-        predicted_x = last_pos[0] + vx * self.occlusion_frames
-
-        return (predicted_x, predicted_y)
+        primary = next((t for t in self.tracks if t.id == self.primary_track_id), None)
+        if primary is None:
+            return None
+        return primary.get_position()
 
     def update(
         self,
