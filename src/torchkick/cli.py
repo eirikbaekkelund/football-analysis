@@ -260,8 +260,7 @@ def dataset(
 
         except ImportError:
             raise click.UsageError(
-                "SoccerNet package is required for dataset downloads. "
-                "Install with: pip install torchkick[soccernet]"
+                "SoccerNet package is required for dataset downloads. " "Install with: pip install torchkick[soccernet]"
             )
 
     elif dataset == "roboflow-players":
@@ -473,7 +472,7 @@ def train() -> None:
     default=None,
     help="Directory containing CVAT images (required when --cvat-json is given).",
 )
-@click.option("--epochs", "-e", type=int, default=50)
+@click.option("--epochs", "-e", type=int, default=300)
 @click.option("--batch-size", "-b", type=int, default=8)
 @click.option("--lr", type=float, default=5e-5)
 @click.option("--save-dir", type=str, default="weights/detection/")
@@ -572,7 +571,7 @@ def train_detection_cmd(
     "--epochs",
     "-e",
     type=int,
-    default=50,
+    default=100,
     help="Number of training epochs.",
 )
 @click.option(
@@ -630,7 +629,7 @@ def train_yolo_cmd(
 
 @train.command("yolo-keypoints")
 @click.option("--data", "-d", type=click.Path(exists=True), required=True, help="Path to YOLO-pose dataset YAML.")
-@click.option("--epochs", "-e", type=int, default=100)
+@click.option("--epochs", "-e", type=int, default=300)
 @click.option("--imgsz", type=int, default=320, help="Input image size.")
 @click.option("--base-model", type=str, default="yolo11n-pose.pt", help="Base YOLO-pose model.")
 @click.option("--save-dir", type=str, default="weights/keypoints/")
@@ -665,7 +664,7 @@ def train_yolo_keypoints_cmd(
 
 @train.command("keypoints")
 @click.option("--data", "-d", type=click.Path(exists=True), required=True, help="Path to SoccerNet calibration zip.")
-@click.option("--epochs", "-e", type=int, default=100)
+@click.option("--epochs", "-e", type=int, default=300)
 @click.option("--batch-size", "-b", type=int, default=8)
 @click.option("--lr", type=float, default=5e-4, help="Peak learning rate.")
 @click.option("--save-dir", type=str, default="weights/keypoints/")

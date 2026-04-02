@@ -107,6 +107,7 @@ def _resolve_roboflow_api_key(api_key: Optional[str]) -> str:
         return api_key
     try:
         from dotenv import load_dotenv
+
         load_dotenv()
     except ImportError:
         pass
