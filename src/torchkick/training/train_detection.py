@@ -62,7 +62,7 @@ def train_detection(
     grad_accumulation: int = 4,
     val_split: float = 0.1,
     use_fsdp: bool = False,
-    compile_model: bool = True,
+    compile_model: bool = False,
     save_dir: str = "weights/detection/",
     device: Optional[str] = None,
     wandb_project: Optional[str] = None,
