@@ -157,9 +157,12 @@ def _apply_augmentations(
             boxes = boxes * np.array([scale_x, scale_y, scale_x, scale_y])
         return image, boxes, labels
 
+    import warnings
     labels_list = labels.tolist() if len(labels) else []
     if len(boxes):
-        result = transform(image=image, bboxes=boxes.tolist(), labels=labels_list)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            result = transform(image=image, bboxes=boxes.tolist(), labels=labels_list)
         image = result["image"]
         boxes = np.array(result["bboxes"], dtype=np.float32) if result["bboxes"] else np.zeros((0, 4), dtype=np.float32)
         labels = np.array(result["labels"], dtype=np.int64) if result["labels"] else np.zeros(0, dtype=np.int64)
