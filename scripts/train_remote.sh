@@ -95,7 +95,8 @@ fi
 log "Installing torchkick"
 pip install -q uv
 uv pip install --system -e ".[reid,roboflow,training]" \
-    --extra-index-url https://download.pytorch.org/whl/cu128
+    --extra-index-url https://download.pytorch.org/whl/cu128 \
+    --index-strategy unsafe-best-match
 ok "torchkick installed"
 
 # ── 3. Download datasets ─────────────────────────────────────────────────────
