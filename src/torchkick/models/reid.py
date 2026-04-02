@@ -515,7 +515,7 @@ class SigLIPTeamEmbedder:
         for i in range(0, len(crops), self.batch_size):
             batch_crops = crops[i : i + self.batch_size]
             pil_imgs = [Image.fromarray(cv2.cvtColor(c, cv2.COLOR_BGR2RGB)) for c in batch_crops]
-            inputs = self._processor(images=pil_imgs, return_tensors="pt", padding=True)
+            inputs = self._processor(images=pil_imgs, return_tensors="pt")
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
             out = self._model(**inputs)
             # SigLIP vision model returns BaseModelOutputWithPooling; use pooler_output
