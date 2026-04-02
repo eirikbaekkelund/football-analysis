@@ -127,10 +127,12 @@ if [ "$SKIP_DETECTION" -eq 0 ]; then
         --base-model yolo11n.pt
 
     # If SoccerNet data is also available, train a combined model
-    if [ "$ROBOFLOW_ONLY" -eq 0 ] && [ -f "data/soccernet/tracking/train.zip" ]; then
+    # SDK saves to data/soccernet/tracking/tracking/train.zip (nested by task name)
+    SOCCERNET_TRACKING_ZIP="data/soccernet/tracking/tracking/train.zip"
+    if [ "$ROBOFLOW_ONLY" -eq 0 ] && [ -f "$SOCCERNET_TRACKING_ZIP" ]; then
         log "Training combined detector (Roboflow + SoccerNet)"
         torchkick train detection \
-            --soccernet data/soccernet/tracking/train.zip \
+            --soccernet "$SOCCERNET_TRACKING_ZIP" \
             --roboflow-json data/roboflow/players/train/_annotations.coco.json \
             --roboflow-images data/roboflow/players/train/ \
             --epochs "$EPOCHS_DETECTION" \
@@ -147,10 +149,12 @@ if [ "$SKIP_KEYPOINTS" -eq 0 ]; then
         --epochs "$EPOCHS_KEYPOINTS" \
         --save-dir weights/keypoints_yolo/
 
-    if [ "$ROBOFLOW_ONLY" -eq 0 ] && [ -f "data/soccernet/calibration/train.zip" ]; then
+    # SDK saves to data/soccernet/calibration/calibration/train.zip
+    SOCCERNET_CALIB_ZIP="data/soccernet/calibration/calibration/train.zip"
+    if [ "$ROBOFLOW_ONLY" -eq 0 ] && [ -f "$SOCCERNET_CALIB_ZIP" ]; then
         log "Training ViTPose pitch keypoints (SoccerNet)"
         torchkick train keypoints \
-            --data data/soccernet/calibration/train.zip \
+            --data "$SOCCERNET_CALIB_ZIP" \
             --epochs "$EPOCHS_KEYPOINTS" \
             --save-dir weights/keypoints_vitpose/
         ok "ViTPose keypoints trained"
