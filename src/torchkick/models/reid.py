@@ -489,8 +489,11 @@ class SigLIPTeamEmbedder:
 
             self._processor = AutoProcessor.from_pretrained(model_name)
             self._model = AutoModel.from_pretrained(model_name).to(self.device).eval()
-        except ImportError:
-            raise ImportError("transformers>=4.38 required. Install: pip install torchkick[reid]")
+        except ImportError as e:
+            raise ImportError(
+                f"SigLIPTeamEmbedder dependency missing: {e}. "
+                "Install with: pip install torchkick[reid] sentencepiece"
+            ) from e
 
     @torch.inference_mode()
     def embed(self, crops: List[np.ndarray]) -> np.ndarray:
