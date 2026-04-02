@@ -21,8 +21,6 @@ import cv2
 import numpy as np
 import torch
 
-# Type aliases
-TensorLike = Union[np.ndarray, torch.Tensor]
 BBox = Tuple[float, float, float, float]
 
 
@@ -206,148 +204,242 @@ class PlayerDetector:
         return detections
 
 
-@dataclass
-class ReIDConfig:
-    """Configuration for ReID model."""
-
-    embedding_dim: int = 512
-    num_classes: int = 1000
-    backbone: str = "osnet"
-    input_size: Tuple[int, int] = (128, 256)  # width, height
-    use_team_head: bool = True
-    use_role_head: bool = True
-    dropout: float = 0.3
-    pretrained: bool = True
-
-
-class AppearanceEmbedder:
+class RTDETRDetector:
     """
-    Extract appearance embeddings for player re-identification.
+    RT-DETR-X player/ball/referee detector.
 
-    Supports both handcrafted features (color histograms) and
-    deep ReID embeddings.
+    Wraps HuggingFace RT-DETR (rtdetr_r101vd) for high-accuracy transformer-based
+    detection. Uses torch.compile for ~2x speedup after first frame.
 
     Args:
-        use_deep_features: Use deep ReID model.
-        reid_model_path: Path to ReID model weights.
+        weights_path: Path to fine-tuned checkpoint (.pth). If None, uses base HF weights.
+        model_name: HuggingFace model identifier.
         device: Torch device string.
+        conf_threshold: Minimum confidence to keep a detection.
+        player_class_id: Class index for players in the fine-tuned head (default 0).
 
     Example:
-        >>> embedder = AppearanceEmbedder(use_deep_features=False)
-        >>> features = embedder.extract(player_crop)
-        >>> print(features.shape)  # (768,) for handcrafted
+        >>> detector = RTDETRDetector("weights/rtdetr_finetuned.pth")
+        >>> detections = detector.detect(frame_bgr)
+        >>> for det in detections:
+        ...     print(det.bbox, det.confidence)
     """
 
     def __init__(
         self,
-        use_deep_features: bool = False,
-        reid_model_path: Optional[Union[str, Path]] = None,
+        weights_path: Optional[Union[str, Path]] = None,
+        model_name: str = "PekingU/rtdetr_r101vd",
         device: str = "cuda",
+        conf_threshold: float = 0.3,
+        player_class_id: int = 0,
     ) -> None:
-        self.use_deep_features = use_deep_features
-        self.device = device
-        self.reid_model = None
+        self.device = torch.device(device)
+        self.conf_threshold = conf_threshold
+        self.player_class_id = player_class_id
 
-        if use_deep_features and reid_model_path:
-            self._load_reid_model(reid_model_path)
+        try:
+            from transformers import RTDetrForObjectDetection, RTDetrImageProcessor
 
-    def _load_reid_model(self, path: Union[str, Path]) -> None:
-        """Load deep ReID model."""
-        # Placeholder - actual model loading would go here
-        pass
+            self._processor = RTDetrImageProcessor.from_pretrained(model_name)
+            self._model = RTDetrForObjectDetection.from_pretrained(model_name)
 
-    def extract_color_histogram(
+            if weights_path is not None:
+                checkpoint = torch.load(str(weights_path), map_location=self.device, weights_only=True)
+                state = checkpoint.get("model_state_dict", checkpoint)
+                self._model.load_state_dict(state)
+
+            self._model.to(self.device)
+            self._model.eval()
+            self._model = torch.compile(self._model, mode="reduce-overhead")
+        except ImportError:
+            raise ImportError("transformers>=4.35.0 required. Install with: pip install torchkick[reid]")
+
+    @torch.inference_mode()
+    def detect(self, frame: np.ndarray) -> List[Detection]:
+        """
+        Detect players (and ball/referee) in a single BGR frame.
+
+        Args:
+            frame: BGR image array.
+
+        Returns:
+            List of Detection objects with bbox, confidence, class_id.
+        """
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        inputs = self._processor(images=frame_rgb, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        outputs = self._model(**inputs)
+
+        h, w = frame.shape[:2]
+        target_size = torch.tensor([[h, w]], device=self.device)
+        results = self._processor.post_process_object_detection(
+            outputs,
+            target_sizes=target_size,
+            threshold=self.conf_threshold,
+        )[0]
+
+        detections = []
+        for score, label, box in zip(
+            results["scores"].cpu().numpy(),
+            results["labels"].cpu().numpy(),
+            results["boxes"].cpu().numpy(),
+        ):
+            detections.append(
+                Detection(
+                    bbox=(float(box[0]), float(box[1]), float(box[2]), float(box[3])),
+                    confidence=float(score),
+                    class_id=int(label),
+                    class_name="player" if int(label) == self.player_class_id else "other",
+                )
+            )
+
+        return detections
+
+    @torch.inference_mode()
+    def detect_batch(self, frames: List[np.ndarray]) -> List[List[Detection]]:
+        """
+        Detect in a batch of BGR frames.
+
+        Args:
+            frames: List of BGR image arrays.
+
+        Returns:
+            List of detection lists, one per frame.
+        """
+        frames_rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames]
+        inputs = self._processor(images=frames_rgb, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        outputs = self._model(**inputs)
+
+        target_sizes = torch.tensor([[f.shape[0], f.shape[1]] for f in frames], device=self.device)
+
+        all_results = self._processor.post_process_object_detection(
+            outputs,
+            target_sizes=target_sizes,
+            threshold=self.conf_threshold,
+        )
+
+        batch_results = []
+        for i, frame in enumerate(frames):
+            results = all_results[i]
+
+            detections = []
+            for score, label, box in zip(
+                results["scores"].cpu().numpy(),
+                results["labels"].cpu().numpy(),
+                results["boxes"].cpu().numpy(),
+            ):
+                detections.append(
+                    Detection(
+                        bbox=(float(box[0]), float(box[1]), float(box[2]), float(box[3])),
+                        confidence=float(score),
+                        class_id=int(label),
+                        class_name="player" if int(label) == self.player_class_id else "other",
+                    )
+                )
+            batch_results.append(detections)
+
+        return batch_results
+
+
+class RFDETRDetector:
+    """
+    RF-DETR player/referee detector (DINOv2 backbone).
+
+    AP50 73.6 vs RT-DETR-R101's ~60 at the same ~5ms latency. Drop-in
+    replacement for ``RTDETRDetector`` with the same ``detect`` / ``detect_batch``
+    interface.
+
+    Args:
+        weights_path: Path to fine-tuned checkpoint. If None, downloads pretrained weights.
+        model_size: "m" (RFDETRBase, default) or "l" (RFDETRLarge).
+        device: Torch device string.
+        conf_threshold: Minimum confidence to keep a detection.
+        player_class_id: Class index for players in the fine-tuned head (default 0).
+
+    Example:
+        >>> detector = RFDETRDetector()  # downloads pretrained weights
+        >>> detections = detector.detect(frame_bgr)
+    """
+
+    def __init__(
         self,
-        image: np.ndarray,
-        mask: Optional[np.ndarray] = None,
-        bins: Tuple[int, int, int] = (8, 12, 8),
-    ) -> np.ndarray:
+        weights_path: Optional[Union[str, Path]] = None,
+        model_size: str = "m",
+        device: str = "cuda",
+        conf_threshold: float = 0.3,
+        player_class_id: int = 0,
+    ) -> None:
+        self.device = torch.device(device)
+        self.conf_threshold = conf_threshold
+        self.player_class_id = player_class_id
+
+        try:
+            from rfdetr import RFDETRBase, RFDETRLarge
+
+            model_cls = RFDETRLarge if model_size == "l" else RFDETRBase
+            kwargs = {"pretrain_weights": str(weights_path)} if weights_path is not None else {}
+            self._model = model_cls(**kwargs)
+            self._model = torch.compile(self._model, mode="reduce-overhead")
+        except ImportError:
+            raise ImportError("rf-detr required. Install with: pip install torchkick[rfdetr]")
+
+    def _to_detections(self, sv_detections) -> List[Detection]:
+        """Convert supervision.Detections to Detection objects."""
+        results = []
+        if sv_detections is None or len(sv_detections) == 0:
+            return results
+        xyxy = sv_detections.xyxy
+        conf = sv_detections.confidence if sv_detections.confidence is not None else [1.0] * len(xyxy)
+        cls_ids = sv_detections.class_id if sv_detections.class_id is not None else [0] * len(xyxy)
+        for box, score, label in zip(xyxy, conf, cls_ids):
+            results.append(
+                Detection(
+                    bbox=(float(box[0]), float(box[1]), float(box[2]), float(box[3])),
+                    confidence=float(score),
+                    class_id=int(label),
+                    class_name="player" if int(label) == self.player_class_id else "other",
+                )
+            )
+        return results
+
+    @torch.inference_mode()
+    def detect(self, frame: np.ndarray) -> List[Detection]:
         """
-        Extract HSV color histogram.
+        Detect players (and ball/referee) in a single BGR frame.
 
         Args:
-            image: BGR player crop.
-            mask: Optional region mask.
-            bins: Histogram bins per channel.
+            frame: BGR image array.
 
         Returns:
-            Normalized histogram vector.
+            List of Detection objects with bbox, confidence, class_id.
         """
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        hist = cv2.calcHist([hsv], [0, 1, 2], mask, list(bins), [0, 180, 0, 256, 0, 256])
-        hist = cv2.normalize(hist, hist).flatten()
-        return hist
+        from PIL import Image
 
-    def get_jersey_mask(
-        self,
-        image: np.ndarray,
-        upper_ratio: float = 0.5,
-    ) -> np.ndarray:
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img_pil = Image.fromarray(frame_rgb)
+        sv_detections = self._model.predict(img_pil, threshold=self.conf_threshold)
+        return self._to_detections(sv_detections)
+
+    @torch.inference_mode()
+    def detect_batch(self, frames: List[np.ndarray]) -> List[List[Detection]]:
         """
-        Create mask for jersey region.
+        Detect in a batch of BGR frames (sequential — rfdetr has no native batch API).
 
         Args:
-            image: Player crop.
-            upper_ratio: Fraction of height for upper body.
+            frames: List of BGR image arrays.
 
         Returns:
-            Binary mask.
+            List of detection lists, one per frame.
         """
-        h, w = image.shape[:2]
-        mask = np.zeros((h, w), dtype=np.uint8)
-
-        upper_h = int(h * upper_ratio)
-        margin_w = int(w * 0.2)
-        mask[int(h * 0.1) : upper_h, margin_w : w - margin_w] = 255
-
-        # Remove green background
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        green_mask = cv2.inRange(hsv, (35, 40, 40), (85, 255, 255))
-        mask = cv2.bitwise_and(mask, cv2.bitwise_not(green_mask))
-
-        return mask
-
-    def extract(self, image: np.ndarray) -> np.ndarray:
-        """
-        Extract full appearance feature vector.
-
-        Args:
-            image: BGR player crop.
-
-        Returns:
-            Feature vector.
-        """
-        jersey_mask = self.get_jersey_mask(image)
-        hist = self.extract_color_histogram(image, jersey_mask)
-
-        if self.use_deep_features and self.reid_model is not None:
-            # TODO: Add deep feature extraction
-            pass
-
-        return hist
-
-    def compute_similarity(
-        self,
-        feat1: np.ndarray,
-        feat2: np.ndarray,
-    ) -> float:
-        """
-        Compute similarity between feature vectors.
-
-        Args:
-            feat1: First feature vector.
-            feat2: Second feature vector.
-
-        Returns:
-            Similarity score (0-1).
-        """
-        # Histogram intersection
-        return np.minimum(feat1, feat2).sum()
+        return [self.detect(f) for f in frames]
 
 
 __all__ = [
     "Detection",
     "PlayerDetector",
-    "ReIDConfig",
-    "AppearanceEmbedder",
+    "RTDETRDetector",
+    "RFDETRDetector",
 ]

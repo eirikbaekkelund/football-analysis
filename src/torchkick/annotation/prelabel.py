@@ -35,6 +35,8 @@ def process_video_for_cvat(
     max_frames: Optional[int] = None,
     confidence_threshold: float = 0.3,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    use_grounded_sam: bool = False,
+    grounded_sam_pipeline: Optional[Any] = None,
 ) -> List[TrackAnnotation]:
     """
     Process video with detector and tracker to generate pre-labels.
@@ -45,11 +47,16 @@ def process_video_for_cvat(
     Args:
         video_path: Path to input video.
         detector: Detection model with predict() method.
+            Ignored when ``use_grounded_sam=True``.
         tracker: Optional tracker for linking detections.
         frame_step: Process every Nth frame.
         max_frames: Maximum frames to process.
         confidence_threshold: Minimum detection confidence.
         progress_callback: Optional callback(current, total) for progress.
+        use_grounded_sam: When True, use a ``GroundedSAMPipeline`` instead of
+            the ``detector`` argument.  Requires ``grounded_sam_pipeline``.
+        grounded_sam_pipeline: A ``GroundedSAMPipeline`` instance.  Required
+            when ``use_grounded_sam=True``.
 
     Returns:
         List of TrackAnnotation objects.
@@ -58,7 +65,27 @@ def process_video_for_cvat(
         >>> from ultralytics import YOLO
         >>> detector = YOLO("yolov8n.pt")
         >>> tracks = process_video_for_cvat("match.mp4", detector)
+
+        >>> # With Grounded-SAM:
+        >>> from torchkick.annotation.grounded_sam import GroundedSAMPipeline
+        >>> pipeline = GroundedSAMPipeline()
+        >>> tracks = process_video_for_cvat(
+        ...     "match.mp4", detector=None,
+        ...     use_grounded_sam=True, grounded_sam_pipeline=pipeline,
+        ...     frame_step=5,
+        ... )
     """
+    if use_grounded_sam:
+        if grounded_sam_pipeline is None:
+            raise ValueError("grounded_sam_pipeline must be provided when use_grounded_sam=True")
+        return _process_video_grounded_sam(
+            video_path=video_path,
+            pipeline=grounded_sam_pipeline,
+            frame_step=frame_step,
+            max_frames=max_frames,
+            progress_callback=progress_callback,
+        )
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
@@ -114,6 +141,41 @@ def process_video_for_cvat(
 
     finally:
         cap.release()
+
+    return list(tracks.values())
+
+
+def _process_video_grounded_sam(
+    video_path: str,
+    pipeline: Any,
+    frame_step: int,
+    max_frames: Optional[int],
+    progress_callback: Optional[Callable[[int, int], None]],
+) -> List[TrackAnnotation]:
+    """Delegate to GroundedSAMPipeline and convert to TrackAnnotation list."""
+    # GroundedSAMPipeline returns annotation.grounded_sam.TrackAnnotation objects;
+    # we convert to annotation.models.TrackAnnotation for CVAT compatibility.
+    gsam_anns = pipeline.process_video(
+        video_path=video_path,
+        frame_step=frame_step,
+        max_frames=max_frames,
+        use_sam=True,
+    )
+
+    # Group by track_id
+    tracks: dict = {}
+    for ann in gsam_anns:
+        tid = ann.track_id
+        label = f"team_{ann.team}" if ann.team >= 0 else "player"
+        if tid not in tracks:
+            tracks[tid] = TrackAnnotation(
+                track_id=tid,
+                label=label,
+                frames=[],
+                boxes=[],
+            )
+        tracks[tid].frames.append(ann.frame_idx)
+        tracks[tid].boxes.append(list(ann.box))
 
     return list(tracks.values())
 
