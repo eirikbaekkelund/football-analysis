@@ -94,9 +94,11 @@ fi
 # ── 2. Install ───────────────────────────────────────────────────────────────
 log "Installing torchkick"
 pip install -q uv
-uv pip install --system -e ".[reid,roboflow,training]" \
+uv pip install --system -e ".[reid,training]" \
     --extra-index-url https://download.pytorch.org/whl/cu128 \
     --index-strategy unsafe-best-match
+# roboflow installed separately — its idna pin conflicts with the PyTorch index
+pip install -q roboflow
 ok "torchkick installed"
 
 # ── 3. Download datasets ─────────────────────────────────────────────────────
