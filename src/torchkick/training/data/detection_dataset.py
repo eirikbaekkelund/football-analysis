@@ -114,8 +114,11 @@ def _load_soccernet_dir_source(root_dir: str) -> List[Dict[str, Any]]:
                 fid, _, x, y, w, h = int(parts[0]), parts[1], float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])
                 frames.setdefault(fid, []).append([x, y, x + w, y + h])
         for fid, boxes in frames.items():
+            valid_boxes = [b for b in boxes if b[2] > b[0] and b[3] > b[1]]
+            if not valid_boxes:
+                continue
             img_path = str(img_dir / f"{fid:06d}.jpg")
-            samples.append({"image_path": img_path, "boxes": boxes, "labels": [0] * len(boxes)})
+            samples.append({"image_path": img_path, "boxes": valid_boxes, "labels": [0] * len(valid_boxes)})
     return samples
 
 

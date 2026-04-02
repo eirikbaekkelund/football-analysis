@@ -128,7 +128,7 @@ def train_detection(
 
     import os
     n_cpu = os.cpu_count() or 4
-    n_workers = min(n_cpu, 12)
+    n_workers = min(n_cpu, 16)
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True, num_workers=n_workers,
         pin_memory=True, persistent_workers=True, prefetch_factor=4, collate_fn=_collate_fn,
