@@ -187,7 +187,9 @@ def train_detection(
                     cy = (boxes[:, 1] + boxes[:, 3]) / 2 / input_size
                     bw = (boxes[:, 2] - boxes[:, 0]) / input_size
                     bh = (boxes[:, 3] - boxes[:, 1]) / input_size
-                    boxes_cxcywh = torch.stack([cx, cy, bw, bh], dim=1)
+                    valid = (bw > 0) & (bh > 0)
+                    boxes_cxcywh = torch.stack([cx, cy, bw, bh], dim=1)[valid]
+                    labels_t = labels_t[valid]
                 else:
                     boxes_cxcywh = boxes
                 hf_labels.append({"class_labels": labels_t, "boxes": boxes_cxcywh})
@@ -232,11 +234,13 @@ def train_detection(
                     boxes = t["boxes"].to(dev)
                     labels_t = t["labels"].to(dev)
                     if len(boxes):
-                        cx = (boxes[:, 0] + boxes[:, 2]) / 2 / 640
-                        cy = (boxes[:, 1] + boxes[:, 3]) / 2 / 640
-                        bw = (boxes[:, 2] - boxes[:, 0]) / 640
-                        bh = (boxes[:, 3] - boxes[:, 1]) / 640
-                        boxes_cxcywh = torch.stack([cx, cy, bw, bh], dim=1)
+                        cx = (boxes[:, 0] + boxes[:, 2]) / 2 / input_size
+                        cy = (boxes[:, 1] + boxes[:, 3]) / 2 / input_size
+                        bw = (boxes[:, 2] - boxes[:, 0]) / input_size
+                        bh = (boxes[:, 3] - boxes[:, 1]) / input_size
+                        valid = (bw > 0) & (bh > 0)
+                        boxes_cxcywh = torch.stack([cx, cy, bw, bh], dim=1)[valid]
+                        labels_t = labels_t[valid]
                     else:
                         boxes_cxcywh = boxes
                     hf_labels.append({"class_labels": labels_t, "boxes": boxes_cxcywh})
