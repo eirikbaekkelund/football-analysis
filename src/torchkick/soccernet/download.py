@@ -101,127 +101,126 @@ def download_pitch_calibration(
     downloader.downloadDataTask(task="calibration", split=splits)
 
 
+def _resolve_roboflow_api_key(api_key: Optional[str]) -> str:
+    """Return api_key, loading .env then falling back to ROBOFLOW_API_KEY env var."""
+    if api_key:
+        return api_key
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+    key = os.environ.get("ROBOFLOW_API_KEY")
+    if not key:
+        raise ValueError(
+            "ROBOFLOW_API_KEY not found. Either:\n"
+            "  1. Add ROBOFLOW_API_KEY=<key> to your .env file, or\n"
+            "  2. Pass --api-key <key> on the command line.\n"
+            "Get a free API key at https://roboflow.com."
+        )
+    return key
+
+
 def download_roboflow_field_keypoints(
     output_dir: str,
     api_key: Optional[str] = None,
-    version: int = 14,
+    version: int = 15,
 ) -> str:
     """
-    Download football-field-detection-f07vi dataset (32-keypoint field landmarks).
+    Download football-field-detection-f07vi dataset (32-keypoint pitch landmarks).
 
-    317 annotated images with 32 pitch keypoints in YOLO-pose format.
-    Compatible with ``train_yolo_keypoints()`` — supports more landmark types
-    than the SoccerNet 29-keypoint set.
-
-    If ``api_key`` is provided, downloads via the Roboflow Python client.
-    Otherwise, attempts a direct HTTPS zip download (no account required for
-    public datasets).
+    317 images, YOLO-pose format. Use with ``train_yolo_keypoints()``.
+    Source: roboflow.com/roboflow-jvuqo/football-field-detection-f07vi
 
     Args:
-        output_dir: Directory to save the downloaded dataset.
-        api_key: Optional Roboflow API key for authenticated downloads.
-        version: Dataset version number (default 14).
-
-    Returns:
-        Path to the downloaded dataset directory.
-
-    Example:
-        >>> path = download_roboflow_field_keypoints("data/roboflow_field/")
+        output_dir: Directory to save the dataset.
+        api_key: Roboflow API key. Falls back to ``ROBOFLOW_API_KEY`` in ``.env``.
+        version: Dataset version (default 15).
     """
-    import os
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    if api_key is not None:
-        try:
-            from roboflow import Roboflow
-
-            rf = Roboflow(api_key=api_key)
-            project = rf.workspace("roboflow-jvuqo").project("football-field-detection-f07vi")
-            dataset = project.version(version).download("yolov8", location=output_dir)
-            return dataset.location
-        except ImportError:
-            raise ImportError("roboflow package required for API download. Install: pip install torchkick[roboflow]")
-    else:
-        import zipfile
-
-        import requests
-
-        url = f"https://universe.roboflow.com/ds/XxFTJxfTJ7?key=roboflow-jvuqo-football-field-v{version}"
-        zip_path = os.path.join(output_dir, "field_keypoints.zip")
-        print(f"Downloading field keypoints dataset to {output_dir}...")
-        r = requests.get(url, stream=True, timeout=120)
-        r.raise_for_status()
-        with open(zip_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
-        with zipfile.ZipFile(zip_path, "r") as z:
-            z.extractall(output_dir)
-        os.remove(zip_path)
-        return output_dir
+    return download_roboflow_dataset(
+        workspace="roboflow-jvuqo",
+        project="football-field-detection-f07vi",
+        version=version,
+        output_dir=output_dir,
+        api_key=api_key,
+    )
 
 
 def download_roboflow_players(
     output_dir: str,
     api_key: Optional[str] = None,
-    version: int = 2,
+    version: int = 20,
 ) -> str:
     """
     Download football-players-detection-3zvbc dataset (4-class player detection).
 
-    372 annotated images with player, goalkeeper, referee, and ball classes
-    in YOLO format. Useful for fine-tuning player detectors.
-
-    If ``api_key`` is provided, downloads via the Roboflow Python client.
-    Otherwise, attempts a direct HTTPS zip download.
+    Player, goalkeeper, referee, ball — YOLOv11 format.
+    Source: roboflow.com/roboflow-jvuqo/football-players-detection-3zvbc
 
     Args:
+        output_dir: Directory to save the dataset.
+        api_key: Roboflow API key. Falls back to ``ROBOFLOW_API_KEY`` in ``.env``.
+        version: Dataset version (default 20).
+    """
+    return download_roboflow_dataset(
+        workspace="roboflow-jvuqo",
+        project="football-players-detection-3zvbc",
+        version=version,
+        output_dir=output_dir,
+        fmt="yolov11",
+        api_key=api_key,
+    )
+
+
+def download_roboflow_dataset(
+    workspace: str,
+    project: str,
+    version: int,
+    output_dir: str,
+    fmt: str = "yolov8",
+    api_key: Optional[str] = None,
+) -> str:
+    """
+    Download any Roboflow Universe dataset.
+
+    Args:
+        workspace: Roboflow workspace slug (visible in the dataset URL:
+            ``roboflow.com/<workspace>/<project>``).
+        project: Roboflow project slug.
+        version: Dataset version number.
         output_dir: Directory to save the downloaded dataset.
-        api_key: Optional Roboflow API key for authenticated downloads.
-        version: Dataset version number (default 2).
+        fmt: Export format (default ``"yolov8"``; use ``"coco"`` for COCO JSON).
+        api_key: Roboflow API key. Falls back to ``ROBOFLOW_API_KEY`` in ``.env``.
 
     Returns:
         Path to the downloaded dataset directory.
 
     Example:
-        >>> path = download_roboflow_players("data/roboflow_players/")
+        >>> path = download_roboflow_dataset(
+        ...     workspace="my-workspace",
+        ...     project="football-players",
+        ...     version=2,
+        ...     output_dir="data/players/",
+        ... )
     """
-    import os
+    # Do NOT pre-create output_dir — the Roboflow SDK skips downloading if
+    # the target directory already exists.
+    key = _resolve_roboflow_api_key(api_key)
 
-    os.makedirs(output_dir, exist_ok=True)
+    try:
+        from roboflow import Roboflow
+    except ImportError:
+        raise ImportError("roboflow package required. Install: pip install torchkick[roboflow]")
 
-    if api_key is not None:
-        try:
-            from roboflow import Roboflow
-
-            rf = Roboflow(api_key=api_key)
-            project = rf.workspace("roboflow-jvuqo").project("football-players-detection-3zvbc")
-            dataset = project.version(version).download("yolov8", location=output_dir)
-            return dataset.location
-        except ImportError:
-            raise ImportError("roboflow package required for API download. Install: pip install torchkick[roboflow]")
-    else:
-        import zipfile
-
-        import requests
-
-        url = f"https://universe.roboflow.com/ds/XxFTJxfTJ8?key=roboflow-jvuqo-football-players-v{version}"
-        zip_path = os.path.join(output_dir, "players.zip")
-        print(f"Downloading player detection dataset to {output_dir}...")
-        r = requests.get(url, stream=True, timeout=120)
-        r.raise_for_status()
-        with open(zip_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
-        with zipfile.ZipFile(zip_path, "r") as z:
-            z.extractall(output_dir)
-        os.remove(zip_path)
-        return output_dir
+    rf = Roboflow(api_key=key)
+    dataset = rf.workspace(workspace).project(project).version(version).download(fmt, location=output_dir)
+    return dataset.location
 
 
 __all__ = [
     "download_tracking_data",
     "download_pitch_calibration",
+    "download_roboflow_dataset",
     "download_roboflow_field_keypoints",
     "download_roboflow_players",
 ]

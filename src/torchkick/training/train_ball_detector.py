@@ -313,8 +313,13 @@ def train_yolo(
     if use_colors:
         project_name += "_colors"
 
+    # Support both SoccerNet-converted (dataset.yaml) and Roboflow (data.yaml) layouts
+    yaml_path = Path(data_dir) / "dataset.yaml"
+    if not yaml_path.exists():
+        yaml_path = Path(data_dir) / "data.yaml"
+
     results = model.train(
-        data=f"{data_dir}/dataset.yaml",
+        data=str(yaml_path),
         epochs=epochs,
         imgsz=imgsz,
         batch=batch_size,

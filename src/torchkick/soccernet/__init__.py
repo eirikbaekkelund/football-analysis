@@ -49,6 +49,7 @@ from torchkick.soccernet.tracking_data import (
 from torchkick.soccernet.download import (
     download_tracking_data,
     download_pitch_calibration,
+    download_roboflow_dataset,
     download_roboflow_field_keypoints,
     download_roboflow_players,
 )
@@ -68,6 +69,7 @@ __all__ = [
     # Download utilities
     "download_tracking_data",
     "download_pitch_calibration",
+    "download_roboflow_dataset",
     "download_roboflow_field_keypoints",
     "download_roboflow_players",
 ]

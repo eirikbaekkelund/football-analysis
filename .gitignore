@@ -11,6 +11,7 @@ __pycache__/
 soccernet/tracking/*
 soccernet/calibration/*
 player_tracker*/
+data/*
 *egg-info/
 yolo_dataset/
 SV_*

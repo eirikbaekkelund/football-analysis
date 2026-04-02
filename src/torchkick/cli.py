@@ -163,7 +163,7 @@ def download(
 @click.option(
     "--dataset",
     "-d",
-    type=click.Choice(["tracking", "calibration", "all", "roboflow-field", "roboflow-players"]),
+    type=click.Choice(["tracking", "calibration", "all", "roboflow-players", "roboflow-field", "roboflow"]),
     required=True,
     help="Which dataset to download.",
 )
@@ -181,26 +181,59 @@ def download(
     help="Comma-separated list of splits to download (train,test,challenge). SoccerNet only.",
 )
 @click.option(
+    "--workspace",
+    type=str,
+    default=None,
+    help="Roboflow workspace slug (roboflow.com/<workspace>/<project>). Required for --dataset roboflow.",
+)
+@click.option(
+    "--project",
+    type=str,
+    default=None,
+    help="Roboflow project slug. Required for --dataset roboflow.",
+)
+@click.option(
+    "--version",
+    type=int,
+    default=1,
+    help="Roboflow dataset version number (default 1).",
+)
+@click.option(
+    "--format",
+    "fmt",
+    type=str,
+    default="yolov8",
+    help="Roboflow export format: yolov8 (default) or coco.",
+)
+@click.option(
     "--api-key",
     type=str,
     default=None,
-    help="Roboflow API key for authenticated downloads (Roboflow datasets only).",
+    help="Roboflow API key. Falls back to ROBOFLOW_API_KEY in .env.",
 )
 def dataset(
     dataset: str,
     output_dir: str,
     splits: str,
+    workspace: str | None,
+    project: str | None,
+    version: int,
+    fmt: str,
     api_key: str | None,
 ) -> None:
     """
     Download training datasets.
 
-    Downloads SoccerNet tracking/calibration or Roboflow Universe datasets.
+    Downloads SoccerNet tracking/calibration data, or any Roboflow Universe
+    dataset by workspace and project slug (visible in the dataset URL).
 
     Example:
         $ torchkick dataset -d tracking -o ./data/
-        $ torchkick dataset -d roboflow-field -o ./data/roboflow_field/
-        $ torchkick dataset -d roboflow-players --api-key MY_KEY -o ./data/players/
+        $ torchkick dataset -d roboflow-players -o data/roboflow/players/
+        $ torchkick dataset -d roboflow-field   -o data/roboflow/field/
+        $ torchkick dataset -d roboflow \\
+              --workspace my-workspace --project my-project --version 3 \\
+              -o data/custom/
     """
     from pathlib import Path
 
@@ -227,22 +260,42 @@ def dataset(
 
         except ImportError:
             raise click.UsageError(
-                "SoccerNet package is required for dataset downloads. " "Install with: pip install torchkick[soccernet]"
+                "SoccerNet package is required for dataset downloads. "
+                "Install with: pip install torchkick[soccernet]"
             )
-
-    elif dataset == "roboflow-field":
-        from torchkick.soccernet import download_roboflow_field_keypoints
-
-        click.echo(f"Downloading Roboflow field keypoints (32 kp) to {output_dir}...")
-        path = download_roboflow_field_keypoints(output_dir, api_key=api_key)
-        click.echo(f"  ✓ Field keypoints downloaded to {path}")
 
     elif dataset == "roboflow-players":
         from torchkick.soccernet import download_roboflow_players
 
         click.echo(f"Downloading Roboflow player detection dataset to {output_dir}...")
         path = download_roboflow_players(output_dir, api_key=api_key)
-        click.echo(f"  ✓ Player detection dataset downloaded to {path}")
+        click.echo(f"  ✓ Downloaded to {path}")
+
+    elif dataset == "roboflow-field":
+        from torchkick.soccernet import download_roboflow_field_keypoints
+
+        click.echo(f"Downloading Roboflow field keypoints dataset to {output_dir}...")
+        path = download_roboflow_field_keypoints(output_dir, api_key=api_key)
+        click.echo(f"  ✓ Downloaded to {path}")
+
+    elif dataset == "roboflow":
+        if not workspace or not project:
+            raise click.UsageError(
+                "--workspace and --project are required for Roboflow downloads.\n"
+                "Find them in the dataset URL: roboflow.com/<workspace>/<project>"
+            )
+        from torchkick.soccernet import download_roboflow_dataset
+
+        click.echo(f"Downloading {workspace}/{project} v{version} ({fmt}) to {output_dir}...")
+        path = download_roboflow_dataset(
+            workspace=workspace,
+            project=project,
+            version=version,
+            output_dir=output_dir,
+            fmt=fmt,
+            api_key=api_key,
+        )
+        click.echo(f"  ✓ Dataset downloaded to {path}")
 
 
 # =============================================================================

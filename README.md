@@ -70,16 +70,27 @@ torchkick dataset -d tracking   -o data/soccernet/
 torchkick dataset -d calibration -o data/soccernet/
 ```
 
-**Roboflow Universe** (no account required for the public datasets):
+**Roboflow Universe** (free API key required — sign up at roboflow.com):
 ```bash
-# 4-class player detection — 372 images, YOLO format
+# Add to .env in the project root:
+# ROBOFLOW_API_KEY=your_key_here
+
+# 4-class player detection — football-players-detection-3zvbc v20
 torchkick dataset -d roboflow-players -o data/roboflow/players/
 
-# 32-keypoint pitch landmarks — 317 images, YOLO-pose format
+# 32-keypoint pitch landmarks — football-field-detection-f07vi v15
 torchkick dataset -d roboflow-field -o data/roboflow/field/
 
-# With Roboflow API key for authenticated / private datasets
-torchkick dataset -d roboflow-players --api-key $RF_KEY -o data/roboflow/players/
+# Any other Roboflow Universe dataset by URL slug
+# (workspace and project visible at roboflow.com/<workspace>/<project>)
+torchkick dataset -d roboflow \
+    --workspace <workspace> --project <project> --version <n> \
+    -o data/custom/
+
+# COCO JSON export (for torchkick train detection)
+torchkick dataset -d roboflow \
+    --workspace roboflow-jvuqo --project football-players-detection-3zvbc \
+    --version 20 --format coco -o data/roboflow/players_coco/
 ```
 
 ---
@@ -263,4 +274,93 @@ at inference time.
 | Pitch keypoints (accurate) | SoccerNet calibration | `torchkick train keypoints --data calibration.zip` |
 | ReID embeddings | Labeled crops | `torchkick train reid --stage supervised --data-dir data/reid/` |
 | ReID student (inference) | Same crops | `torchkick train distill --teacher-weights ...` |
+
+
+---
+
+## Remote training on RunPod
+
+The fastest way to train all models is to spin up a GPU pod on RunPod, run
+the training script, and SCP the weights back.
+
+### 1 — Start a RunPod pod
+
+Recommended template: **RunPod PyTorch 2.x** with at least an **A10G** (24 GB).
+Note the pod IP and SSH port from the RunPod dashboard.
+
+### 2 — Copy your `.env` to the pod
+
+```bash
+# From your local machine
+scp -P <port> .env root@<runpod-ip>:/workspace/torchkick/.env
+```
+
+Or set the key directly in the pod's environment before running the script:
+
+```bash
+export ROBOFLOW_API_KEY=your_key_here
+```
+
+### 3 — Run the training script on the pod
+
+SSH in and run:
+
+```bash
+ssh root@<runpod-ip> -p <port>
+
+# Roboflow datasets only (no SoccerNet account needed) — ~2 h on A10G
+bash <(curl -fsSL https://raw.githubusercontent.com/eirikbaekkelund/torchkick/main/scripts/train_remote.sh) --roboflow-only
+
+# Or clone first and run locally
+git clone https://github.com/eirikbaekkelund/torchkick.git /workspace/torchkick
+bash /workspace/torchkick/scripts/train_remote.sh --roboflow-only
+```
+
+With SoccerNet data as well (needs SoccerNet credentials set in the pod):
+
+```bash
+bash /workspace/torchkick/scripts/train_remote.sh
+```
+
+With ReID training (requires labelled player crops copied to the pod):
+
+```bash
+# Copy crops from local first
+scp -P <port> -r data/reid/ root@<runpod-ip>:/workspace/torchkick/data/reid/
+
+bash /workspace/torchkick/scripts/train_remote.sh \
+    --roboflow-only \
+    --reid-crops-dir data/reid/
+```
+
+Flags:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--roboflow-only` | off | Skip SoccerNet downloads |
+| `--skip-detection` | off | Skip player detector training |
+| `--skip-keypoints` | off | Skip pitch keypoint training |
+| `--reid-crops-dir <path>` | — | Enable ReID training with crops at this path |
+| `--epochs-detection <n>` | 50 | Player detector epochs |
+| `--epochs-keypoints <n>` | 100 | Pitch keypoint epochs |
+| `--batch <n>` | 32 | Batch size |
+
+### 4 — Pull weights back to your machine
+
+```bash
+# From your LOCAL machine, from the repo root
+bash scripts/pull_weights.sh <runpod-ip> <ssh-port>
+```
+
+This rsync-pulls `weights_export/` from the pod into your local `weights/`
+and prints the ready-to-run `torchkick analyze` command with all weight paths filled in.
+
+### 5 — Run inference with trained weights
+
+```bash
+torchkick analyze -v match.mp4 \
+    --model weights/player_detector_yolo.pt --model-type yolo \
+    --pitch-weights weights/pitch_keypoints_yolo.pt \
+    --reid-weights  weights/reid_student.pth
+```
 
