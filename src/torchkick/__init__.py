@@ -19,13 +19,12 @@ Quick Start:
     ...         pass
     >>>
     >>> # Track players
-    >>> from torchkick.tracking import SimpleIoUTracker, HomographyEstimator
-    >>> tracker = SimpleIoUTracker()
+    >>> from torchkick.tracking import HomographyEstimator
     >>> homography = HomographyEstimator()
     >>>
-    >>> # Detect pitch lines
-    >>> from torchkick.models import PitchLineDetector
-    >>> detector = PitchLineDetector(weights_kp, weights_lines)
+    >>> # Detect pitch keypoints for homography
+    >>> from torchkick.models import YOLOPoseKeypointDetector
+    >>> detector = YOLOPoseKeypointDetector("weights/yolo_pitch_pose.pt")
 
 Submodules:
     utils: Video I/O, timing, visualization utilities
@@ -57,8 +56,9 @@ from torchkick.utils import (
 )
 
 # Tracking components commonly used at top level
-from torchkick.bbox_tracking import (
-    SimpleIoUTracker,
+from torchkick.tracking import (
+    SoccerTracker,
+    ByteTracker,
     HomographyEstimator,
     PitchVisualizer,
     BallTracker,
@@ -91,7 +91,8 @@ __all__ = [
     "print_timing_stats",
     "reset_timing_stats",
     # Tracking
-    "SimpleIoUTracker",
+    "SoccerTracker",
+    "ByteTracker",
     "HomographyEstimator",
     "PitchVisualizer",
     "BallTracker",

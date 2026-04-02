@@ -1,60 +1,54 @@
 """
 Neural network model wrappers for football analysis.
 
-This module provides wrappers for pitch line detection, player detection,
-and appearance embedding models.
-
 Submodules:
-    pitch: Pitch line keypoint detection and camera calibration.
-    player: Player detection and appearance embedding.
+    pitch: Pitch keypoint detection (ViTPose / YOLO-pose).
+    player: Player detection (YOLO, FCNN, RT-DETR, RF-DETR).
+    ball: Ball detection (YOLOv11-nano, with optional tiled SAHI-style slicer).
+    reid: ReID embedding (DINOv2 + PEFT LoRA).
 
 Example:
     >>> from torchkick.models import (
-    ...     PitchLineDetector,
-    ...     PitchCalibrator,
+    ...     ViTPoseKeypointDetector,
+    ...     YOLOPoseKeypointDetector,
     ...     PlayerDetector,
-    ...     AppearanceEmbedder,
+    ...     RTDETRDetector,
+    ...     RFDETRDetector,
     ... )
-    >>> 
-    >>> # Pitch calibration
-    >>> detector = PitchLineDetector(weights_kp, weights_lines)
-    >>> calibrator = PitchCalibrator(detector)
-    >>> P = calibrator.process_frame(frame)
-    >>> 
-    >>> # Player detection
-    >>> player_det = PlayerDetector("yolo_weights.pt")
-    >>> detections = player_det.detect(frame)
+    >>> pitch_det = YOLOPoseKeypointDetector("weights/yolo_pitch_pose.pt")
+    >>> kps, conf = pitch_det.detect(frame)
 """
 
 from __future__ import annotations
 
-# Pitch models
+# Ball detector (YOLOv11-nano)
+from torchkick.models.ball import BallDetector, BallDetection, BallInferenceSlicer
+
+# Pitch keypoint detectors
 from torchkick.models.pitch import (
-    LINE_COORDINATES_3D,
-    projection_from_cam_params,
-    project_lines_to_image,
-    PitchLineDetector,
-    PitchCalibrator,
+    ViTPoseKeypointDetector,
+    YOLOPoseKeypointDetector,
 )
 
 # Player models
 from torchkick.models.player import (
     Detection,
     PlayerDetector,
-    ReIDConfig,
-    AppearanceEmbedder,
+    RTDETRDetector,
+    RFDETRDetector,
 )
 
 __all__ = [
+    # Ball
+    "BallDetector",
+    "BallDetection",
+    "BallInferenceSlicer",
     # Pitch
-    "LINE_COORDINATES_3D",
-    "projection_from_cam_params",
-    "project_lines_to_image",
-    "PitchLineDetector",
-    "PitchCalibrator",
+    "ViTPoseKeypointDetector",
+    "YOLOPoseKeypointDetector",
     # Player
     "Detection",
     "PlayerDetector",
-    "ReIDConfig",
-    "AppearanceEmbedder",
+    "RTDETRDetector",
+    "RFDETRDetector",
 ]

@@ -163,9 +163,9 @@ def download(
 @click.option(
     "--dataset",
     "-d",
-    type=click.Choice(["tracking", "calibration", "all"]),
+    type=click.Choice(["tracking", "calibration", "all", "roboflow-field", "roboflow-players"]),
     required=True,
-    help="Which SoccerNet dataset to download.",
+    help="Which dataset to download.",
 )
 @click.option(
     "--output-dir",
@@ -178,49 +178,71 @@ def download(
     "--splits",
     type=str,
     default="train,test",
-    help="Comma-separated list of splits to download (train,test,challenge).",
+    help="Comma-separated list of splits to download (train,test,challenge). SoccerNet only.",
+)
+@click.option(
+    "--api-key",
+    type=str,
+    default=None,
+    help="Roboflow API key for authenticated downloads (Roboflow datasets only).",
 )
 def dataset(
     dataset: str,
     output_dir: str,
     splits: str,
+    api_key: str | None,
 ) -> None:
     """
-    Download SoccerNet datasets.
+    Download training datasets.
 
-    Downloads tracking or calibration data from SoccerNet. Requires
-    the soccernet optional dependency.
+    Downloads SoccerNet tracking/calibration or Roboflow Universe datasets.
 
     Example:
         $ torchkick dataset -d tracking -o ./data/
-        $ torchkick dataset -d all --splits train,test
+        $ torchkick dataset -d roboflow-field -o ./data/roboflow_field/
+        $ torchkick dataset -d roboflow-players --api-key MY_KEY -o ./data/players/
     """
     from pathlib import Path
 
-    split_list = [s.strip() for s in splits.split(",")]
-    click.echo(f"Downloading SoccerNet {dataset} dataset")
-    click.echo(f"  Splits: {split_list}")
-    click.echo(f"  Output: {output_dir}")
+    if dataset in ("tracking", "calibration", "all"):
+        split_list = [s.strip() for s in splits.split(",")]
+        click.echo(f"Downloading SoccerNet {dataset} dataset")
+        click.echo(f"  Splits: {split_list}")
+        click.echo(f"  Output: {output_dir}")
 
-    try:
-        from torchkick.soccernet import download_tracking_data, download_pitch_calibration
+        try:
+            from torchkick.soccernet import download_tracking_data, download_pitch_calibration
 
-        if dataset in ("tracking", "all"):
-            tracking_dir = str(Path(output_dir) / "tracking")
-            click.echo(f"Downloading tracking data to {tracking_dir}...")
-            download_tracking_data(tracking_dir, splits=split_list)  # type: ignore
-            click.echo("  ✓ Tracking data downloaded")
+            if dataset in ("tracking", "all"):
+                tracking_dir = str(Path(output_dir) / "tracking")
+                click.echo(f"Downloading tracking data to {tracking_dir}...")
+                download_tracking_data(tracking_dir, splits=split_list)  # type: ignore
+                click.echo("  ✓ Tracking data downloaded")
 
-        if dataset in ("calibration", "all"):
-            calibration_dir = str(Path(output_dir) / "calibration")
-            click.echo(f"Downloading calibration data to {calibration_dir}...")
-            download_pitch_calibration(calibration_dir, splits=split_list)  # type: ignore
-            click.echo("  ✓ Calibration data downloaded")
+            if dataset in ("calibration", "all"):
+                calibration_dir = str(Path(output_dir) / "calibration")
+                click.echo(f"Downloading calibration data to {calibration_dir}...")
+                download_pitch_calibration(calibration_dir, splits=split_list)  # type: ignore
+                click.echo("  ✓ Calibration data downloaded")
 
-    except ImportError:
-        raise click.UsageError(
-            "SoccerNet package is required for dataset downloads. " "Install with: pip install torchkick[soccernet]"
-        )
+        except ImportError:
+            raise click.UsageError(
+                "SoccerNet package is required for dataset downloads. " "Install with: pip install torchkick[soccernet]"
+            )
+
+    elif dataset == "roboflow-field":
+        from torchkick.soccernet import download_roboflow_field_keypoints
+
+        click.echo(f"Downloading Roboflow field keypoints (32 kp) to {output_dir}...")
+        path = download_roboflow_field_keypoints(output_dir, api_key=api_key)
+        click.echo(f"  ✓ Field keypoints downloaded to {path}")
+
+    elif dataset == "roboflow-players":
+        from torchkick.soccernet import download_roboflow_players
+
+        click.echo(f"Downloading Roboflow player detection dataset to {output_dir}...")
+        path = download_roboflow_players(output_dir, api_key=api_key)
+        click.echo(f"  ✓ Player detection dataset downloaded to {path}")
 
 
 # =============================================================================
@@ -245,9 +267,9 @@ def dataset(
 )
 @click.option(
     "--model-type",
-    type=click.Choice(["yolo", "fcnn", "rtdetr"]),
-    default="fcnn",
-    help="Detection model type.",
+    type=click.Choice(["yolo", "fcnn", "rtdetr", "rfdetr", "sam3_mlx", "sam3_pytorch"]),
+    default="rfdetr",
+    help="Detection model type. rfdetr (DINOv2, AP50 73.6) is the recommended default.",
 )
 @click.option(
     "--duration",
@@ -272,6 +294,30 @@ def dataset(
     is_flag=False,
     help="Disable space control heatmap.",
 )
+@click.option(
+    "--reid-weights",
+    type=click.Path(),
+    default=None,
+    help="Path to ReID student checkpoint for appearance-guided tracking.",
+)
+@click.option(
+    "--reid-interval",
+    type=int,
+    default=5,
+    help="Frames between ReID embedding updates (default 5).",
+)
+@click.option(
+    "--pitch-weights",
+    type=click.Path(),
+    default=None,
+    help="Path to pitch keypoint model weights for homography estimation.",
+)
+@click.option(
+    "--pitch-detector-type",
+    type=click.Choice(["yolo", "vitpose"]),
+    default="yolo",
+    help="Pitch keypoint detector backend: 'yolo' (faster) or 'vitpose' (more accurate).",
+)
 def analyze(
     video: str,
     model: str | None,
@@ -280,6 +326,10 @@ def analyze(
     homography_interval: int,
     no_overlay: bool,
     no_dominance: bool,
+    reid_weights: str | None,
+    reid_interval: int,
+    pitch_weights: str | None,
+    pitch_detector_type: str,
 ) -> None:
     """
     Run full match analysis pipeline.
@@ -287,10 +337,14 @@ def analyze(
     Performs player detection, tracking, pitch projection, team classification,
     and outputs a visualization video with 2D pitch view.
 
+    RF-DETR (DINOv2 backbone, AP50 73.6) is the default and recommended
+    detector. When no --reid-weights are given, SigLIP zero-shot clustering
+    is used for team assignment automatically.
+
     Example:
         $ torchkick analyze -v match.mp4
         $ torchkick analyze -v match.mp4 --model-type yolo --duration 60
-        $ torchkick analyze -v match.mp4 --dominance
+        $ torchkick analyze -v match.mp4 --reid-weights weights/reid/student.pt
     """
     from torchkick.inference import run_analysis
 
@@ -306,6 +360,10 @@ def analyze(
         homography_interval=homography_interval,
         draw_overlay=not no_overlay,
         draw_dominance=not no_dominance,
+        reid_weights=reid_weights,
+        reid_interval=reid_interval,
+        pitch_weights=pitch_weights,
+        pitch_detector_type=pitch_detector_type,
     )
 
     click.echo(f"Analysis complete! Output: {output_path}")
@@ -319,16 +377,134 @@ def analyze(
 @main.group()
 def train() -> None:
     """
-    Train detection models.
-
-    Subcommands for training various models on SoccerNet data.
+    Train models for football analysis.
 
     Example:
+        $ torchkick train detection --soccernet data/sn/train.zip --roboflow-json data/rf/train/_ann.json --roboflow-images data/rf/train/
         $ torchkick train yolo --data soccernet/tracking/train.zip
-        $ torchkick train fcnn --epochs 10
-        $ torchkick train lines --data calibration_data/
+        $ torchkick train keypoints --data calibration/train.zip
+        $ torchkick train reid --stage supervised --data-dir data/reid/
+        $ torchkick train distill --teacher-weights weights/reid/reid_supervised_best.pth --data-dir data/reid/
     """
     pass
+
+
+@train.command("detection")
+@click.option(
+    "--soccernet",
+    type=click.Path(exists=True),
+    default=None,
+    help="SoccerNet tracking ZIP file (e.g. data/soccernet/tracking/train.zip).",
+)
+@click.option(
+    "--roboflow-json",
+    type=click.Path(exists=True),
+    default=None,
+    help="Roboflow COCO JSON annotations (e.g. data/roboflow/train/_annotations.coco.json).",
+)
+@click.option(
+    "--roboflow-images",
+    type=click.Path(exists=True),
+    default=None,
+    help="Directory containing Roboflow images (required when --roboflow-json is given).",
+)
+@click.option(
+    "--cvat-json",
+    type=click.Path(exists=True),
+    default=None,
+    help="CVAT COCO 1.0 export JSON (e.g. data/custom/annotations.json).",
+)
+@click.option(
+    "--cvat-images",
+    type=click.Path(exists=True),
+    default=None,
+    help="Directory containing CVAT images (required when --cvat-json is given).",
+)
+@click.option("--epochs", "-e", type=int, default=50)
+@click.option("--batch-size", "-b", type=int, default=8)
+@click.option("--lr", type=float, default=5e-5)
+@click.option("--save-dir", type=str, default="weights/detection/")
+@click.option("--no-compile", is_flag=True, help="Disable torch.compile.")
+@click.option("--fsdp", is_flag=True, help="Enable FSDP for multi-GPU training.")
+@click.option("--wandb-project", type=str, default=None)
+def train_detection_cmd(
+    soccernet: str | None,
+    roboflow_json: str | None,
+    roboflow_images: str | None,
+    cvat_json: str | None,
+    cvat_images: str | None,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    save_dir: str,
+    no_compile: bool,
+    fsdp: bool,
+    wandb_project: str | None,
+) -> None:
+    """
+    Train RT-DETR player detector from any combination of data sources.
+
+    Accepts any non-empty subset of SoccerNet, Roboflow, and CVAT data.
+    All specified sources are merged at training time — no manual dataset
+    merging required.
+
+    Data source formats:
+        SoccerNet : ZIP file from `torchkick dataset -d tracking`
+        Roboflow  : COCO JSON export (Roboflow → Export → COCO JSON)
+        CVAT      : COCO 1.0 export  (CVAT → Export dataset → COCO 1.0)
+
+    Example:
+        $ torchkick train detection --soccernet data/soccernet/tracking/train.zip
+
+        $ torchkick train detection \\
+              --roboflow-json data/roboflow/train/_annotations.coco.json \\
+              --roboflow-images data/roboflow/train/
+
+        $ torchkick train detection \\
+              --soccernet data/soccernet/tracking/train.zip \\
+              --roboflow-json data/roboflow/train/_annotations.coco.json \\
+              --roboflow-images data/roboflow/train/ \\
+              --cvat-json data/custom/annotations.json \\
+              --cvat-images data/custom/images/
+    """
+    from torchkick.training import train_detection
+
+    # Validate paired arguments
+    if roboflow_json and not roboflow_images:
+        raise click.UsageError("--roboflow-images is required when --roboflow-json is given.")
+    if cvat_json and not cvat_images:
+        raise click.UsageError("--cvat-images is required when --cvat-json is given.")
+
+    # Build data_config from whichever sources were provided
+    data_config = []
+    if soccernet:
+        data_config.append({"type": "soccernet_zip", "path": soccernet})
+        click.echo(f"  + SoccerNet: {soccernet}")
+    if roboflow_json:
+        data_config.append({"type": "coco_json", "path": roboflow_json, "images_dir": roboflow_images})
+        click.echo(f"  + Roboflow:  {roboflow_json}")
+    if cvat_json:
+        data_config.append({"type": "coco_json", "path": cvat_json, "images_dir": cvat_images})
+        click.echo(f"  + CVAT:      {cvat_json}")
+
+    if not data_config:
+        raise click.UsageError(
+            "At least one data source is required. " "Use --soccernet, --roboflow-json, or --cvat-json."
+        )
+
+    click.echo(f"Training RT-DETR detection model ({len(data_config)} source(s))")
+
+    weights = train_detection(
+        data_config=data_config,
+        epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=lr,
+        compile_model=not no_compile,
+        use_fsdp=fsdp,
+        save_dir=save_dir,
+        wandb_project=wandb_project,
+    )
+    click.echo(f"Training complete! Best model: {weights}")
 
 
 @train.command("yolo")
@@ -399,192 +575,360 @@ def train_yolo_cmd(
     click.echo(f"Training complete! Best model: {weights}")
 
 
-@train.command("fcnn")
-@click.option(
-    "--data",
-    "-d",
-    type=click.Path(exists=True),
-    default="soccernet/tracking/tracking/train.zip",
-    help="Path to SoccerNet tracking zip.",
-)
-@click.option(
-    "--epochs",
-    "-e",
-    type=int,
-    default=10,
-    help="Number of training epochs.",
-)
-@click.option(
-    "--batch-size",
-    "-b",
-    type=int,
-    default=64,
-    help="Training batch size.",
-)
-@click.option(
-    "--save-path",
-    type=str,
-    default="fcnn_player_tracker.pth",
-    help="Path to save model weights.",
-)
-def train_fcnn_cmd(
+@train.command("yolo-keypoints")
+@click.option("--data", "-d", type=click.Path(exists=True), required=True, help="Path to YOLO-pose dataset YAML.")
+@click.option("--epochs", "-e", type=int, default=100)
+@click.option("--imgsz", type=int, default=320, help="Input image size.")
+@click.option("--base-model", type=str, default="yolo11n-pose.pt", help="Base YOLO-pose model.")
+@click.option("--save-dir", type=str, default="weights/keypoints/")
+def train_yolo_keypoints_cmd(
+    data: str,
+    epochs: int,
+    imgsz: int,
+    base_model: str,
+    save_dir: str,
+) -> None:
+    """
+    Train YOLO-pose pitch keypoint detector (mosaic=0.0).
+
+    Faster than ViTPose (~3ms/frame at 320×320). Use mosaic=0.0 to avoid
+    spatial landmark shuffling that degrades keypoint AP.
+
+    Example:
+        $ torchkick train yolo-keypoints --data pitch.yaml --epochs 100
+    """
+    from torchkick.training.train_ball_detector import train_yolo_keypoints
+
+    click.echo(f"Training YOLO-pose keypoints (mosaic=0.0)")
+    weights = train_yolo_keypoints(
+        data_yaml=data,
+        base_model=base_model,
+        epochs=epochs,
+        imgsz=imgsz,
+        save_dir=save_dir,
+    )
+    click.echo(f"Training complete! Best model: {weights}")
+
+
+@train.command("keypoints")
+@click.option("--data", "-d", type=click.Path(exists=True), required=True, help="Path to SoccerNet calibration zip.")
+@click.option("--epochs", "-e", type=int, default=100)
+@click.option("--batch-size", "-b", type=int, default=8)
+@click.option("--lr", type=float, default=5e-4, help="Peak learning rate.")
+@click.option("--save-dir", type=str, default="weights/keypoints/")
+@click.option("--model-variant", type=click.Choice(["ViTPose-L", "ViTPose-B"]), default="ViTPose-L")
+@click.option("--no-compile", is_flag=True, help="Disable torch.compile.")
+@click.option("--wandb-project", type=str, default=None)
+def train_keypoints_cmd(
     data: str,
     epochs: int,
     batch_size: int,
-    save_path: str,
+    lr: float,
+    save_dir: str,
+    model_variant: str,
+    no_compile: bool,
+    wandb_project: str | None,
 ) -> None:
     """
-    Train Faster R-CNN player detector.
+    Train ViTPose-L pitch keypoint detector.
 
-    Faster R-CNN provides higher accuracy for small objects (distant players)
-    compared to YOLO, with a latency trade-off.
-
-    Example:
-        $ torchkick train fcnn --epochs 10 --batch-size 64
-    """
-    from torchkick.training import train_fcnn
-
-    click.echo("Training Faster R-CNN player detector")
-    click.echo(f"  Data: {data}")
-    click.echo(f"  Epochs: {epochs}")
-    click.echo(f"  Batch size: {batch_size}")
-
-    weights = train_fcnn(
-        data_zip=data,
-        epochs=epochs,
-        batch_size=batch_size,
-        save_path=save_path,
-    )
-
-    click.echo(f"Training complete! Model: {weights}")
-
-
-@train.command("rtdetr")
-@click.option(
-    "--data",
-    "-d",
-    type=click.Path(exists=True),
-    default="soccernet/tracking/tracking/train.zip",
-    help="Path to SoccerNet tracking zip.",
-)
-@click.option(
-    "--epochs",
-    "-e",
-    type=int,
-    default=20,
-    help="Number of training epochs.",
-)
-@click.option(
-    "--batch-size",
-    "-b",
-    type=int,
-    default=32,
-    help="Training batch size.",
-)
-@click.option(
-    "--save-path",
-    type=str,
-    default="rtdetr_player_tracker.pth",
-    help="Path to save model weights.",
-)
-def train_rtdetr_cmd(
-    data: str,
-    epochs: int,
-    batch_size: int,
-    save_path: str,
-) -> None:
-    """
-    Train RT-DETR player detector.
-
-    RT-DETR is a transformer-based detector with Apache 2.0 license,
-    achieving YOLO-like speed with higher accuracy.
+    Detects 29 pitch landmarks from SoccerNet calibration data.
 
     Example:
-        $ torchkick train rtdetr --epochs 20 --batch-size 32
+        $ torchkick train keypoints --data data/calibration/train.zip --epochs 100
     """
-    from torchkick.training import train_rtdetr
+    from torchkick.training import train_keypoints
 
-    click.echo("Training RT-DETR player detector")
-    click.echo(f"  Data: {data}")
-    click.echo(f"  Epochs: {epochs}")
-    click.echo(f"  Batch size: {batch_size}")
-
-    weights = train_rtdetr(
+    click.echo(f"Training ViTPose ({model_variant}) keypoint detector")
+    weights = train_keypoints(
         data_zip=data,
+        model_variant=model_variant,
         epochs=epochs,
         batch_size=batch_size,
-        save_path=save_path,
+        learning_rate=lr,
+        compile_model=not no_compile,
+        save_dir=save_dir,
+        wandb_project=wandb_project,
     )
+    click.echo(f"Training complete! Best model: {weights}")
 
-    click.echo(f"Training complete! Model: {weights}")
 
-
-@train.command("lines")
+@train.command("reid")
 @click.option(
-    "--data",
+    "--data-dir",
     "-d",
     type=click.Path(exists=True),
     required=True,
-    help="Path to line detection training data.",
+    help="Directory with crop sub-folders by class (supervised) or track ID (ssl).",
 )
 @click.option(
-    "--output",
-    "-o",
-    type=str,
-    default="weights/pitch",
-    help="Output directory for weights.",
+    "--stage",
+    type=click.Choice(["supervised", "ssl"]),
+    default="supervised",
+    help="Training stage: supervised ArcFace or BYOL tracklet SSL.",
 )
-@click.option(
-    "--epochs",
-    "-e",
-    type=int,
-    default=100,
-    help="Number of training epochs.",
-)
-@click.option(
-    "--batch-size",
-    "-b",
-    type=int,
-    default=8,
-    help="Training batch size.",
-)
-@click.option(
-    "--config",
-    type=click.Path(exists=True),
-    default="models/pitch/config/hrnetv2_w48_l.yaml",
-    help="HRNet config file.",
-)
-def train_lines_cmd(
-    data: str,
-    output: str,
+@click.option("--epochs", "-e", type=int, default=30)
+@click.option("--batch-size", "-b", type=int, default=64)
+@click.option("--lr", type=float, default=3e-4)
+@click.option("--lora-rank", type=int, default=16, help="LoRA adapter rank.")
+@click.option("--num-classes", type=int, default=3, help="Identity classes (3 = home/away/ref).")
+@click.option("--save-dir", type=str, default="weights/reid/")
+@click.option("--no-compile", is_flag=True)
+@click.option("--fsdp", is_flag=True, help="Enable FSDP for multi-GPU training.")
+@click.option("--wandb-project", type=str, default=None)
+def train_reid_cmd(
+    data_dir: str,
+    stage: str,
     epochs: int,
     batch_size: int,
-    config: str,
+    lr: float,
+    lora_rank: int,
+    num_classes: int,
+    save_dir: str,
+    no_compile: bool,
+    fsdp: bool,
+    wandb_project: str | None,
 ) -> None:
     """
-    Train pitch line detector.
+    Train DINOv2 + LoRA + ArcFace ReID model.
 
-    Trains HRNet-based line detection model for camera calibration.
+    Stage 'supervised': ArcFace metric learning on labelled crops.
+    Stage 'ssl': BYOL tracklet self-supervised learning.
 
     Example:
-        $ torchkick train lines --data calibration_data/ --epochs 100
+        $ torchkick train reid --stage supervised --data-dir data/reid/ --epochs 30
+        $ torchkick train reid --stage ssl       --data-dir data/reid/ --epochs 20
     """
-    from torchkick.training import train_lines
+    from torchkick.training import train_reid
 
-    click.echo("Training pitch line detector")
-    click.echo(f"  Data: {data}")
-    click.echo(f"  Output: {output}")
-    click.echo(f"  Epochs: {epochs}")
-
-    weights = train_lines(
-        data_dir=data,
-        output_dir=output,
-        config_path=config,
+    click.echo(f"Training ReID ({stage} stage)")
+    weights = train_reid(
+        data_dir=data_dir,
+        stage=stage,
+        num_classes=num_classes,
+        lora_rank=lora_rank,
         epochs=epochs,
         batch_size=batch_size,
+        learning_rate=lr,
+        compile_model=not no_compile,
+        use_fsdp=fsdp,
+        save_dir=save_dir,
+        wandb_project=wandb_project,
+    )
+    click.echo(f"Training complete! Best model: {weights}")
+
+
+@train.command("distill")
+@click.option(
+    "--teacher-weights",
+    type=click.Path(exists=True),
+    required=True,
+    help="Path to supervised ReID checkpoint (reid_supervised_best.pth).",
+)
+@click.option(
+    "--data-dir",
+    "-d",
+    type=click.Path(exists=True),
+    required=True,
+    help="ReID crops directory (same as used for teacher).",
+)
+@click.option("--epochs", "-e", type=int, default=30)
+@click.option("--batch-size", "-b", type=int, default=128)
+@click.option("--lr", type=float, default=3e-4)
+@click.option("--temperature", type=float, default=4.0, help="Softmax temperature for KL distillation loss.")
+@click.option("--save-dir", type=str, default="weights/reid/")
+@click.option("--no-compile", is_flag=True)
+@click.option("--wandb-project", type=str, default=None)
+def train_distill_cmd(
+    teacher_weights: str,
+    data_dir: str,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    temperature: float,
+    save_dir: str,
+    no_compile: bool,
+    wandb_project: str | None,
+) -> None:
+    """
+    Distil DINOv2-Large ReID teacher → DINOv2-Small student.
+
+    Produces a 384-dim student model for real-time inference (~3ms/frame).
+
+    Example:
+        $ torchkick train distill \\
+              --teacher-weights weights/reid/reid_supervised_best.pth \\
+              --data-dir data/reid/
+    """
+    from torchkick.training import train_distill
+
+    click.echo("Distilling ViT-L/14 → ViT-S/8")
+    weights = train_distill(
+        teacher_weights=teacher_weights,
+        data_dir=data_dir,
+        temperature=temperature,
+        epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=lr,
+        compile_model=not no_compile,
+        save_dir=save_dir,
+        wandb_project=wandb_project,
+    )
+    click.echo(f"Distillation complete! Student: {weights}")
+
+
+# =============================================================================
+# LABEL COMMAND GROUP - Automated annotation pipeline
+# =============================================================================
+
+
+@main.group()
+def label() -> None:
+    """
+    Automated annotation tools.
+
+    Run pre-labeling pipelines that generate CVAT-ready annotations
+    from raw video using foundation models.
+
+    Example:
+        $ torchkick label grounded-sam --video match.mp4 --project-id 1
+        $ torchkick label active-learning --video-dir data/videos/ --project-id 1
+    """
+    pass
+
+
+@label.command("grounded-sam")
+@click.option("--video", "-v", type=click.Path(exists=True), required=True, help="Input video file.")
+@click.option("--project-id", type=int, required=True, help="CVAT project ID to upload annotations to.")
+@click.option("--frame-step", type=int, default=5, help="Process every N-th frame (default 5).")
+@click.option(
+    "--reid-weights", type=click.Path(), default=None, help="Optional ReID student weights for team assignment."
+)
+@click.option("--no-sam", is_flag=True, help="Skip SAM2 mask refinement (faster, boxes only).")
+@click.option("--box-threshold", type=float, default=0.35)
+@click.option("--text-threshold", type=float, default=0.25)
+@click.option("--prompt", type=str, default="soccer player . ball . referee", help="GroundingDINO text prompt.")
+def label_grounded_sam(
+    video: str,
+    project_id: int,
+    frame_step: int,
+    reid_weights: str | None,
+    no_sam: bool,
+    box_threshold: float,
+    text_threshold: float,
+    prompt: str,
+) -> None:
+    """
+    Auto-label a video with GroundingDINO + SAM2.
+
+    Detects players, ball, and referee via text-guided GroundingDINO,
+    optionally refines detections to instance masks with SAM2, and
+    uploads annotations to CVAT.
+
+    Example:
+        $ torchkick label grounded-sam --video match.mp4 --project-id 1
+        $ torchkick label grounded-sam --video match.mp4 --project-id 1 --no-sam
+    """
+    import torch
+    from torchkick.annotation.grounded_sam import GroundedSAMPipeline
+
+    reid_embedder = None
+    if reid_weights:
+        try:
+            from torchkick.models.reid import DINOv2ReIDEmbedder
+
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+            reid_embedder = DINOv2ReIDEmbedder(weights_path=reid_weights, device=dev)
+            click.echo(f"ReID embedder loaded from {reid_weights}")
+        except Exception as e:
+            click.echo(f"[warn] Could not load ReID embedder: {e}")
+
+    pipeline = GroundedSAMPipeline(
+        reid_embedder=reid_embedder,
+        text_prompt=prompt,
+        box_threshold=box_threshold,
+        text_threshold=text_threshold,
     )
 
-    click.echo(f"Training complete! Best model: {weights}")
+    click.echo(f"Running Grounded-SAM on: {video}")
+    annotations = pipeline.process_video(
+        video_path=video,
+        frame_step=frame_step,
+        use_sam=not no_sam,
+    )
+
+    click.echo(f"Generated {len(annotations)} annotations. CVAT upload project_id={project_id}.")
+    click.echo("(CVAT upload via annotation.client — wire project_id when client is configured)")
+
+
+@label.command("active-learning")
+@click.option("--video-dir", type=click.Path(exists=True), required=True, help="Directory containing MP4 videos.")
+@click.option("--project-id", type=int, required=True, help="CVAT project ID.")
+@click.option("--budget", type=int, default=100, help="Maximum frames to upload per iteration.")
+@click.option("--frame-step", type=int, default=5)
+@click.option("--reid-weights", type=click.Path(), default=None, help="ReID student weights for uncertainty scoring.")
+@click.option(
+    "--uncertainty-weight", type=float, default=0.5, help="Mix of uncertainty (0) vs diversity (1) selection."
+)
+def label_active_learning(
+    video_dir: str,
+    project_id: int,
+    budget: int,
+    frame_step: int,
+    reid_weights: str | None,
+    uncertainty_weight: float,
+) -> None:
+    """
+    Run one iteration of the active learning labeling loop.
+
+    Scores unlabeled video frames by uncertainty (MC Dropout) and
+    diversity (coreset) and uploads the most informative subset to CVAT.
+
+    Example:
+        $ torchkick label active-learning \\
+              --video-dir data/videos/ --project-id 1 --budget 100
+    """
+    import torch
+    from torchkick.annotation.grounded_sam import GroundedSAMPipeline
+    from torchkick.annotation.active_learning import ActiveLearningLoop
+
+    reid_embedder = None
+    if reid_weights:
+        try:
+            from torchkick.models.reid import DINOv2ReIDEmbedder
+
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+            reid_embedder = DINOv2ReIDEmbedder(weights_path=reid_weights, device=dev)
+        except Exception as e:
+            click.echo(f"[warn] Could not load ReID embedder: {e}")
+
+    pipeline = GroundedSAMPipeline(reid_embedder=reid_embedder)
+
+    # CVAT client — requires environment vars CVAT_HOST / CVAT_TOKEN
+    try:
+        from torchkick.annotation.client import CVATClient
+
+        cvat_client = CVATClient()
+    except Exception as e:
+        raise click.UsageError(
+            f"Could not initialise CVAT client: {e}. " "Set CVAT_HOST and CVAT_TOKEN environment variables."
+        )
+
+    loop = ActiveLearningLoop(
+        pipeline=pipeline,
+        cvat_client=cvat_client,
+        embedder=reid_embedder,
+        budget=budget,
+        uncertainty_weight=uncertainty_weight,
+    )
+
+    click.echo(f"Running active learning on {video_dir} (budget={budget})")
+    result = loop.run(
+        video_dir=video_dir,
+        project_id=project_id,
+        frame_step=frame_step,
+    )
+    click.echo(f"Selected {result['selected']} frames → {len(result['uploaded_task_ids'])} CVAT tasks created")
 
 
 if __name__ == "__main__":
