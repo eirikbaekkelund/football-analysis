@@ -517,7 +517,9 @@ class SigLIPTeamEmbedder:
             pil_imgs = [Image.fromarray(cv2.cvtColor(c, cv2.COLOR_BGR2RGB)) for c in batch_crops]
             inputs = self._processor(images=pil_imgs, return_tensors="pt", padding=True)
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            image_features = self._model.get_image_features(**inputs)
+            out = self._model(**inputs)
+            # SigLIP vision model returns BaseModelOutputWithPooling; use pooler_output
+            image_features = out.pooler_output if hasattr(out, "pooler_output") else out.last_hidden_state[:, 0]
             image_features = F.normalize(image_features.float(), dim=-1)
             all_embeddings.append(image_features.cpu().numpy())
 
