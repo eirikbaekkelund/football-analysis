@@ -93,11 +93,14 @@ def _load_soccernet_source(zip_path: str) -> List[Dict[str, Any]]:
     return samples
 
 
-def _apply_augmentations(image: np.ndarray, boxes: np.ndarray, input_size: int) -> Tuple[np.ndarray, np.ndarray]:
+def _apply_augmentations(
+    image: np.ndarray, boxes: np.ndarray, labels: np.ndarray, input_size: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Apply albumentations augmentation pipeline.
 
     Conservative on color (preserve jersey colors) but aggressive on geometry.
+    Returns (image, boxes, labels) — labels are filtered to match surviving boxes.
     """
     try:
         import albumentations as A
@@ -123,19 +126,21 @@ def _apply_augmentations(image: np.ndarray, boxes: np.ndarray, input_size: int) 
             scale_x = input_size / max(image.shape[1], 1)
             scale_y = input_size / max(image.shape[0], 1)
             boxes = boxes * np.array([scale_x, scale_y, scale_x, scale_y])
-        return image, boxes
+        return image, boxes, labels
 
-    labels = [0] * len(boxes)
+    labels_list = labels.tolist() if len(labels) else []
     if len(boxes):
-        result = transform(image=image, bboxes=boxes.tolist(), labels=labels)
+        result = transform(image=image, bboxes=boxes.tolist(), labels=labels_list)
         image = result["image"]
         boxes = np.array(result["bboxes"], dtype=np.float32) if result["bboxes"] else np.zeros((0, 4), dtype=np.float32)
+        labels = np.array(result["labels"], dtype=np.int64) if result["labels"] else np.zeros(0, dtype=np.int64)
     else:
         result = transform(image=image, bboxes=[], labels=[])
         image = result["image"]
         boxes = np.zeros((0, 4), dtype=np.float32)
+        labels = np.zeros(0, dtype=np.int64)
 
-    return image, boxes
+    return image, boxes, labels
 
 
 class MixedDetectionDataset(Dataset):
@@ -210,7 +215,7 @@ class MixedDetectionDataset(Dataset):
         labels = np.array(sample["labels"], dtype=np.int64) if sample["labels"] else np.zeros(0, dtype=np.int64)
 
         if self.augment:
-            image, boxes = _apply_augmentations(image, boxes, self.input_size)
+            image, boxes, labels = _apply_augmentations(image, boxes, labels, self.input_size)
         else:
             image = cv2.resize(image, (self.input_size, self.input_size))
 
