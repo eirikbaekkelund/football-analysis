@@ -220,6 +220,9 @@ def train_detection(
 
             train_loss += loss.item() * grad_accumulation
 
+            if step % 100 == 0:
+                print(f"  [{epoch}/{epochs}] step {step}/{len(train_loader)} loss={loss.item() * grad_accumulation:.4f}", flush=True)
+
         if isinstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR):
             scheduler.step()
 
