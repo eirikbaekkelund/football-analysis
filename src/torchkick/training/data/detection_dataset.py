@@ -101,7 +101,7 @@ def _load_soccernet_dir_source(root_dir: str) -> List[Dict[str, Any]]:
     """
     root = Path(root_dir)
     samples = []
-    for gt_file in sorted(root.glob("*/gt/gt.txt")):
+    for gt_file in sorted(root.glob("**/gt/gt.txt")):
         seq_name = gt_file.parts[-3]
         img_dir = gt_file.parent.parent / "img1"
         # Parse MOT gt.txt: frame,id,x,y,w,h,conf,class,visibility
