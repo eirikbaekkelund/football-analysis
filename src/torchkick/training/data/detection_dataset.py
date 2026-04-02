@@ -253,9 +253,12 @@ class MixedDetectionDataset(Dataset):
         else:
             image = cv2.resize(image, (self.input_size, self.input_size))
 
-        # BGR -> RGB, [0, 255] -> [0, 1]
+        # BGR -> RGB, normalize with ImageNet stats (RT-DETR backbone pretrained on ImageNet)
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image_tensor = torch.from_numpy(image_rgb).permute(2, 0, 1).float() / 255.0
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        image_tensor = (image_tensor - mean) / std
 
         targets = {
             "boxes": torch.from_numpy(boxes),
