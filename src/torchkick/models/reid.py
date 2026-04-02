@@ -485,10 +485,10 @@ class SigLIPTeamEmbedder:
         self.device = torch.device(device)
         self.batch_size = batch_size
         try:
-            from transformers import AutoProcessor, AutoModel
+            from transformers import AutoImageProcessor, SiglipVisionModel
 
-            self._processor = AutoProcessor.from_pretrained(model_name)
-            self._model = AutoModel.from_pretrained(model_name).to(self.device).eval()
+            self._processor = AutoImageProcessor.from_pretrained(model_name)
+            self._model = SiglipVisionModel.from_pretrained(model_name).to(self.device).eval()
         except ImportError as e:
             raise ImportError(
                 f"SigLIPTeamEmbedder dependency missing: {e}. "
