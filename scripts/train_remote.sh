@@ -94,7 +94,7 @@ fi
 # ── 2. Install ───────────────────────────────────────────────────────────────
 log "Installing torchkick"
 pip install -q uv
-uv pip install -e ".[reid,roboflow,training]" \
+uv pip install --system -e ".[reid,roboflow,training]" \
     --extra-index-url https://download.pytorch.org/whl/cu128
 ok "torchkick installed"
 
