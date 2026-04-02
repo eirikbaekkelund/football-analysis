@@ -985,7 +985,14 @@ def run_analysis(
         elif model_type == "rtdetr":
             model_path = "models/player/rtdetr/rtdetr_player_tracker.pth"
 
-    dev = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
+    if device:
+        dev = torch.device(device)
+    elif torch.cuda.is_available():
+        dev = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        dev = torch.device("mps")
+    else:
+        dev = torch.device("cpu")
     print(f"Device: {dev}")
 
     # Load models
