@@ -249,7 +249,7 @@ def dataset(
             if dataset in ("tracking", "all"):
                 tracking_dir = str(Path(output_dir) / "tracking")
                 click.echo(f"Downloading tracking data to {tracking_dir}...")
-                download_tracking_data(tracking_dir, splits=split_list)  # type: ignore
+                download_tracking_data(tracking_dir, splits=split_list, include_2023=False)  # type: ignore
                 click.echo("  ✓ Tracking data downloaded")
 
             if dataset in ("calibration", "all"):

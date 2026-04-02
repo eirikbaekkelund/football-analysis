@@ -111,8 +111,9 @@ ok "Roboflow field keypoints dataset ready"
 
 if [ "$ROBOFLOW_ONLY" -eq 0 ]; then
     log "Downloading SoccerNet datasets (requires SoccerNet account)"
-    torchkick dataset -d tracking     -o data/soccernet/
-    torchkick dataset -d calibration  -o data/soccernet/
+    # train split only — test adds ~8 GB not needed for training; 2023 edition skipped by default
+    torchkick dataset -d tracking    -o data/soccernet/ --splits train
+    torchkick dataset -d calibration -o data/soccernet/ --splits train
     ok "SoccerNet datasets ready"
 fi
 
