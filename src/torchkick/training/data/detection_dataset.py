@@ -66,22 +66,28 @@ def _load_coco_source(
 
 
 def _load_soccernet_source(zip_path: str) -> List[Dict[str, Any]]:
-    """Load SoccerNet tracking data as sample dicts via PlayerTrackingDataset."""
+    """Build metadata-only index from SoccerNet zip. Images loaded lazily in __getitem__."""
     try:
         from torchkick.soccernet import PlayerTrackingDataset
     except ImportError:
         raise ImportError("SoccerNet source requires torchkick[soccernet]")
 
-    ds = PlayerTrackingDataset(zip_path)
+    ds = PlayerTrackingDataset(zip_path, bbox_format="xyxy")
     samples = []
-    for i in range(len(ds)):
-        item = ds[i]
-        # item: {"image": ndarray, "boxes": [[x1,y1,x2,y2],...], "track_ids": [...]}
+    for seq_name, frame_id in ds.samples:
+        df = ds.annotations[seq_name]
+        frame_rows = df[df["frame"] == frame_id]
+        boxes = []
+        for _, row in frame_rows.iterrows():
+            x, y, w, h = float(row["x"]), float(row["y"]), float(row["w"]), float(row["h"])
+            boxes.append([x, y, x + w, y + h])
         samples.append(
             {
-                "image_array": item["image"],
-                "boxes": [b.tolist() if hasattr(b, "tolist") else list(b) for b in item["boxes"]],
-                "labels": [0] * len(item["boxes"]),  # all players = class 0
+                "zip_path": zip_path,
+                "seq_name": seq_name,
+                "frame_id": int(frame_id),
+                "boxes": boxes,
+                "labels": [0] * len(boxes),
             }
         )
     return samples
@@ -176,6 +182,14 @@ class MixedDetectionDataset(Dataset):
         return len(self._samples)
 
     def _load_image(self, sample: Dict[str, Any]) -> np.ndarray:
+        if "zip_path" in sample:
+            import fsspec
+            from io import BytesIO
+            from PIL import Image as PILImage
+            img_path = f"zip://{sample['seq_name']}/img1/{sample['frame_id']:06d}.jpg::{sample['zip_path']}"
+            with fsspec.open(img_path, "rb") as f:
+                img = np.array(PILImage.open(BytesIO(f.read())).convert("RGB"))
+            return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         if "image_array" in sample:
             img = sample["image_array"]
             if not isinstance(img, np.ndarray):

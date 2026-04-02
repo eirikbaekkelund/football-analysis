@@ -112,15 +112,19 @@ def train_detection(
         except ImportError:
             print("W&B not installed; skipping logging.")
 
-    # Dataset
+    # Dataset — build index once, split with fixed seed, wrap train subset for augmentation
     print("Loading dataset...")
     input_size = 640
-    train_dataset = MixedDetectionDataset(data_config, input_size=input_size, augment=True)
-    val_dataset = MixedDetectionDataset(data_config, input_size=input_size, augment=False)
-    n_val = max(1, int(len(train_dataset) * val_split))
-    n_train = len(train_dataset) - n_val
-    train_ds, _ = random_split(train_dataset, [n_train, n_val])
-    val_ds, _ = random_split(val_dataset, [n_val, n_train])
+    full_dataset = MixedDetectionDataset(data_config, input_size=input_size, augment=False)
+    n_val = max(1, int(len(full_dataset) * val_split))
+    n_train = len(full_dataset) - n_val
+    generator = torch.Generator().manual_seed(42)
+    val_ds, _ = random_split(full_dataset, [n_val, n_train], generator=generator)
+
+    # Re-use same indices for training but with augmentation enabled
+    aug_dataset = MixedDetectionDataset(data_config, input_size=input_size, augment=True)
+    generator2 = torch.Generator().manual_seed(42)
+    _, train_ds = random_split(aug_dataset, [n_val, n_train], generator=generator2)
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, collate_fn=_collate_fn
