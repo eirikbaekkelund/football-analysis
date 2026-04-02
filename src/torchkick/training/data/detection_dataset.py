@@ -93,6 +93,32 @@ def _load_soccernet_source(zip_path: str) -> List[Dict[str, Any]]:
     return samples
 
 
+def _load_soccernet_dir_source(root_dir: str) -> List[Dict[str, Any]]:
+    """Build index from a pre-extracted SoccerNet directory (much faster than zip).
+
+    Expects the same layout as the zip: <root>/<seq_name>/img1/<frame>.jpg
+    and <root>/<seq_name>/gt/gt.txt (MOT-format ground truth).
+    """
+    root = Path(root_dir)
+    samples = []
+    for gt_file in sorted(root.glob("*/gt/gt.txt")):
+        seq_name = gt_file.parts[-3]
+        img_dir = gt_file.parent.parent / "img1"
+        # Parse MOT gt.txt: frame,id,x,y,w,h,conf,class,visibility
+        frames: Dict[int, List] = {}
+        with open(gt_file) as f:
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) < 6:
+                    continue
+                fid, _, x, y, w, h = int(parts[0]), parts[1], float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])
+                frames.setdefault(fid, []).append([x, y, x + w, y + h])
+        for fid, boxes in frames.items():
+            img_path = str(img_dir / f"{fid:06d}.jpg")
+            samples.append({"image_path": img_path, "boxes": boxes, "labels": [0] * len(boxes)})
+    return samples
+
+
 def _apply_augmentations(
     image: np.ndarray, boxes: np.ndarray, labels: np.ndarray, input_size: int
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -180,8 +206,10 @@ class MixedDetectionDataset(Dataset):
                 self._samples.extend(_load_coco_source(src["path"], src.get("images_dir", "")))
             elif src_type == "soccernet_zip":
                 self._samples.extend(_load_soccernet_source(src["path"]))
+            elif src_type == "soccernet_dir":
+                self._samples.extend(_load_soccernet_dir_source(src["path"]))
             else:
-                raise ValueError(f"Unknown source type: {src_type!r}. Use 'coco_json' or 'soccernet_zip'.")
+                raise ValueError(f"Unknown source type: {src_type!r}. Use 'coco_json', 'soccernet_zip', or 'soccernet_dir'.")
 
     def __len__(self) -> int:
         return len(self._samples)

@@ -126,11 +126,16 @@ def train_detection(
     generator2 = torch.Generator().manual_seed(42)
     _, train_ds = random_split(aug_dataset, [n_val, n_train], generator=generator2)
 
+    import os
+    n_cpu = os.cpu_count() or 4
+    n_workers = min(n_cpu, 12)
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, collate_fn=_collate_fn
+        train_ds, batch_size=batch_size, shuffle=True, num_workers=n_workers,
+        pin_memory=True, persistent_workers=True, prefetch_factor=4, collate_fn=_collate_fn,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True, collate_fn=_collate_fn
+        val_ds, batch_size=batch_size, shuffle=False, num_workers=max(n_workers // 2, 2),
+        pin_memory=True, persistent_workers=True, prefetch_factor=2, collate_fn=_collate_fn,
     )
 
     print(f"Train: {n_train} samples | Val: {n_val} samples")

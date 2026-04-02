@@ -453,6 +453,12 @@ def train() -> None:
     help="SoccerNet tracking ZIP file (e.g. data/soccernet/tracking/train.zip).",
 )
 @click.option(
+    "--soccernet-dir",
+    type=click.Path(exists=True),
+    default=None,
+    help="Pre-extracted SoccerNet directory (faster than zip). Extract with: unzip train.zip -d data/soccernet_extracted/",
+)
+@click.option(
     "--roboflow-json",
     type=click.Path(exists=True),
     default=None,
@@ -485,6 +491,7 @@ def train() -> None:
 @click.option("--wandb-project", type=str, default=None)
 def train_detection_cmd(
     soccernet: str | None,
+    soccernet_dir: str | None,
     roboflow_json: str | None,
     roboflow_images: str | None,
     cvat_json: str | None,
@@ -535,7 +542,10 @@ def train_detection_cmd(
     data_config = []
     if soccernet:
         data_config.append({"type": "soccernet_zip", "path": soccernet})
-        click.echo(f"  + SoccerNet: {soccernet}")
+        click.echo(f"  + SoccerNet ZIP: {soccernet}")
+    if soccernet_dir:
+        data_config.append({"type": "soccernet_dir", "path": soccernet_dir})
+        click.echo(f"  + SoccerNet dir: {soccernet_dir}")
     if roboflow_json:
         data_config.append({"type": "coco_json", "path": roboflow_json, "images_dir": roboflow_images})
         click.echo(f"  + Roboflow:  {roboflow_json}")
@@ -545,7 +555,7 @@ def train_detection_cmd(
 
     if not data_config:
         raise click.UsageError(
-            "At least one data source is required. " "Use --soccernet, --roboflow-json, or --cvat-json."
+            "At least one data source is required. Use --soccernet, --soccernet-dir, --roboflow-json, or --cvat-json."
         )
 
     click.echo(f"Training RT-DETR detection model ({len(data_config)} source(s))")
