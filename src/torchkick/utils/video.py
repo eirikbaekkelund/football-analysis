@@ -154,26 +154,27 @@ class VideoWriter:
     """
     Context manager for writing video files with standard codec settings.
 
-    Uses XVID codec with AVI container by default for cross-platform compatibility.
+    Uses mp4v codec with MP4 container by default — natively supported on
+    macOS (QuickTime) and Windows 10+ without additional codec installation.
 
     Args:
-        path: Output file path (extension normalized to .avi for XVID codec).
+        path: Output file path (extension normalized to .mp4 for mp4v codec).
         fps: Output frame rate.
         size: Frame dimensions as (width, height) tuple.
-        codec: FourCC codec string. Default "XVID" for broad compatibility.
+        codec: FourCC codec string. Default "mp4v" for cross-platform MP4 output.
 
     Raises:
         RuntimeError: If video writer cannot be created.
 
     Example:
-        >>> with VideoWriter("output.avi", fps=30, size=(1920, 1080)) as writer:
+        >>> with VideoWriter("output.mp4", fps=30, size=(1920, 1080)) as writer:
         ...     for frame in frames:
         ...         writer.write(frame)
         ...     print(f"Wrote {writer.frame_count} frames")
     """
 
-    DEFAULT_CODEC: str = "XVID"
-    DEFAULT_EXT: str = ".avi"
+    DEFAULT_CODEC: str = "mp4v"
+    DEFAULT_EXT: str = ".mp4"
 
     def __init__(
         self,
@@ -182,10 +183,10 @@ class VideoWriter:
         size: Tuple[int, int],
         codec: str = DEFAULT_CODEC,
     ) -> None:
-        # Ensure .avi extension for XVID codec
+        # Ensure .mp4 extension for mp4v codec
         self._path = Path(path)
-        if codec == "XVID" and self._path.suffix.lower() != ".avi":
-            self._path = self._path.with_suffix(".avi")
+        if codec == "mp4v" and self._path.suffix.lower() != ".mp4":
+            self._path = self._path.with_suffix(".mp4")
         self.path = str(self._path)
 
         self.fps = fps
@@ -346,7 +347,7 @@ def generate_output_path(
         parts.append(f"{int(duration)}s")
     parts.append(suffix)
 
-    output_name = "_".join(parts) + ".avi"
+    output_name = "_".join(parts) + ".mp4"
     return output_name
 
 

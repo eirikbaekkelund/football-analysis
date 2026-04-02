@@ -337,13 +337,17 @@ def dataset(
     help="Frames between homography updates (1=every frame).",
 )
 @click.option(
-    "--overlay",
-    is_flag=False,
+    "--no-overlay",
+    "no_overlay",
+    is_flag=True,
+    default=False,
     help="Disable pitch line overlay on video.",
 )
 @click.option(
-    "--dominance",
-    is_flag=False,
+    "--no-dominance",
+    "no_dominance",
+    is_flag=True,
+    default=False,
     help="Disable space control heatmap.",
 )
 @click.option(
