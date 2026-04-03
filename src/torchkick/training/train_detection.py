@@ -35,12 +35,16 @@ import torch
 from torch.utils.data import DataLoader, random_split
 
 
-def _get_model_and_processor(model_name: str):
+def _get_model_and_processor(model_name: str, num_labels: int = 2):
     try:
         from transformers import RTDetrForObjectDetection, RTDetrImageProcessor
 
         processor = RTDetrImageProcessor.from_pretrained(model_name)
-        model = RTDetrForObjectDetection.from_pretrained(model_name)
+        model = RTDetrForObjectDetection.from_pretrained(
+            model_name,
+            num_labels=num_labels,
+            ignore_mismatched_sizes=True,
+        )
         return model, processor
     except ImportError:
         raise ImportError("transformers>=4.35.0 required. Install: pip install torchkick[reid]")
@@ -55,6 +59,7 @@ def _collate_fn(batch):
 def train_detection(
     data_config: List[Dict[str, Any]],
     model_name: str = "PekingU/rtdetr_r101vd",
+    num_labels: int = 2,
     epochs: int = 50,
     batch_size: int = 8,
     learning_rate: float = 5e-5,
@@ -141,7 +146,7 @@ def train_detection(
     print(f"Train: {n_train} samples | Val: {n_val} samples")
 
     # Model
-    model, processor = _get_model_and_processor(model_name)
+    model, processor = _get_model_and_processor(model_name, num_labels=num_labels)
 
     if use_fsdp:
         try:

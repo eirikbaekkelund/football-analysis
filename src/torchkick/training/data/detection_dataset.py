@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -35,8 +35,16 @@ from torch.utils.data import Dataset
 def _load_coco_source(
     json_path: str,
     images_dir: str,
+    label_map: Optional[Dict[int, int]] = None,
 ) -> List[Dict[str, Any]]:
-    """Load COCO-format annotations into a flat list of sample dicts."""
+    """Load COCO-format annotations into a flat list of sample dicts.
+
+    Args:
+        label_map: Optional remapping of category IDs. E.g. to collapse
+            player/goalkeeper/referee → 0 (person) and ball → 1:
+            ``{1: 0, 2: 0, 3: 0, 4: 1}``
+            Annotations whose category maps to -1 are dropped.
+    """
     with open(json_path) as f:
         coco = json.load(f)
 
@@ -52,13 +60,18 @@ def _load_coco_source(
         boxes_xyxy = []
         labels = []
         for ann in anns:
+            cat = ann.get("category_id", 0)
+            if label_map is not None:
+                cat = label_map.get(cat, -1)
+                if cat == -1:
+                    continue
             x, y, w, h = ann["bbox"]
             boxes_xyxy.append([x, y, x + w, y + h])
-            labels.append(ann.get("category_id", 0))
+            labels.append(cat)
         samples.append(
             {
                 "image_path": img_path,
-                "boxes": boxes_xyxy,  # [[x1,y1,x2,y2], ...]
+                "boxes": boxes_xyxy,
                 "labels": labels,
             }
         )
@@ -209,7 +222,7 @@ class MixedDetectionDataset(Dataset):
         for src in sources:
             src_type = src["type"]
             if src_type == "coco_json":
-                self._samples.extend(_load_coco_source(src["path"], src.get("images_dir", "")))
+                self._samples.extend(_load_coco_source(src["path"], src.get("images_dir", ""), src.get("label_map")))
             elif src_type == "soccernet_zip":
                 self._samples.extend(_load_soccernet_source(src["path"]))
             elif src_type == "soccernet_dir":

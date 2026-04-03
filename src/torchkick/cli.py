@@ -482,9 +482,11 @@ def train() -> None:
     default=None,
     help="Directory containing CVAT images (required when --cvat-json is given).",
 )
+@click.option("--person-ball", is_flag=True, default=True, help="Remap all person categories (player/goalkeeper/referee) → 0, ball → 1. Recommended.")
 @click.option("--epochs", "-e", type=int, default=300)
 @click.option("--batch-size", "-b", type=int, default=8)
 @click.option("--lr", type=float, default=5e-5)
+@click.option("--num-classes", type=int, default=2, help="Number of output classes. Default 2 = person + ball.")
 @click.option("--save-dir", type=str, default="weights/detection/")
 @click.option("--no-compile", is_flag=True, help="Disable torch.compile.")
 @click.option("--fsdp", is_flag=True, help="Enable FSDP for multi-GPU training.")
@@ -496,9 +498,11 @@ def train_detection_cmd(
     roboflow_images: str | None,
     cvat_json: str | None,
     cvat_images: str | None,
+    person_ball: bool,
     epochs: int,
     batch_size: int,
     lr: float,
+    num_classes: int,
     save_dir: str,
     no_compile: bool,
     fsdp: bool,
@@ -546,12 +550,20 @@ def train_detection_cmd(
     if soccernet_dir:
         data_config.append({"type": "soccernet_dir", "path": soccernet_dir})
         click.echo(f"  + SoccerNet dir: {soccernet_dir}")
+    # person+ball label map: player/goalkeeper/referee → 0, ball → 1
+    label_map = {1: 0, 2: 0, 3: 0, 4: 1} if person_ball else None
     if roboflow_json:
-        data_config.append({"type": "coco_json", "path": roboflow_json, "images_dir": roboflow_images})
-        click.echo(f"  + Roboflow:  {roboflow_json}")
+        src = {"type": "coco_json", "path": roboflow_json, "images_dir": roboflow_images}
+        if label_map:
+            src["label_map"] = label_map
+        data_config.append(src)
+        click.echo(f"  + Roboflow:  {roboflow_json}" + (" (person+ball remapping)" if label_map else ""))
     if cvat_json:
-        data_config.append({"type": "coco_json", "path": cvat_json, "images_dir": cvat_images})
-        click.echo(f"  + CVAT:      {cvat_json}")
+        src = {"type": "coco_json", "path": cvat_json, "images_dir": cvat_images}
+        if label_map:
+            src["label_map"] = label_map
+        data_config.append(src)
+        click.echo(f"  + CVAT:      {cvat_json}" + (" (person+ball remapping)" if label_map else ""))
 
     if not data_config:
         raise click.UsageError(
@@ -562,6 +574,7 @@ def train_detection_cmd(
 
     weights = train_detection(
         data_config=data_config,
+        num_labels=num_classes,
         epochs=epochs,
         batch_size=batch_size,
         learning_rate=lr,
