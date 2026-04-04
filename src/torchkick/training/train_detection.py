@@ -187,24 +187,6 @@ def train_detection(
         for step, (images, targets) in enumerate(train_loader):
             images = images.to(dev)
 
-            # One-time sanity check on first batch of first epoch
-            if epoch == 1 and step == 0:
-                print("\n=== SANITY CHECK (epoch 1, step 0) ===")
-                print(f"  images shape: {images.shape}  dtype: {images.dtype}")
-                print(f"  images mean/std: {images.mean().item():.3f} / {images.std().item():.3f}  (expect ~0.0/1.0 if ImageNet-normalized)")
-                print(f"  images min/max:  {images.min().item():.3f} / {images.max().item():.3f}  (expect ~-2.1 / +2.6)")
-                total_boxes = sum(len(t["boxes"]) for t in targets)
-                label_tensors = [t["labels"] for t in targets if len(t["labels"])]
-                if label_tensors:
-                    all_labels = torch.cat(label_tensors)
-                    unique, counts = all_labels.unique(return_counts=True)
-                    print(f"  total boxes in batch: {total_boxes}")
-                    print(f"  label distribution: { {int(k): int(v) for k, v in zip(unique, counts)} }  (expect {{0: N}} for person-only)")
-                if total_boxes:
-                    all_boxes = torch.cat([t["boxes"] for t in targets if len(t["boxes"])])
-                    print(f"  boxes xyxy range: x=[{all_boxes[:,0].min():.1f},{all_boxes[:,2].max():.1f}] y=[{all_boxes[:,1].min():.1f},{all_boxes[:,3].max():.1f}]  (expect 0-640)")
-                print("=======================================\n", flush=True)
-
             # Build HuggingFace-compatible labels
             hf_labels = []
             for t in targets:
@@ -226,6 +208,39 @@ def train_detection(
             with torch.amp.autocast("cuda", enabled=(scaler is not None)):
                 outputs = model(pixel_values=images, labels=hf_labels)
                 loss = outputs.loss / grad_accumulation
+
+            # One-time sanity check after first forward pass
+            if epoch == 1 and step == 0:
+                print("\n=== SANITY CHECK (epoch 1, step 0) ===")
+                # --- Inputs ---
+                print(f"  [input] images: {images.shape} {images.dtype}")
+                print(f"  [input] mean/std: {images.mean().item():.3f}/{images.std().item():.3f}  (expect ~0.0/1.0)")
+                print(f"  [input] min/max:  {images.min().item():.3f}/{images.max().item():.3f}  (expect ~-2.1/+2.6)")
+                total_boxes = sum(len(lbl["boxes"]) for lbl in hf_labels)
+                all_labels_list = [lbl["class_labels"] for lbl in hf_labels if len(lbl["class_labels"])]
+                if all_labels_list:
+                    all_cls = torch.cat(all_labels_list)
+                    unique, counts = all_cls.unique(return_counts=True)
+                    print(f"  [input] boxes total: {total_boxes}  label dist: { {int(k): int(v) for k, v in zip(unique, counts)} }  (expect {{0: N}})")
+                if total_boxes:
+                    all_boxes_cxcywh = torch.cat([lbl["boxes"] for lbl in hf_labels if len(lbl["boxes"])])
+                    print(f"  [input] boxes cxcywh range: cx=[{all_boxes_cxcywh[:,0].min():.2f},{all_boxes_cxcywh[:,0].max():.2f}] "
+                          f"cy=[{all_boxes_cxcywh[:,1].min():.2f},{all_boxes_cxcywh[:,1].max():.2f}] "
+                          f"w=[{all_boxes_cxcywh[:,2].min():.3f},{all_boxes_cxcywh[:,2].max():.3f}]  (expect all in 0-1)")
+                # --- Outputs ---
+                print(f"  [output] loss: {outputs.loss.item():.4f}")
+                loss_dict = getattr(outputs, "loss_dict", {})
+                if loss_dict:
+                    print(f"  [output] loss_dict keys: {list(loss_dict.keys())}")
+                    for k, v in loss_dict.items():
+                        print(f"    {k}: {v.item():.4f}")
+                # Predicted logits: shape [B, num_queries, num_classes]
+                if hasattr(outputs, "logits"):
+                    logits = outputs.logits  # [B, Q, C]
+                    scores = logits.sigmoid().max(dim=-1).values  # [B, Q]
+                    print(f"  [output] logits shape: {logits.shape}  (expect [B, 300, 80])")
+                    print(f"  [output] max pred score per image: {scores.max(dim=-1).values.tolist()}")
+                print("=======================================\n", flush=True)
 
             if scaler:
                 scaler.scale(loss).backward()
