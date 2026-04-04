@@ -268,7 +268,12 @@ class MixedDetectionDataset(Dataset):
         if self.augment:
             image, boxes, labels = _apply_augmentations(image, boxes, labels, self.input_size)
         else:
+            orig_h, orig_w = image.shape[:2]
             image = cv2.resize(image, (self.input_size, self.input_size))
+            if len(boxes):
+                scale_x = self.input_size / max(orig_w, 1)
+                scale_y = self.input_size / max(orig_h, 1)
+                boxes = boxes * np.array([scale_x, scale_y, scale_x, scale_y], dtype=np.float32)
 
         # BGR -> RGB, normalize with ImageNet stats (RT-DETR backbone pretrained on ImageNet)
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
