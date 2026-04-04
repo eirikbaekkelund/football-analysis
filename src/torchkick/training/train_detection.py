@@ -288,6 +288,7 @@ def train_detection(
         # Validation
         model.eval()
         val_loss = 0.0
+        val_sanity_done = False
         with torch.no_grad():
             for images, targets in val_loader:
                 images = images.to(dev)
@@ -310,10 +311,31 @@ def train_detection(
                     out = model(pixel_values=images, labels=hf_labels)
                 val_loss += out.loss.item()
 
+                if epoch == 1 and not val_sanity_done:
+                    val_sanity_done = True
+                    print("\n=== VAL SANITY CHECK (epoch 1, first val batch) ===")
+                    print(f"  [input] images: {images.shape}  mean/std: {images.mean().item():.3f}/{images.std().item():.3f}")
+                    total_boxes = sum(len(lbl["boxes"]) for lbl in hf_labels)
+                    all_labels_list = [lbl["class_labels"] for lbl in hf_labels if len(lbl["class_labels"])]
+                    if all_labels_list:
+                        all_cls = torch.cat(all_labels_list)
+                        unique, counts = all_cls.unique(return_counts=True)
+                        print(f"  [input] boxes: {total_boxes}  label dist: { {int(k): int(v) for k, v in zip(unique, counts)} }")
+                    print(f"  [output] val loss: {out.loss.item():.4f}")
+                    loss_dict = getattr(out, "loss_dict", {})
+                    if loss_dict:
+                        for k, v in loss_dict.items():
+                            print(f"    {k}: {v.item():.4f}")
+                    if hasattr(out, "logits"):
+                        scores = out.logits.sigmoid().max(dim=-1).values
+                        print(f"  [output] logits: {out.logits.shape}  max scores: {scores.max(dim=-1).values.tolist()}")
+                    print("====================================================\n", flush=True)
+
         avg_train = train_loss / len(train_loader)
         avg_val = val_loss / len(val_loader)
         elapsed = time.time() - t0
-        print(f"Epoch {epoch}/{epochs} | train={avg_train:.4f} val={avg_val:.4f} | {elapsed:.1f}s")
+        cur_lr = optimizer.param_groups[0]["lr"]
+        print(f"Epoch {epoch}/{epochs} | train={avg_train:.4f} val={avg_val:.4f} | lr={cur_lr:.2e} | {elapsed:.1f}s")
 
         if run:
             run.log({"train_loss": avg_train, "val_loss": avg_val, "epoch": epoch})
