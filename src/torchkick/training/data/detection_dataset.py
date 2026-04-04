@@ -124,7 +124,11 @@ def _load_soccernet_dir_source(root_dir: str) -> List[Dict[str, Any]]:
                 parts = line.strip().split(",")
                 if len(parts) < 6:
                     continue
-                fid, _, x, y, w, h = int(parts[0]), parts[1], float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])
+                fid = int(parts[0])
+                x, y, w, h = float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])
+                # conf=0 means "ignore" region in MOT format — skip
+                if len(parts) >= 7 and parts[6].strip() == "0":
+                    continue
                 frames.setdefault(fid, []).append([x, y, x + w, y + h])
         for fid, boxes in frames.items():
             valid_boxes = [b for b in boxes if b[2] > b[0] and b[3] > b[1]]

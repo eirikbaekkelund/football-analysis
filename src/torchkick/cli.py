@@ -486,7 +486,7 @@ def train() -> None:
 @click.option("--epochs", "-e", type=int, default=300)
 @click.option("--batch-size", "-b", type=int, default=8)
 @click.option("--lr", type=float, default=5e-5)
-@click.option("--num-classes", type=int, default=2, help="Number of output classes. Default 2 = person + ball.")
+@click.option("--num-classes", type=int, default=80, help="Number of output classes. Default 80 = full COCO (reuses pretrained heads).")
 @click.option("--save-dir", type=str, default="weights/detection/")
 @click.option("--no-compile", is_flag=True, help="Disable torch.compile.")
 @click.option("--fsdp", is_flag=True, help="Enable FSDP for multi-GPU training.")
@@ -550,9 +550,10 @@ def train_detection_cmd(
     if soccernet_dir:
         data_config.append({"type": "soccernet_dir", "path": soccernet_dir})
         click.echo(f"  + SoccerNet dir: {soccernet_dir}")
-    # person+ball label map for Roboflow football-players-detection dataset:
-    # 0=supercategory (drop), 1=ball→1, 2=goalkeeper→0, 3=player→0, 4=referee→0
-    label_map = {0: -1, 1: 1, 2: 0, 3: 0, 4: 0} if person_ball else None
+    # Map to COCO class IDs so pretrained heads are reused (no reinitialization):
+    # Roboflow: 0=supercategory(drop), 1=ball→32(sports ball), 2/3/4=persons→0(person)
+    # This keeps the pretrained COCO classification heads intact.
+    label_map = {0: -1, 1: 32, 2: 0, 3: 0, 4: 0} if person_ball else None
     if roboflow_json:
         src = {"type": "coco_json", "path": roboflow_json, "images_dir": roboflow_images}
         if label_map:
