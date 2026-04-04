@@ -550,10 +550,10 @@ def train_detection_cmd(
     if soccernet_dir:
         data_config.append({"type": "soccernet_dir", "path": soccernet_dir})
         click.echo(f"  + SoccerNet dir: {soccernet_dir}")
-    # Map to COCO class IDs so pretrained heads are reused (no reinitialization):
-    # Roboflow: 0=supercategory(drop), 1=ball→32(sports ball), 2/3/4=persons→0(person)
-    # This keeps the pretrained COCO classification heads intact.
-    label_map = {0: -1, 1: 32, 2: 0, 3: 0, 4: 0} if person_ball else None
+    # Map all person sub-types to COCO class 0 (person); drop ball and supercategory.
+    # Ball detection is handled by a separate YOLOv11n model — mixing them causes
+    # partial-label noise (SoccerNet has no ball annotations).
+    label_map = {0: -1, 1: -1, 2: 0, 3: 0, 4: 0} if person_ball else None
     if roboflow_json:
         src = {"type": "coco_json", "path": roboflow_json, "images_dir": roboflow_images}
         if label_map:
