@@ -256,10 +256,8 @@ def train_detection(
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
                     optimizer.step()
-                if hasattr(scheduler, "step") and isinstance(scheduler, torch.optim.lr_scheduler.LRScheduler):
-                    pass  # CosineAnnealingLR steps per epoch
-                else:
-                    scheduler.step()
+                if not isinstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR):
+                    scheduler.step()  # transformers cosine-with-warmup steps per optimizer update
                 optimizer.zero_grad()
 
                 update = (step + 1) // grad_accumulation
