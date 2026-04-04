@@ -550,8 +550,9 @@ def train_detection_cmd(
     if soccernet_dir:
         data_config.append({"type": "soccernet_dir", "path": soccernet_dir})
         click.echo(f"  + SoccerNet dir: {soccernet_dir}")
-    # person+ball label map: player/goalkeeper/referee → 0, ball → 1
-    label_map = {1: 0, 2: 0, 3: 0, 4: 1} if person_ball else None
+    # person+ball label map for Roboflow football-players-detection dataset:
+    # 0=supercategory (drop), 1=ball→1, 2=goalkeeper→0, 3=player→0, 4=referee→0
+    label_map = {0: -1, 1: 1, 2: 0, 3: 0, 4: 0} if person_ball else None
     if roboflow_json:
         src = {"type": "coco_json", "path": roboflow_json, "images_dir": roboflow_images}
         if label_map:
