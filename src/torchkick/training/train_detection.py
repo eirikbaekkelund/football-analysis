@@ -186,6 +186,25 @@ def train_detection(
 
         for step, (images, targets) in enumerate(train_loader):
             images = images.to(dev)
+
+            # One-time sanity check on first batch of first epoch
+            if epoch == 1 and step == 0:
+                print("\n=== SANITY CHECK (epoch 1, step 0) ===")
+                print(f"  images shape: {images.shape}  dtype: {images.dtype}")
+                print(f"  images mean/std: {images.mean().item():.3f} / {images.std().item():.3f}  (expect ~0.0/1.0 if ImageNet-normalized)")
+                print(f"  images min/max:  {images.min().item():.3f} / {images.max().item():.3f}  (expect ~-2.1 / +2.6)")
+                total_boxes = sum(len(t["boxes"]) for t in targets)
+                label_tensors = [t["labels"] for t in targets if len(t["labels"])]
+                if label_tensors:
+                    all_labels = torch.cat(label_tensors)
+                    unique, counts = all_labels.unique(return_counts=True)
+                    print(f"  total boxes in batch: {total_boxes}")
+                    print(f"  label distribution: { {int(k): int(v) for k, v in zip(unique, counts)} }  (expect {{0: N}} for person-only)")
+                if total_boxes:
+                    all_boxes = torch.cat([t["boxes"] for t in targets if len(t["boxes"])])
+                    print(f"  boxes xyxy range: x=[{all_boxes[:,0].min():.1f},{all_boxes[:,2].max():.1f}] y=[{all_boxes[:,1].min():.1f},{all_boxes[:,3].max():.1f}]  (expect 0-640)")
+                print("=======================================\n", flush=True)
+
             # Build HuggingFace-compatible labels
             hf_labels = []
             for t in targets:
