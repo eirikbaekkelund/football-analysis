@@ -249,7 +249,21 @@ def train_detection(
 
                 update = (step + 1) // grad_accumulation
                 if update % 100 == 0:
-                    print(f"  [{epoch}/{epochs}] update {update} loss={loss.item() * grad_accumulation:.4f}", flush=True)
+                    cur_lr = optimizer.param_groups[0]["lr"]
+                    loss_dict = getattr(outputs, "loss_dict", {})
+                    loss_cls = loss_dict.get("loss_vfl", loss_dict.get("loss_ce", float("nan")))
+                    loss_bbox = loss_dict.get("loss_bbox", float("nan"))
+                    loss_giou = loss_dict.get("loss_giou", float("nan"))
+                    if hasattr(loss_cls, "item"): loss_cls = loss_cls.item()
+                    if hasattr(loss_bbox, "item"): loss_bbox = loss_bbox.item()
+                    if hasattr(loss_giou, "item"): loss_giou = loss_giou.item()
+                    print(
+                        f"  [{epoch}/{epochs}] update {update} | "
+                        f"loss={loss.item() * grad_accumulation:.4f} "
+                        f"cls={loss_cls:.3f} bbox={loss_bbox:.3f} giou={loss_giou:.3f} | "
+                        f"lr={cur_lr:.2e}",
+                        flush=True,
+                    )
 
             train_loss += loss.item() * grad_accumulation
 
