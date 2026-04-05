@@ -482,11 +482,21 @@ def train() -> None:
     default=None,
     help="Directory containing CVAT images (required when --cvat-json is given).",
 )
-@click.option("--person-ball", is_flag=True, default=True, help="Remap all person categories (player/goalkeeper/referee) → 0, ball → 1. Recommended.")
+@click.option(
+    "--person-ball",
+    is_flag=True,
+    default=True,
+    help="Remap all person categories (player/goalkeeper/referee) → 0, ball → 1. Recommended.",
+)
 @click.option("--epochs", "-e", type=int, default=300)
 @click.option("--batch-size", "-b", type=int, default=8)
 @click.option("--lr", type=float, default=5e-5)
-@click.option("--num-classes", type=int, default=80, help="Number of output classes. Default 80 = full COCO (reuses pretrained heads).")
+@click.option(
+    "--num-classes",
+    type=int,
+    default=80,
+    help="Number of output classes. Default 80 = full COCO (reuses pretrained heads).",
+)
 @click.option("--save-dir", type=str, default="weights/detection/")
 @click.option("--no-compile", is_flag=True, help="Disable torch.compile.")
 @click.option("--fsdp", is_flag=True, help="Enable FSDP for multi-GPU training.")

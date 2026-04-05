@@ -33,6 +33,7 @@ set -euo pipefail
 REPO_URL="https://github.com/eirikbaekkelund/torchkick.git"
 WORKSPACE="${WORKSPACE:-/workspace}"
 REPO_DIR="$WORKSPACE/torchkick"
+LOG_FILE="$WORKSPACE/torchkick_train.log"
 
 # Defaults
 ROBOFLOW_ONLY=0
@@ -63,6 +64,37 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+
+# ── Self-detach: survive SSH disconnects ─────────────────────────────────────
+# Re-exec inside tmux (reattachable) or nohup (log-only) so the job lives past
+# terminal close. Skip when already detached or running non-interactively.
+if [[ "${TORCHKICK_DETACHED:-0}" != "1" ]] && [[ -t 1 ]]; then
+    export TORCHKICK_DETACHED=1
+    if command -v tmux &>/dev/null; then
+        SESSION="torchkick_train"
+        # Kill any stale session with the same name
+        tmux kill-session -t "$SESSION" 2>/dev/null || true
+        tmux new-session -d -s "$SESSION" \
+            "bash $(realpath "$0") $* 2>&1 | tee '$LOG_FILE'; echo '=== DONE ==='"
+        echo "Training started in tmux session '$SESSION'"
+        echo "  Re-attach:  tmux attach -t $SESSION"
+        echo "  Tail log:   tail -f $LOG_FILE"
+        exit 0
+    else
+        nohup bash "$(realpath "$0")" "$@" > "$LOG_FILE" 2>&1 &
+        echo $! > "$WORKSPACE/torchkick_train.pid"
+        echo "Training started in background (PID $!)"
+        echo "  Tail log:   tail -f $LOG_FILE"
+        echo "  Check:      kill -0 \$(cat $WORKSPACE/torchkick_train.pid) && echo running"
+        exit 0
+    fi
+fi
+
+# Redirect all output to log file when running detached (nohup path)
+if [[ "${TORCHKICK_DETACHED:-0}" == "1" ]] && [[ ! -t 1 ]]; then
+    # Already captured by nohup redirect; just add timestamps to stdout
+    exec > >(while IFS= read -r line; do echo "[$(date '+%H:%M:%S')] $line"; done) 2>&1
+fi
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 log() { echo -e "\n\033[1;36m==> $*\033[0m"; }

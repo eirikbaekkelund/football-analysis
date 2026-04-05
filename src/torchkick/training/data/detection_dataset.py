@@ -175,6 +175,7 @@ def _apply_augmentations(
         return image, boxes, labels
 
     import warnings
+
     labels_list = labels.tolist() if len(labels) else []
     if len(boxes):
         with warnings.catch_warnings():
@@ -232,7 +233,9 @@ class MixedDetectionDataset(Dataset):
             elif src_type == "soccernet_dir":
                 self._samples.extend(_load_soccernet_dir_source(src["path"]))
             else:
-                raise ValueError(f"Unknown source type: {src_type!r}. Use 'coco_json', 'soccernet_zip', or 'soccernet_dir'.")
+                raise ValueError(
+                    f"Unknown source type: {src_type!r}. Use 'coco_json', 'soccernet_zip', or 'soccernet_dir'."
+                )
 
     def __len__(self) -> int:
         return len(self._samples)
@@ -242,6 +245,7 @@ class MixedDetectionDataset(Dataset):
             import fsspec
             from io import BytesIO
             from PIL import Image as PILImage
+
             img_path = f"zip://{sample['seq_name']}/img1/{sample['frame_id']:06d}.jpg::{sample['zip_path']}"
             with fsspec.open(img_path, "rb") as f:
                 img = np.array(PILImage.open(BytesIO(f.read())).convert("RGB"))

@@ -132,15 +132,28 @@ def train_detection(
     _, train_ds = random_split(aug_dataset, [n_val, n_train], generator=generator2)
 
     import os
+
     n_cpu = os.cpu_count() or 4
     n_workers = min(n_cpu, 16)
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=n_workers,
-        pin_memory=True, persistent_workers=True, prefetch_factor=4, collate_fn=_collate_fn,
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=n_workers,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
+        collate_fn=_collate_fn,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, num_workers=max(n_workers // 2, 2),
-        pin_memory=True, persistent_workers=True, prefetch_factor=2, collate_fn=_collate_fn,
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=max(n_workers // 2, 2),
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
+        collate_fn=_collate_fn,
     )
 
     print(f"Train: {n_train} samples | Val: {n_val} samples")
@@ -221,12 +234,16 @@ def train_detection(
                 if all_labels_list:
                     all_cls = torch.cat(all_labels_list)
                     unique, counts = all_cls.unique(return_counts=True)
-                    print(f"  [input] boxes total: {total_boxes}  label dist: { {int(k): int(v) for k, v in zip(unique, counts)} }  (expect {{0: N}})")
+                    print(
+                        f"  [input] boxes total: {total_boxes}  label dist: { {int(k): int(v) for k, v in zip(unique, counts)} }  (expect {{0: N}})"
+                    )
                 if total_boxes:
                     all_boxes_cxcywh = torch.cat([lbl["boxes"] for lbl in hf_labels if len(lbl["boxes"])])
-                    print(f"  [input] boxes cxcywh range: cx=[{all_boxes_cxcywh[:,0].min():.2f},{all_boxes_cxcywh[:,0].max():.2f}] "
-                          f"cy=[{all_boxes_cxcywh[:,1].min():.2f},{all_boxes_cxcywh[:,1].max():.2f}] "
-                          f"w=[{all_boxes_cxcywh[:,2].min():.3f},{all_boxes_cxcywh[:,2].max():.3f}]  (expect all in 0-1)")
+                    print(
+                        f"  [input] boxes cxcywh range: cx=[{all_boxes_cxcywh[:,0].min():.2f},{all_boxes_cxcywh[:,0].max():.2f}] "
+                        f"cy=[{all_boxes_cxcywh[:,1].min():.2f},{all_boxes_cxcywh[:,1].max():.2f}] "
+                        f"w=[{all_boxes_cxcywh[:,2].min():.3f},{all_boxes_cxcywh[:,2].max():.3f}]  (expect all in 0-1)"
+                    )
                 # --- Outputs ---
                 print(f"  [output] loss: {outputs.loss.item():.4f}")
                 loss_dict = getattr(outputs, "loss_dict", {})
@@ -267,9 +284,12 @@ def train_detection(
                     loss_cls = loss_dict.get("loss_vfl", loss_dict.get("loss_ce", float("nan")))
                     loss_bbox = loss_dict.get("loss_bbox", float("nan"))
                     loss_giou = loss_dict.get("loss_giou", float("nan"))
-                    if hasattr(loss_cls, "item"): loss_cls = loss_cls.item()
-                    if hasattr(loss_bbox, "item"): loss_bbox = loss_bbox.item()
-                    if hasattr(loss_giou, "item"): loss_giou = loss_giou.item()
+                    if hasattr(loss_cls, "item"):
+                        loss_cls = loss_cls.item()
+                    if hasattr(loss_bbox, "item"):
+                        loss_bbox = loss_bbox.item()
+                    if hasattr(loss_giou, "item"):
+                        loss_giou = loss_giou.item()
                     print(
                         f"  [{epoch}/{epochs}] update {update} | "
                         f"loss={loss.item() * grad_accumulation:.4f} "
@@ -312,13 +332,17 @@ def train_detection(
                 if epoch == 1 and not val_sanity_done:
                     val_sanity_done = True
                     print("\n=== VAL SANITY CHECK (epoch 1, first val batch) ===")
-                    print(f"  [input] images: {images.shape}  mean/std: {images.mean().item():.3f}/{images.std().item():.3f}")
+                    print(
+                        f"  [input] images: {images.shape}  mean/std: {images.mean().item():.3f}/{images.std().item():.3f}"
+                    )
                     total_boxes = sum(len(lbl["boxes"]) for lbl in hf_labels)
                     all_labels_list = [lbl["class_labels"] for lbl in hf_labels if len(lbl["class_labels"])]
                     if all_labels_list:
                         all_cls = torch.cat(all_labels_list)
                         unique, counts = all_cls.unique(return_counts=True)
-                        print(f"  [input] boxes: {total_boxes}  label dist: { {int(k): int(v) for k, v in zip(unique, counts)} }")
+                        print(
+                            f"  [input] boxes: {total_boxes}  label dist: { {int(k): int(v) for k, v in zip(unique, counts)} }"
+                        )
                     print(f"  [output] val loss: {out.loss.item():.4f}")
                     loss_dict = getattr(out, "loss_dict", {})
                     if loss_dict:
@@ -326,7 +350,9 @@ def train_detection(
                             print(f"    {k}: {v.item():.4f}")
                     if hasattr(out, "logits"):
                         scores = out.logits.sigmoid().max(dim=-1).values
-                        print(f"  [output] logits: {out.logits.shape}  max scores: {scores.max(dim=-1).values.tolist()}")
+                        print(
+                            f"  [output] logits: {out.logits.shape}  max scores: {scores.max(dim=-1).values.tolist()}"
+                        )
                     print("====================================================\n", flush=True)
 
         avg_train = train_loss / len(train_loader)
