@@ -498,7 +498,7 @@ def train() -> None:
 )
 @click.option("--epochs", "-e", type=int, default=300)
 @click.option("--batch-size", "-b", type=int, default=8)
-@click.option("--lr", type=float, default=5e-5)
+@click.option("--lr", type=float, default=1e-5)
 @click.option(
     "--num-classes",
     type=int,
