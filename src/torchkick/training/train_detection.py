@@ -72,7 +72,7 @@ def train_detection(
     save_dir: str = "weights/detection/",
     device: Optional[str] = None,
     wandb_project: Optional[str] = None,
-    conf_threshold: float = 0.3,
+    conf_threshold: float = 0.1,
 ) -> str:
     """
     Train RT-DETR-X on mixed soccer detection data.
@@ -162,6 +162,21 @@ def train_detection(
 
     # Model
     model, processor = _get_model_and_processor(model_name, num_labels=num_labels)
+
+    # Initialize classification head biases to focal-loss prior (≈ -4.6).
+    # Keeps initial sigmoid outputs near 0.01, stabilising Hungarian matching
+    # when the head is randomly reinitialised (num_labels != COCO 80).
+    import math
+
+    prior_bias = -math.log((1 - 0.01) / 0.01)  # ≈ -4.6
+    for name, module in model.named_modules():
+        if hasattr(module, "bias") and module.bias is not None:
+            if "class_embed" in name and module.bias.shape[0] == num_labels:
+                torch.nn.init.constant_(module.bias, prior_bias)
+    enc = getattr(getattr(model, "model", model), "enc_score_head", None)
+    if enc is not None and enc.bias is not None and enc.bias.shape[0] == num_labels:
+        torch.nn.init.constant_(enc.bias, prior_bias)
+    print(f"Classification head biases initialised to {prior_bias:.3f} (focal prior p=0.01)")
 
     if use_fsdp:
         try:
