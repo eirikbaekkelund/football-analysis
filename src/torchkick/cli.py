@@ -508,8 +508,8 @@ def train() -> None:
 @click.option(
     "--num-classes",
     type=int,
-    default=2,
-    help="Number of output classes. Default 2 = player (0) + ball (1).",
+    default=1,
+    help="Number of output classes. Default 1 = player only (SoccerNet has no per-class annotation).",
 )
 @click.option(
     "--conf-threshold",

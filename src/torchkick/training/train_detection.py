@@ -59,7 +59,7 @@ def _collate_fn(batch):
 def train_detection(
     data_config: List[Dict[str, Any]],
     model_name: str = "PekingU/rtdetr_r101vd",
-    num_labels: int = 2,
+    num_labels: int = 1,
     epochs: int = 50,
     batch_size: int = 32,
     learning_rate: float = 1e-5,
