@@ -85,22 +85,28 @@ def _load_soccernet_source(zip_path: str) -> List[Dict[str, Any]]:
     except ImportError:
         raise ImportError("SoccerNet source requires torchkick[soccernet]")
 
+    # SoccerNet class IDs: 1=player, 2=goalkeeper, 3=referee → label 0; 4=ball → label 1
+    _CLASS_TO_LABEL = {1: 0, 2: 0, 3: 0, 4: 1}
     ds = PlayerTrackingDataset(zip_path, bbox_format="xyxy")
     samples = []
     for seq_name, frame_id in ds.samples:
         df = ds.annotations[seq_name]
-        frame_rows = df[df["frame"] == frame_id]
+        frame_rows = df[(df["frame"] == frame_id) & (df["class_id"].isin(_CLASS_TO_LABEL))]
         boxes = []
+        labels = []
         for _, row in frame_rows.iterrows():
             x, y, w, h = float(row["x"]), float(row["y"]), float(row["w"]), float(row["h"])
             boxes.append([x, y, x + w, y + h])
+            labels.append(_CLASS_TO_LABEL[int(row["class_id"])])
+        if not boxes:
+            continue
         samples.append(
             {
                 "zip_path": zip_path,
                 "seq_name": seq_name,
                 "frame_id": int(frame_id),
                 "boxes": boxes,
-                "labels": [0] * len(boxes),
+                "labels": labels,
             }
         )
     return samples
@@ -118,6 +124,8 @@ def _load_soccernet_dir_source(root_dir: str) -> List[Dict[str, Any]]:
         seq_name = gt_file.parts[-3]
         img_dir = gt_file.parent.parent / "img1"
         # Parse MOT gt.txt: frame,id,x,y,w,h,conf,class,visibility
+        # SoccerNet class IDs: 1=player, 2=goalkeeper, 3=referee → label 0; 4=ball → label 1
+        _CLASS_TO_LABEL = {"1": 0, "2": 0, "3": 0, "4": 1}
         frames: Dict[int, List] = {}
         with open(gt_file) as f:
             for line in f:
@@ -129,13 +137,18 @@ def _load_soccernet_dir_source(root_dir: str) -> List[Dict[str, Any]]:
                 # conf=0 means "ignore" region in MOT format — skip
                 if len(parts) >= 7 and parts[6].strip() == "0":
                     continue
-                frames.setdefault(fid, []).append([x, y, x + w, y + h])
-        for fid, boxes in frames.items():
-            valid_boxes = [b for b in boxes if b[2] > b[0] and b[3] > b[1]]
-            if not valid_boxes:
+                class_str = parts[7].strip() if len(parts) >= 8 else "1"
+                if class_str not in _CLASS_TO_LABEL:
+                    continue
+                label = _CLASS_TO_LABEL[class_str]
+                frames.setdefault(fid, []).append([x, y, x + w, y + h, label])
+        for fid, entries in frames.items():
+            valid = [(e[:4], e[4]) for e in entries if e[2] > e[0] and e[3] > e[1]]
+            if not valid:
                 continue
             img_path = str(img_dir / f"{fid:06d}.jpg")
-            samples.append({"image_path": img_path, "boxes": valid_boxes, "labels": [0] * len(valid_boxes)})
+            valid_boxes, valid_labels = zip(*valid)
+            samples.append({"image_path": img_path, "boxes": list(valid_boxes), "labels": list(valid_labels)})
     return samples
 
 

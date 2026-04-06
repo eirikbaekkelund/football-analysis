@@ -508,8 +508,8 @@ def train() -> None:
 @click.option(
     "--num-classes",
     type=int,
-    default=1,
-    help="Number of output classes. Default 1 = player-only single-class detector.",
+    default=2,
+    help="Number of output classes. Default 2 = player (0) + ball (1).",
 )
 @click.option(
     "--conf-threshold",

@@ -59,7 +59,7 @@ def _collate_fn(batch):
 def train_detection(
     data_config: List[Dict[str, Any]],
     model_name: str = "PekingU/rtdetr_r101vd",
-    num_labels: int = 1,
+    num_labels: int = 2,
     epochs: int = 50,
     batch_size: int = 32,
     learning_rate: float = 1e-5,
@@ -252,7 +252,7 @@ def train_detection(
                     all_cls = torch.cat(all_labels_list)
                     unique, counts = all_cls.unique(return_counts=True)
                     print(
-                        f"  [input] boxes total: {total_boxes}  label dist: { {int(k): int(v) for k, v in zip(unique, counts)} }  (expect {{0: N}})"
+                        f"  [input] boxes total: {total_boxes}  label dist: { {int(k): int(v) for k, v in zip(unique, counts)} }  (expect {{0: players, 1: balls}})"
                     )
                 if total_boxes:
                     all_boxes_cxcywh = torch.cat([lbl["boxes"] for lbl in hf_labels if len(lbl["boxes"])])
@@ -272,7 +272,7 @@ def train_detection(
                 if hasattr(outputs, "logits"):
                     logits = outputs.logits  # [B, Q, C]
                     scores = logits.sigmoid().max(dim=-1).values  # [B, Q]
-                    print(f"  [output] logits shape: {logits.shape}  (expect [B, ~460, {num_labels}] in train mode)")
+                    print(f"  [output] logits shape: {logits.shape}  (expect [B, ~400, {num_labels}] in train mode)")
                     print(f"  [output] max pred score per image: {scores.max(dim=-1).values.tolist()}")
                 print("=======================================\n", flush=True)
 
