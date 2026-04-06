@@ -59,18 +59,20 @@ def _collate_fn(batch):
 def train_detection(
     data_config: List[Dict[str, Any]],
     model_name: str = "PekingU/rtdetr_r101vd",
-    num_labels: int = 80,
+    num_labels: int = 1,
     epochs: int = 50,
-    batch_size: int = 8,
+    batch_size: int = 32,
     learning_rate: float = 1e-5,
+    lr_backbone_scale: float = 0.1,
     warmup_ratio: float = 0.05,
-    grad_accumulation: int = 4,
+    grad_accumulation: int = 2,
     val_split: float = 0.15,
     use_fsdp: bool = False,
     compile_model: bool = False,
     save_dir: str = "weights/detection/",
     device: Optional[str] = None,
     wandb_project: Optional[str] = None,
+    conf_threshold: float = 0.3,
 ) -> str:
     """
     Train RT-DETR-X on mixed soccer detection data.
@@ -175,8 +177,16 @@ def train_detection(
         model = torch.compile(model, mode="reduce-overhead")
         print("Model compiled with torch.compile.")
 
-    # Optimizer & Scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    # Optimizer & Scheduler — backbone gets 10x lower LR to prevent catastrophic forgetting
+    backbone_params = [p for n, p in model.named_parameters() if "backbone" in n]
+    other_params = [p for n, p in model.named_parameters() if "backbone" not in n]
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": backbone_params, "lr": learning_rate * lr_backbone_scale},
+            {"params": other_params, "lr": learning_rate},
+        ],
+        weight_decay=1e-4,
+    )
     total_steps = (n_train // (batch_size * grad_accumulation)) * epochs
     warmup_steps = int(total_steps * warmup_ratio)
     try:
@@ -262,7 +272,7 @@ def train_detection(
                 if hasattr(outputs, "logits"):
                     logits = outputs.logits  # [B, Q, C]
                     scores = logits.sigmoid().max(dim=-1).values  # [B, Q]
-                    print(f"  [output] logits shape: {logits.shape}  (expect [B, 300, 80])")
+                    print(f"  [output] logits shape: {logits.shape}  (expect [B, ~460, {num_labels}] in train mode)")
                     print(f"  [output] max pred score per image: {scores.max(dim=-1).values.tolist()}")
                 print("=======================================\n", flush=True)
 
@@ -281,7 +291,11 @@ def train_detection(
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
                     optimizer.step()
                 if not isinstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR):
-                    scheduler.step()  # transformers cosine-with-warmup steps per optimizer update
+                    import warnings
+
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("ignore", "Detected call of `lr_scheduler.step()`")
+                        scheduler.step()
                 optimizer.zero_grad()
 
                 update = (step + 1) // grad_accumulation
@@ -336,9 +350,9 @@ def train_detection(
                     out = model(pixel_values=images, labels=hf_labels)
                 val_loss += out.loss.item()
 
-                # Accumulate mAP
+                # Accumulate mAP — use class-0 (person) score directly; force predicted label=0
                 if map_metric is not None and hasattr(out, "logits") and hasattr(out, "pred_boxes"):
-                    scores_batch = out.logits.sigmoid()  # [B, 300, num_classes]
+                    scores_batch = out.logits.sigmoid()  # [B, 300, num_labels]
                     boxes_batch = out.pred_boxes  # [B, 300, 4] normalized cxcywh
                     preds_map = []
                     targets_map = []
@@ -349,13 +363,13 @@ def train_detection(
                         x2 = (cx + bw / 2) * input_size
                         y2 = (cy + bh / 2) * input_size
                         abs_boxes = torch.stack([x1, y1, x2, y2], dim=-1)
-                        max_scores, pred_labels = scores_img.max(dim=-1)
-                        keep = max_scores > 0.05
+                        person_scores = scores_img[:, 0]  # class-0 (person) confidence
+                        keep = person_scores > conf_threshold
                         preds_map.append(
                             {
                                 "boxes": abs_boxes[keep].cpu(),
-                                "scores": max_scores[keep].cpu(),
-                                "labels": pred_labels[keep].cpu(),
+                                "scores": person_scores[keep].cpu(),
+                                "labels": torch.zeros(keep.sum(), dtype=torch.long),
                             }
                         )
                         targets_map.append(
@@ -386,9 +400,10 @@ def train_detection(
                         for k, v in loss_dict.items():
                             print(f"    {k}: {v.item():.4f}")
                     if hasattr(out, "logits"):
-                        scores = out.logits.sigmoid().max(dim=-1).values
+                        person_scores_val = out.logits.sigmoid()[:, :, 0]  # class-0 (person)
                         print(
-                            f"  [output] logits: {out.logits.shape}  max scores: {scores.max(dim=-1).values.tolist()}"
+                            f"  [output] logits: {out.logits.shape}  (expect [B, 300, {num_labels}])  "
+                            f"max person score per image: {person_scores_val.max(dim=-1).values.tolist()}"
                         )
                     print("====================================================\n", flush=True)
 

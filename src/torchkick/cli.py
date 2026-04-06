@@ -500,10 +500,22 @@ def train() -> None:
 @click.option("--batch-size", "-b", type=int, default=8)
 @click.option("--lr", type=float, default=1e-5)
 @click.option(
+    "--lr-backbone-scale",
+    type=float,
+    default=0.1,
+    help="Backbone LR multiplier (backbone_lr = lr * scale). 0.1 = 10x lower than decoder. Use 0.0 to freeze.",
+)
+@click.option(
     "--num-classes",
     type=int,
-    default=80,
-    help="Number of output classes. Default 80 = full COCO (reuses pretrained heads).",
+    default=1,
+    help="Number of output classes. Default 1 = player-only single-class detector.",
+)
+@click.option(
+    "--conf-threshold",
+    type=float,
+    default=0.3,
+    help="Person confidence threshold for mAP computation (default 0.3).",
 )
 @click.option("--save-dir", type=str, default="weights/detection/")
 @click.option("--no-compile", is_flag=True, help="Disable torch.compile.")
@@ -520,7 +532,9 @@ def train_detection_cmd(
     epochs: int,
     batch_size: int,
     lr: float,
+    lr_backbone_scale: float,
     num_classes: int,
+    conf_threshold: float,
     save_dir: str,
     no_compile: bool,
     fsdp: bool,
@@ -598,10 +612,12 @@ def train_detection_cmd(
         epochs=epochs,
         batch_size=batch_size,
         learning_rate=lr,
+        lr_backbone_scale=lr_backbone_scale,
         compile_model=not no_compile,
         use_fsdp=fsdp,
         save_dir=save_dir,
         wandb_project=wandb_project,
+        conf_threshold=conf_threshold,
     )
     click.echo(f"Training complete! Best model: {weights}")
 

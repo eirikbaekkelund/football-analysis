@@ -260,6 +260,19 @@ class MixedDetectionDataset(Dataset):
         self.augment = augment
         self._samples: List[Dict[str, Any]] = []
 
+        try:
+            import albumentations as A
+
+            self._letterbox = A.Compose(
+                [
+                    A.LongestMaxSize(max_size=input_size),
+                    A.PadIfNeeded(input_size, input_size, border_mode=cv2.BORDER_CONSTANT, fill=114),
+                ],
+                bbox_params=A.BboxParams(format="pascal_voc", label_fields=["labels"], min_visibility=0.1),
+            )
+        except ImportError:
+            self._letterbox = None
+
         for src in sources:
             src_type = src["type"]
             if src_type == "coco_json":
@@ -395,12 +408,22 @@ class MixedDetectionDataset(Dataset):
             else:
                 image, boxes, labels = _apply_augmentations(image, boxes, labels, self.input_size)
         else:
-            orig_h, orig_w = image.shape[:2]
-            image = cv2.resize(image, (self.input_size, self.input_size))
-            if len(boxes):
-                scale_x = self.input_size / max(orig_w, 1)
-                scale_y = self.input_size / max(orig_h, 1)
-                boxes = boxes * np.array([scale_x, scale_y, scale_x, scale_y], dtype=np.float32)
+            if self._letterbox is not None:
+                result = self._letterbox(image=image, bboxes=boxes.tolist(), labels=labels.tolist())
+                image = result["image"]
+                boxes = (
+                    np.array(result["bboxes"], dtype=np.float32)
+                    if result["bboxes"]
+                    else np.zeros((0, 4), dtype=np.float32)
+                )
+                labels = np.array(result["labels"], dtype=np.int64) if result["labels"] else np.zeros(0, dtype=np.int64)
+            else:
+                orig_h, orig_w = image.shape[:2]
+                image = cv2.resize(image, (self.input_size, self.input_size))
+                if len(boxes):
+                    scale_x = self.input_size / max(orig_w, 1)
+                    scale_y = self.input_size / max(orig_h, 1)
+                    boxes = boxes * np.array([scale_x, scale_y, scale_x, scale_y], dtype=np.float32)
 
         # BGR -> RGB, normalize with ImageNet stats (RT-DETR backbone pretrained on ImageNet)
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
