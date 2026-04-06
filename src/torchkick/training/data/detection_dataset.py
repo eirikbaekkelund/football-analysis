@@ -129,7 +129,6 @@ def _load_soccernet_dir_source(root_dir: str) -> List[Dict[str, Any]]:
         # Standard MOT class IDs if present: 1=player, 2=goalkeeper, 3=referee → 0; 4=ball → 1
         _CLASS_TO_LABEL = {"-1": 0, "1": 0, "2": 0, "3": 0, "4": 1}
         frames: Dict[int, List] = {}
-        raw_class_counts: Dict[str, int] = {}
         with open(gt_file) as f:
             for line in f:
                 parts = line.strip().split(",")
@@ -140,13 +139,11 @@ def _load_soccernet_dir_source(root_dir: str) -> List[Dict[str, Any]]:
                 # conf=0 means "ignore" region in MOT format — skip
                 if len(parts) >= 7 and parts[6].strip() == "0":
                     continue
-                class_str = parts[7].strip() if len(parts) >= 8 else "1"
-                raw_class_counts[class_str] = raw_class_counts.get(class_str, 0) + 1
+                class_str = parts[7].strip() if len(parts) >= 8 else "-1"
                 if class_str not in _CLASS_TO_LABEL:
                     continue
                 label = _CLASS_TO_LABEL[class_str]
                 frames.setdefault(fid, []).append([x, y, x + w, y + h, label])
-        print(f"  [soccernet_dir] {seq_name}: raw class_id counts = {dict(sorted(raw_class_counts.items()))}")
         for fid, entries in frames.items():
             valid = [(e[:4], e[4]) for e in entries if e[2] > e[0] and e[3] > e[1]]
             if not valid:
