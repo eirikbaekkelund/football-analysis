@@ -294,7 +294,7 @@ def train_detection(
                     import warnings
 
                     with warnings.catch_warnings():
-                        warnings.filterwarnings("ignore", "Detected call of `lr_scheduler.step()`")
+                        warnings.simplefilter("ignore", UserWarning)
                         scheduler.step()
                 optimizer.zero_grad()
 
@@ -422,7 +422,7 @@ def train_detection(
 
         print(
             f"Epoch {epoch}/{epochs} | train={avg_train:.4f} val={avg_val:.4f} "
-            f"map@0.5={map50:.4f} map={map_all:.4f} | lr={cur_lr:.2e} | {elapsed:.1f}s"
+            f"map@0.5={map50:.4f} map@1.0={map_all:.4f} | lr={cur_lr:.2e} | {elapsed:.1f}s"
         )
 
         if run:
