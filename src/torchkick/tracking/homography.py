@@ -102,6 +102,72 @@ PITCH_LINE_COORDINATES: Dict[str, List[Tuple[int, PitchPoint]]] = {
 PITCH_LINE_COORDINATES["Circle central"] = _get_circle_points(0, 0, CENTER_CIRCLE_RADIUS)
 
 
+# Roboflow 32-keypoint pitch layout (SoccerPitchConfiguration.vertices, 0-indexed).
+# Converted to center-origin meters to match the existing HomographyEstimator coordinate system
+# (x: -52.5 … +52.5 along length, y: -34 … +34 along width).
+# Source: https://github.com/roboflow/sports/blob/main/sports/configs/soccer.py
+# Roboflow raw dimensions: 12000cm × 7000cm, origin at top-left corner.
+# Conversion: x_center = x_raw/100 - 60, y_center = y_raw/100 - 35
+_RF_L = 120.0  # pitch length m
+_RF_W = 70.0  # pitch width m
+_RF_PBW = 41.0  # penalty box width m
+_RF_PBD = 20.15  # penalty box depth m
+_RF_GBW = 18.32  # goal box width m
+_RF_GBD = 5.50  # goal box depth m
+_RF_CCR = 9.15  # centre circle radius m
+_RF_PS = 11.0  # penalty spot distance m
+_RF_HX = _RF_L / 2  # 60.0
+_RF_HY = _RF_W / 2  # 35.0
+
+
+def _rf(x_raw: float, y_raw: float) -> Tuple[float, float]:
+    """Convert Roboflow corner-origin coords to center-origin meters.
+
+    Normalises from the Roboflow 120×70m template to the codebase-standard
+    105×68m coordinate system (HALF_LENGTH=52.5, HALF_WIDTH=34) so that
+    pitch_viz renders correctly.
+    """
+    x_scaled = (x_raw / _RF_L) * PITCH_LENGTH - HALF_LENGTH
+    y_scaled = (y_raw / _RF_W) * PITCH_WIDTH - HALF_WIDTH
+    return (x_scaled, y_scaled)
+
+
+ROBOFLOW_VERTICES: List[Tuple[float, float]] = [
+    _rf(0, 0),  # 0  top-left corner
+    _rf(0, (_RF_W - _RF_PBW) / 2),  # 1  left penalty box top
+    _rf(0, (_RF_W - _RF_GBW) / 2),  # 2  left goal box top
+    _rf(0, (_RF_W + _RF_GBW) / 2),  # 3  left goal box bottom
+    _rf(0, (_RF_W + _RF_PBW) / 2),  # 4  left penalty box bottom
+    _rf(0, _RF_W),  # 5  bottom-left corner
+    _rf(_RF_GBD, (_RF_W - _RF_GBW) / 2),  # 6  left goal box front top
+    _rf(_RF_GBD, (_RF_W + _RF_GBW) / 2),  # 7  left goal box front bottom
+    _rf(_RF_PS, _RF_HY),  # 8  left penalty spot
+    _rf(_RF_PBD, (_RF_W - _RF_PBW) / 2),  # 9  left penalty box front top
+    _rf(_RF_PBD, (_RF_W - _RF_GBW) / 2),  # 10 left penalty box inner top
+    _rf(_RF_PBD, (_RF_W + _RF_GBW) / 2),  # 11 left penalty box inner bottom
+    _rf(_RF_PBD, (_RF_W + _RF_PBW) / 2),  # 12 left penalty box front bottom
+    _rf(_RF_HX, 0),  # 13 halfway line top
+    _rf(_RF_HX, _RF_HY - _RF_CCR),  # 14 centre circle top
+    _rf(_RF_HX, _RF_HY + _RF_CCR),  # 15 centre circle bottom
+    _rf(_RF_HX, _RF_W),  # 16 halfway line bottom
+    _rf(_RF_L - _RF_PBD, (_RF_W - _RF_PBW) / 2),  # 17 right penalty box front top
+    _rf(_RF_L - _RF_PBD, (_RF_W - _RF_GBW) / 2),  # 18 right penalty box inner top
+    _rf(_RF_L - _RF_PBD, (_RF_W + _RF_GBW) / 2),  # 19 right penalty box inner bottom
+    _rf(_RF_L - _RF_PBD, (_RF_W + _RF_PBW) / 2),  # 20 right penalty box front bottom
+    _rf(_RF_L - _RF_PS, _RF_HY),  # 21 right penalty spot
+    _rf(_RF_L - _RF_GBD, (_RF_W - _RF_GBW) / 2),  # 22 right goal box front top
+    _rf(_RF_L - _RF_GBD, (_RF_W + _RF_GBW) / 2),  # 23 right goal box front bottom
+    _rf(_RF_L, 0),  # 24 top-right corner
+    _rf(_RF_L, (_RF_W - _RF_PBW) / 2),  # 25 right penalty box top
+    _rf(_RF_L, (_RF_W - _RF_GBW) / 2),  # 26 right goal box top
+    _rf(_RF_L, (_RF_W + _RF_GBW) / 2),  # 27 right goal box bottom
+    _rf(_RF_L, (_RF_W + _RF_PBW) / 2),  # 28 right penalty box bottom
+    _rf(_RF_L, _RF_W),  # 29 bottom-right corner
+    _rf(_RF_HX - _RF_CCR, _RF_HY),  # 30 centre circle left
+    _rf(_RF_HX + _RF_CCR, _RF_HY),  # 31 centre circle right
+]
+
+
 class CameraPoseKalmanFilter:
     """
     8-DoF Kalman filter in camera pose space [rvec(3), log_scale, velocities(4)].
@@ -409,14 +475,25 @@ class HomographyEstimator:
         dst_points = []
 
         if keypoints.ndim == 2:
-            # ViTPose flat format: [N, 2] pixel coords, confidence [N]
+            # Flat format: [N, 2] pixel coords, confidence [N]
+            # If N <= 32, use Roboflow vertex lookup directly (index → pitch coordinate).
+            # Roboflow dataset has 32 keypoints; older versions may have fewer (e.g. 29).
+            # Fall back to SoccerNet LINE_CLASSES mapping only when N > 32.
+            use_roboflow = len(keypoints) <= len(ROBOFLOW_VERTICES)
+
             for i, (conf, (img_x, img_y)) in enumerate(zip(confidence, keypoints)):
                 if conf < self.confidence_threshold:
                     continue
                 if img_x < 0 or img_x > w or img_y < 0 or img_y > h:
                     continue
-                # Map keypoint index to pitch coordinate via line_classes
-                # Only use keypoints whose index corresponds to a known line class
+
+                if use_roboflow:
+                    px, py = ROBOFLOW_VERTICES[i]
+                    src_points.append([img_x, img_y])
+                    dst_points.append([px, py])
+                    continue
+
+                # SoccerNet LINE_CLASSES mapping
                 if i < len(self.line_classes):
                     class_name = self.line_classes[i]
                     if class_name in PITCH_LINE_COORDINATES:

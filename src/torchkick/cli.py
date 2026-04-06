@@ -374,6 +374,12 @@ def dataset(
     default="yolo",
     help="Pitch keypoint detector backend: 'yolo' (faster) or 'vitpose' (more accurate).",
 )
+@click.option(
+    "--conf-threshold",
+    type=float,
+    default=0.3,
+    help="Detection confidence threshold (default 0.3; lower for early-stage checkpoints).",
+)
 def analyze(
     video: str,
     model: str | None,
@@ -386,6 +392,7 @@ def analyze(
     reid_interval: int,
     pitch_weights: str | None,
     pitch_detector_type: str,
+    conf_threshold: float,
 ) -> None:
     """
     Run full match analysis pipeline.
@@ -420,6 +427,7 @@ def analyze(
         reid_interval=reid_interval,
         pitch_weights=pitch_weights,
         pitch_detector_type=pitch_detector_type,
+        conf_threshold=conf_threshold,
     )
 
     click.echo(f"Analysis complete! Output: {output_path}")

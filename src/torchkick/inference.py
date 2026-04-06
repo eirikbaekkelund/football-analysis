@@ -75,6 +75,7 @@ def load_models(
     reid_weights: Optional[str] = None,
     pitch_weights: Optional[str] = None,
     pitch_detector_type: str = "yolo",
+    conf_threshold: float = 0.3,
 ) -> Tuple:
     """
     Load detection and homography models, and optionally the ReID embedder.
@@ -100,6 +101,8 @@ def load_models(
     if pitch_weights is not None:
         from torchkick.models.pitch import ViTPoseKeypointDetector, YOLOPoseKeypointDetector
 
+        # YOLO does not support MPS; fall back to CPU on Apple Silicon
+        yolo_device = str(device) if str(device) not in ("mps", "mps:0") else "cpu"
         if pitch_detector_type == "vitpose":
             pitch_kp_detector = ViTPoseKeypointDetector(
                 weights_path=pitch_weights,
@@ -108,7 +111,7 @@ def load_models(
         else:
             pitch_kp_detector = YOLOPoseKeypointDetector(
                 weights_path=pitch_weights,
-                device=str(device),
+                device=yolo_device,
             )
 
     # Load detection model
@@ -134,6 +137,7 @@ def load_models(
         detector = RTDETRDetector(
             weights_path=model_path,  # None → uses base HuggingFace weights
             device=str(device),
+            conf_threshold=conf_threshold,
         )
     elif model_type == "rfdetr":
         from torchkick.models import RFDETRDetector
@@ -349,6 +353,7 @@ def detect_and_project(
         min_correspondences=6,
         confidence_threshold=0.3,
         visibility_threshold=0.3,
+        use_kalman=False,
     )
 
     # Non-YOLO models use ByteTracker (YOLO has built-in tracking via botsort)
@@ -388,6 +393,32 @@ def detect_and_project(
                 ok = homography.estimate(kps, conf, conf, frame_bgr.shape[:2])
                 if ok and homography.H_inv is not None:
                     store.frame_homographies[frame_idx] = homography.H_inv.copy()
+                if frame_idx < 3:
+                    n_vis = int((conf > 0.3).sum())
+                    print(
+                        f"  [DEBUG frame {frame_idx}] homography={ok}, visible_kps={n_vis}, "
+                        f"inliers={homography.num_inliers}"
+                    )
+                    if ok:
+                        # Project 4 known keypoint positions to verify coordinate mapping
+                        import numpy as _np
+
+                        _h, _w = frame_bgr.shape[:2]
+                        _test = _np.array(
+                            [
+                                [_w * 0.48, _h * 0.31],  # halfway-line top area
+                                [_w * 0.48, _h * 0.39],
+                                [_w * 0.49, _h * 0.50],
+                                [_w * 0.49, _h * 0.81],
+                            ]
+                        )
+                        _proj = homography.project_to_pitch(_test)
+                        print(
+                            f"  [DEBUG frame {frame_idx}] halfway-line sample projections "
+                            f"(expect x≈0, y≈-35/−9/+9/+35):"
+                        )
+                        for _pt, _pp in zip(_test, _proj):
+                            print(f"    pixel ({_pt[0]:.0f},{_pt[1]:.0f}) → pitch ({_pp[0]:.2f},{_pp[1]:.2f})")
 
             # Per-frame feet keypoints cache (filled every reid_interval frames)
             _feet_cache: Dict[int, Tuple[float, float]] = {}
@@ -469,6 +500,16 @@ def detect_and_project(
             elif model_type in ("rtdetr", "rfdetr"):
                 valid_detections = [list(d.bbox) for d in detector.detect(frame_bgr)]
 
+                if frame_idx == 0:
+                    print(f"  [DEBUG frame 0] detections={len(valid_detections)}")
+                    for _b in valid_detections[:5]:
+                        _pp = homography.project_player_to_pitch(_b)
+                        _cx, _cy = (_b[0] + _b[2]) / 2, (_b[1] + _b[3]) / 2
+                        print(
+                            f"    bbox=({_b[0]:.0f},{_b[1]:.0f},{_b[2]:.0f},{_b[3]:.0f}) "
+                            f"foot=({_cx:.0f},{_cy:.0f}) → pitch={_pp}"
+                        )
+
                 _active_embedder = reid_embedder if reid_embedder is not None else siglip_embedder
                 if _active_embedder is not None and frame_idx % reid_interval == 0 and valid_detections:
                     det_crops = [_crop_box(frame_rgb, b) for b in valid_detections]
@@ -504,6 +545,27 @@ def detect_and_project(
         store.total_frames = frame_idx + 1
 
     print(f"Complete: {len(store.tracks)} tracks, {store.total_frames} frames")
+
+    # Debug: pitch coordinate range across all observations
+    import numpy as _np
+
+    all_pitch = [
+        (o.pitch_pos[0], o.pitch_pos[1])
+        for t in store.tracks.values()
+        for o in t.observations
+        if o.pitch_pos is not None
+    ]
+    if all_pitch:
+        xs, ys = zip(*all_pitch)
+        print(f"  [DEBUG] pitch x range: [{min(xs):.1f}, {max(xs):.1f}]  (expect [-60, +60])")
+        print(f"  [DEBUG] pitch y range: [{min(ys):.1f}, {max(ys):.1f}]  (expect [-35, +35])")
+        print(
+            f"  [DEBUG] observations with pitch coords: {len(all_pitch)} / "
+            f"{sum(len(t.observations) for t in store.tracks.values())} total"
+        )
+    else:
+        print("  [DEBUG] No pitch projections computed")
+
     return store
 
 
@@ -941,6 +1003,7 @@ def run_analysis(
     reid_interval: int = 5,
     pitch_weights: Optional[str] = None,
     pitch_detector_type: str = "yolo",
+    conf_threshold: float = 0.3,
 ) -> str:
     """
     Run complete match analysis pipeline.
@@ -1003,6 +1066,7 @@ def run_analysis(
         reid_weights=reid_weights,
         pitch_weights=pitch_weights,
         pitch_detector_type=pitch_detector_type,
+        conf_threshold=conf_threshold,
     )
 
     # Zero-shot SigLIP team embedder — used when no ReID weights are provided

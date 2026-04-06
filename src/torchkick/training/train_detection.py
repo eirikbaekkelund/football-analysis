@@ -62,10 +62,10 @@ def train_detection(
     num_labels: int = 80,
     epochs: int = 50,
     batch_size: int = 8,
-    learning_rate: float = 5e-5,
+    learning_rate: float = 1e-5,
     warmup_ratio: float = 0.05,
     grad_accumulation: int = 4,
-    val_split: float = 0.1,
+    val_split: float = 0.15,
     use_fsdp: bool = False,
     compile_model: bool = False,
     save_dir: str = "weights/detection/",
@@ -188,8 +188,15 @@ def train_detection(
 
     scaler = torch.amp.GradScaler("cuda") if dev.type == "cuda" else None
 
-    best_val_loss = float("inf")
+    best_map50 = 0.0
     best_ckpt = str(save_path / "rtdetr_best.pth")
+    try:
+        from torchmetrics.detection import MeanAveragePrecision
+
+        map_metric = MeanAveragePrecision(box_format="xyxy", iou_type="bbox").to(dev)
+    except ImportError:
+        map_metric = None
+        print("torchmetrics not found; checkpoint will fall back to val_loss. Install: pip install torchkick[training]")
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -329,6 +336,36 @@ def train_detection(
                     out = model(pixel_values=images, labels=hf_labels)
                 val_loss += out.loss.item()
 
+                # Accumulate mAP
+                if map_metric is not None and hasattr(out, "logits") and hasattr(out, "pred_boxes"):
+                    scores_batch = out.logits.sigmoid()  # [B, 300, num_classes]
+                    boxes_batch = out.pred_boxes  # [B, 300, 4] normalized cxcywh
+                    preds_map = []
+                    targets_map = []
+                    for t, scores_img, boxes_img in zip(targets, scores_batch, boxes_batch):
+                        cx, cy, bw, bh = boxes_img.unbind(-1)
+                        x1 = (cx - bw / 2) * input_size
+                        y1 = (cy - bh / 2) * input_size
+                        x2 = (cx + bw / 2) * input_size
+                        y2 = (cy + bh / 2) * input_size
+                        abs_boxes = torch.stack([x1, y1, x2, y2], dim=-1)
+                        max_scores, pred_labels = scores_img.max(dim=-1)
+                        keep = max_scores > 0.05
+                        preds_map.append(
+                            {
+                                "boxes": abs_boxes[keep].cpu(),
+                                "scores": max_scores[keep].cpu(),
+                                "labels": pred_labels[keep].cpu(),
+                            }
+                        )
+                        targets_map.append(
+                            {
+                                "boxes": t["boxes"].cpu(),
+                                "labels": t["labels"].cpu(),
+                            }
+                        )
+                    map_metric.update(preds_map, targets_map)
+
                 if epoch == 1 and not val_sanity_done:
                     val_sanity_done = True
                     print("\n=== VAL SANITY CHECK (epoch 1, first val batch) ===")
@@ -359,19 +396,44 @@ def train_detection(
         avg_val = val_loss / len(val_loader)
         elapsed = time.time() - t0
         cur_lr = optimizer.param_groups[0]["lr"]
-        print(f"Epoch {epoch}/{epochs} | train={avg_train:.4f} val={avg_val:.4f} | lr={cur_lr:.2e} | {elapsed:.1f}s")
+
+        map50 = 0.0
+        map_all = 0.0
+        if map_metric is not None:
+            map_result = map_metric.compute()
+            map50 = map_result["map_50"].item()
+            map_all = map_result["map"].item()
+            map_metric.reset()
+
+        print(
+            f"Epoch {epoch}/{epochs} | train={avg_train:.4f} val={avg_val:.4f} "
+            f"map@0.5={map50:.4f} map={map_all:.4f} | lr={cur_lr:.2e} | {elapsed:.1f}s"
+        )
 
         if run:
-            run.log({"train_loss": avg_train, "val_loss": avg_val, "epoch": epoch})
+            run.log(
+                {
+                    "train_loss": avg_train,
+                    "val_loss": avg_val,
+                    "map50": map50,
+                    "map": map_all,
+                    "lr": cur_lr,
+                    "epoch": epoch,
+                }
+            )
 
-        if avg_val < best_val_loss:
-            best_val_loss = avg_val
+        is_best = (map50 > best_map50) if map_metric is not None else False
+        if is_best:
+            best_map50 = map50
             # Unwrap compiled/FSDP model for saving
             save_model = model
             if hasattr(model, "_orig_mod"):
                 save_model = model._orig_mod  # type: ignore[attr-defined]
-            torch.save({"model_state_dict": save_model.state_dict(), "epoch": epoch, "val_loss": avg_val}, best_ckpt)
-            print(f"  Saved best checkpoint → {best_ckpt}")
+            torch.save(
+                {"model_state_dict": save_model.state_dict(), "epoch": epoch, "val_loss": avg_val, "map50": map50},
+                best_ckpt,
+            )
+            print(f"  Saved best checkpoint → {best_ckpt}  (map@0.5={map50:.4f})")
 
     if run:
         run.finish()
