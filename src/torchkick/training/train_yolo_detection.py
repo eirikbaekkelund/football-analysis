@@ -709,10 +709,35 @@ def build_soccernet_keypoint_dataset(
     if not yaml_splits:
         raise RuntimeError(f"No calibration zips found in {calibration_dir}")
 
+    # When no valid split exists, carve out 15% of train as a held-out val set.
+    # Files are moved (not copied) so there is zero leakage.
+    if "valid" not in yaml_splits and "val" not in yaml_splits and "train" in yaml_splits:
+        import random as _random
+        _random.seed(42)
+        train_img_dir = out / "images" / "train"
+        train_lbl_dir = out / "labels" / "train"
+        val_img_dir   = out / "images" / "valid"
+        val_lbl_dir   = out / "labels" / "valid"
+        val_img_dir.mkdir(parents=True, exist_ok=True)
+        val_lbl_dir.mkdir(parents=True, exist_ok=True)
+
+        all_imgs = sorted(train_img_dir.glob("*.jpg"))
+        n_val = max(1, int(len(all_imgs) * 0.15))
+        val_imgs = _random.sample(all_imgs, n_val)
+
+        for img_p in val_imgs:
+            lbl_p = train_lbl_dir / img_p.with_suffix(".txt").name
+            img_p.rename(val_img_dir / img_p.name)
+            if lbl_p.exists():
+                lbl_p.rename(val_lbl_dir / lbl_p.name)
+
+        yaml_splits["valid"] = "images/valid"
+        print(f"  Auto-split: {n_val} samples → valid, {len(all_imgs) - n_val} remain in train")
+
     # Write dataset.yaml
     yaml_path = out / "dataset.yaml"
     train_key = yaml_splits.get("train", next(iter(yaml_splits.values())))
-    val_key = yaml_splits.get("valid", yaml_splits.get("val", train_key))
+    val_key   = yaml_splits.get("valid", yaml_splits.get("val", train_key))
 
     yaml_lines = [
         f"path: {out.resolve()}",
