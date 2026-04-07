@@ -613,13 +613,12 @@ def run_analysis(
     detector = YOLO(yolo_weights)
     detector.to(dev)
 
-    # Load pitch keypoint detector (YOLO-pose)
+    # Load pitch keypoint detector (DINOv2 heatmap)
     pitch_kp_detector = None
     if pitch_weights is not None:
-        from torchkick.models.pitch import YOLOPoseKeypointDetector
+        from torchkick.models.pitch import HeatmapPitchDetector
 
-        yolo_device = str(dev) if str(dev) not in ("mps", "mps:0") else "cpu"
-        pitch_kp_detector = YOLOPoseKeypointDetector(weights_path=pitch_weights, device=yolo_device)
+        pitch_kp_detector = HeatmapPitchDetector(weights_path=pitch_weights, device=str(dev))
         print(f"Pitch keypoint detector loaded: {pitch_weights}")
 
     # Load ReID embedder

@@ -20,21 +20,47 @@ import cv2
 import numpy as np
 
 _KP_LABELS = [
-    "TL", "LP1", "LG1", "LG2", "LP2", "BL",
-    "LGF1", "LGF2", "LPS", "LPF1", "LPI1", "LPI2", "LPF2",
-    "HT", "CCT", "CCB", "HB",
-    "RPF1", "RPI1", "RPI2", "RPF2", "RPS", "RGF1", "RGF2",
-    "TR", "RP1", "RG1", "RG2", "RP2", "BR",
-    "CCL", "CCR",
+    "TL",
+    "LP1",
+    "LG1",
+    "LG2",
+    "LP2",
+    "BL",
+    "LGF1",
+    "LGF2",
+    "LPS",
+    "LPF1",
+    "LPI1",
+    "LPI2",
+    "LPF2",
+    "HT",
+    "CCT",
+    "CCB",
+    "HB",
+    "RPF1",
+    "RPI1",
+    "RPI2",
+    "RPF2",
+    "RPS",
+    "RGF1",
+    "RGF2",
+    "TR",
+    "RP1",
+    "RG1",
+    "RG2",
+    "RP2",
+    "BR",
+    "CCL",
+    "CCR",
 ]
 
 _KP_COLORS = (
-    [(0, 255, 0)] * 6       # 0-5  corners / boundary
-    + [(0, 200, 255)] * 7   # 6-12 left box
-    + [(255, 255, 0)] * 4   # 13-16 centre
-    + [(0, 100, 255)] * 7   # 17-23 right box
-    + [(0, 255, 0)] * 6     # 24-29 corners / boundary (right)
-    + [(255, 0, 255)] * 2   # 30-31 circle left/right
+    [(0, 255, 0)] * 6  # 0-5  corners / boundary
+    + [(0, 200, 255)] * 7  # 6-12 left box
+    + [(255, 255, 0)] * 4  # 13-16 centre
+    + [(0, 100, 255)] * 7  # 17-23 right box
+    + [(0, 255, 0)] * 6  # 24-29 corners / boundary (right)
+    + [(255, 0, 255)] * 2  # 30-31 circle left/right
 )
 
 
@@ -54,7 +80,7 @@ def draw_gt_keypoints(img: np.ndarray, label_path: Path) -> np.ndarray:
             # parts: class cx cy bw bh  kp0x kp0y kp0v  kp1x kp1y kp1v  ...
             kps_flat = list(map(float, parts[5:]))
             for i in range(32):
-                x_n, y_n, vis = kps_flat[i*3], kps_flat[i*3+1], kps_flat[i*3+2]
+                x_n, y_n, vis = kps_flat[i * 3], kps_flat[i * 3 + 1], kps_flat[i * 3 + 2]
                 if vis < 1:
                     continue
                 px, py = int(x_n * w), int(y_n * h)
@@ -63,8 +89,7 @@ def draw_gt_keypoints(img: np.ndarray, label_path: Path) -> np.ndarray:
                 color = _KP_COLORS[i]
                 cv2.circle(out, (px, py), 7, color, -1)
                 cv2.circle(out, (px, py), 7, (0, 0, 0), 1)
-                cv2.putText(out, _KP_LABELS[i], (px + 8, py + 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA)
+                cv2.putText(out, _KP_LABELS[i], (px + 8, py + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA)
     return out
 
 

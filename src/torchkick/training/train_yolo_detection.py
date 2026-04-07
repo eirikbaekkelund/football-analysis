@@ -699,7 +699,9 @@ def build_soccernet_keypoint_dataset(
             print(f"  [skip] {zip_path} not found")
             continue
         print(f"Converting {zip_path.name} …")
-        n = convert_soccernet_calibration_to_yolo_pose(str(zip_path), str(out), split=split, imgsz=imgsz, min_keypoints=min_keypoints)
+        n = convert_soccernet_calibration_to_yolo_pose(
+            str(zip_path), str(out), split=split, imgsz=imgsz, min_keypoints=min_keypoints
+        )
         print(f"  → {n} samples written to {out}/images/{split}/")
         yaml_splits[split] = f"images/{split}"
         total += n
@@ -726,80 +728,6 @@ def build_soccernet_keypoint_dataset(
     yaml_path.write_text("\n".join(yaml_lines) + "\n")
     print(f"\nDataset YAML → {yaml_path}  ({total} total samples)")
     return str(yaml_path)
-
-
-def train_yolo_keypoints(
-    data_yaml: Optional[str] = None,
-    soccernet_calibration_dir: Optional[str] = None,
-    base_model: str = "yolo11n-pose.pt",
-    epochs: int = 100,
-    imgsz: int = 320,
-    device: int = 0,
-    save_dir: str = "weights/keypoints/",
-) -> str:
-    """
-    Train YOLO-pose pitch keypoint detector (32-keypoint Roboflow schema).
-
-    Accepts a pre-built YOLO-pose dataset YAML (``data_yaml``), or a
-    SoccerNet calibration directory (``soccernet_calibration_dir``) that is
-    automatically converted to YOLO-pose format before training.  Both can
-    be supplied to merge datasets (Roboflow YAML + SoccerNet auto-convert).
-
-    Uses ``mosaic=0.0`` — mosaic augmentation shuffles spatial landmark
-    positions and degrades keypoint AP on structured pitch layouts.
-
-    Args:
-        data_yaml: Path to a pre-built YOLO-pose dataset YAML.
-        soccernet_calibration_dir: Directory containing SoccerNet calibration
-            zips (``train.zip``, ``valid.zip``).  Auto-converted to YOLO-pose
-            format targeting the 32-keypoint schema.  When both ``data_yaml``
-            and ``soccernet_calibration_dir`` are supplied, SoccerNet data is
-            converted and its YAML is used (pass ``data_yaml`` separately
-            for Roboflow data and merge the datasets by hand if needed).
-        base_model: Base YOLO-pose model to finetune (e.g. ``yolo11n-pose.pt``).
-        epochs: Training epochs.
-        imgsz: Input image size (320 is fastest for pitch keypoints).
-        device: CUDA device index.
-        save_dir: Directory for saved weights.
-
-    Returns:
-        Path to best model weights.
-
-    Example:
-        >>> # From a pre-built Roboflow YAML
-        >>> weights = train_yolo_keypoints("pitch_keypoints.yaml", epochs=100)
-
-        >>> # Auto-convert SoccerNet calibration data
-        >>> weights = train_yolo_keypoints(
-        ...     soccernet_calibration_dir="data/soccernet/calibration",
-        ...     epochs=100,
-        ... )
-    """
-    from ultralytics import YOLO
-
-    if soccernet_calibration_dir is not None:
-        converted_dir = str(Path(save_dir).parent / "soccernet_kp_dataset")
-        print(f"Converting SoccerNet calibration data → {converted_dir}")
-        data_yaml = build_soccernet_keypoint_dataset(
-            calibration_dir=soccernet_calibration_dir,
-            output_dir=converted_dir,
-        )
-
-    if data_yaml is None:
-        raise ValueError("Provide data_yaml or soccernet_calibration_dir.")
-
-    model = YOLO(base_model)
-    results = model.train(
-        data=data_yaml,
-        epochs=epochs,
-        imgsz=imgsz,
-        mosaic=0.0,  # Required: mosaic shuffles landmark positions → degrades keypoint AP
-        device=device,
-        project=save_dir,
-    )
-    best_weights = f"{results.save_dir}/weights/best.pt"
-    print(f"Keypoint training complete. Best model: {best_weights}")
-    return best_weights
 
 
 if __name__ == "__main__":

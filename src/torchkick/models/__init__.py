@@ -26,8 +26,8 @@ from torchkick.models.ball import BallDetector, BallDetection, BallInferenceSlic
 
 # Pitch keypoint detectors
 from torchkick.models.pitch import (
-    ViTPoseKeypointDetector,
-    YOLOPoseKeypointDetector,
+    DINOv2PitchModel,
+    HeatmapPitchDetector,
 )
 
 # Player models
@@ -47,8 +47,8 @@ __all__ = [
     "BallDetection",
     "BallInferenceSlicer",
     # Pitch
-    "ViTPoseKeypointDetector",
-    "YOLOPoseKeypointDetector",
+    "DINOv2PitchModel",
+    "HeatmapPitchDetector",
     # Player
     "Detection",
     "PlayerDetector",

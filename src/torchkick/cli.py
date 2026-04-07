@@ -10,7 +10,7 @@ Commands:
 Example:
     $ torchkick analyze --video match.mp4 --yolo-weights best.pt
     $ torchkick train yolo --soccernet-dir /data/soccernet/ --epochs 100
-    $ torchkick train yolo-keypoints --data pitch.yaml --epochs 100
+    $ torchkick train pitch-heatmap --data /data/soccernet_kp_dataset --epochs 100
     $ torchkick train reid-video --video match.mp4 --yolo-weights best.pt
 """
 
@@ -237,53 +237,92 @@ def train_yolo_cmd(
 # ---- YOLO-pose pitch keypoints ----------------------------------------------
 
 
-@train.command("yolo-keypoints")
-@click.option("--data", "-d", type=click.Path(exists=True), default=None, help="Pre-built YOLO-pose dataset YAML.")
+# ---- DINOv2 pitch heatmap keypoints ----------------------------------------
+
+
+@train.command("pitch-heatmap")
+@click.option(
+    "--data",
+    "-d",
+    type=click.Path(exists=True),
+    default=None,
+    help="Pre-converted dataset root (images/ + labels/ subdirs).",
+)
 @click.option(
     "--soccernet-calibration-dir",
     type=click.Path(exists=True),
     default=None,
-    help="SoccerNet calibration dir (train.zip / valid.zip). Auto-converts to 32-keypoint YOLO-pose format.",
+    help="SoccerNet calibration dir (train.zip / valid.zip). Auto-converts to label format.",
 )
-@click.option("--epochs", "-e", type=int, default=300)
-@click.option("--imgsz", type=int, default=320)
-@click.option("--base-model", type=str, default="yolo11n-pose.pt")
-@click.option("--save-dir", type=str, default="weights/keypoints/")
-def train_yolo_keypoints_cmd(
+@click.option("--epochs", "-e", type=int, default=100)
+@click.option("--batch-size", "-b", type=int, default=8)
+@click.option(
+    "--backbone",
+    type=click.Choice(["dinov2_vits14", "dinov2_vitb14"]),
+    default="dinov2_vits14",
+    help="DINOv2 variant (S=~23M, B=~88M params).",
+)
+@click.option("--base-model", type=click.Path(), default=None, help="Resume / fine-tune from existing checkpoint.")
+@click.option(
+    "--min-keypoints", type=int, default=6, help="Skip frames with fewer visible keypoints (filters close-ups)."
+)
+@click.option("--imgsz", type=int, default=560, help="Input image size (must be multiple of 14).")
+@click.option("--save-dir", type=str, default="weights/pitch_heatmap/")
+@click.option("--wandb-project", type=str, default=None)
+@click.option("--no-compile", is_flag=True, help="Disable torch.compile.")
+def train_pitch_heatmap_cmd(
     data: str | None,
     soccernet_calibration_dir: str | None,
     epochs: int,
+    batch_size: int,
+    backbone: str,
+    base_model: str | None,
+    min_keypoints: int,
     imgsz: int,
-    base_model: str,
     save_dir: str,
+    wandb_project: str | None,
+    no_compile: bool,
 ) -> None:
     """
-    Train YOLO-pose pitch keypoint detector (32-keypoint schema).
+    Train DINOv2+heatmap pitch keypoint detector (32-keypoint schema).
 
-    Uses mosaic=0.0 to prevent spatial landmark shuffling.
-    Accepts a pre-built YOLO-pose YAML (--data) or auto-converts SoccerNet
-    calibration data (--soccernet-calibration-dir).
+    Uses a ViT-S/14 (or ViT-B/14) backbone with full end-to-end fine-tuning
+    (differential LR: backbone 10× lower than decoder) and a CNN heatmap
+    decoder.  Includes a pitch-presence head for broadcast-view filtering.
+
+    Accepts either a pre-converted dataset directory (--data) or a raw
+    SoccerNet calibration directory (--soccernet-calibration-dir) which is
+    auto-converted before training starts.
 
     Example:
-        $ torchkick train yolo-keypoints --data pitch.yaml --epochs 100
-        $ torchkick train yolo-keypoints \\
-              --soccernet-calibration-dir data/soccernet/calibration --epochs 200
+        $ torchkick train pitch-heatmap \\
+              --data /workspace/weights/soccernet_kp_dataset \\
+              --epochs 100 --batch-size 8 --wandb-project torchkick
+
+        $ torchkick train pitch-heatmap \\
+              --soccernet-calibration-dir /data/soccernet/calibration \\
+              --epochs 100 --batch-size 8
     """
-    from torchkick.training.train_yolo_detection import train_yolo_keypoints
+    from torchkick.training import train_pitch_heatmap
 
     if data is None and soccernet_calibration_dir is None:
-        raise click.UsageError("Provide --data (YAML) or --soccernet-calibration-dir.")
+        raise click.UsageError("Provide --data or --soccernet-calibration-dir.")
 
-    click.echo("Training YOLO-pose keypoints (mosaic=0.0)")
-    weights = train_yolo_keypoints(
-        data_yaml=data,
+    click.echo(f"Training DINOv2 heatmap pitch detector ({backbone}) | " f"epochs={epochs} | batch={batch_size}")
+    best = train_pitch_heatmap(
+        data_dir=data,
         soccernet_calibration_dir=soccernet_calibration_dir,
         base_model=base_model,
+        backbone_variant=backbone,
         epochs=epochs,
+        batch_size=batch_size,
+        min_keypoints=min_keypoints,
         imgsz=imgsz,
+        compile_model=not no_compile,
         save_dir=save_dir,
+        wandb_project=wandb_project,
     )
-    click.echo(f"Done → {weights}")
+    click.echo(f"Done → {best}")
 
 
 # ---- DINOv2 ReID (labelled crops) ------------------------------------------
@@ -405,8 +444,8 @@ def train_detection_cmd(args) -> None:
 @train.command("keypoints")
 @click.argument("args", nargs=-1)
 def train_keypoints_cmd(args) -> None:
-    """[Not implemented] ViTPose pitch keypoint training. Use `train yolo-keypoints` instead."""
-    raise click.UsageError("ViTPose keypoint training not active. Use `torchkick train yolo-keypoints`.")
+    """[Removed] Use `train pitch-heatmap` for DINOv2+heatmap pitch keypoint detection."""
+    raise click.UsageError("Use `torchkick train pitch-heatmap` for pitch keypoint detection.")
 
 
 @train.command("distill")

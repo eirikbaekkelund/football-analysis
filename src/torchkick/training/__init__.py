@@ -14,13 +14,13 @@ Example:
     >>> ball_weights = train_yolo(data_zip="data/train.zip", epochs=30)
 """
 
+from torchkick.training.train_pitch_heatmap import train_pitch_heatmap
 from torchkick.training.train_yolo_detection import (
     convert_to_yolo_format,
     convert_dir_to_yolo_format,
     convert_soccernet_calibration_to_yolo_pose,
     build_soccernet_keypoint_dataset,
     train_yolo,
-    train_yolo_keypoints,
     get_jersey_color_class,
 )
 from torchkick.training.train_detection import train_detection
@@ -31,13 +31,14 @@ from torchkick.training.train_body_pose import train_body_pose
 from torchkick.training.train_pose_lifter import train_pose_lifter, PoseLiftMLP
 
 __all__ = [
+    # DINOv2 pitch heatmap detector
+    "train_pitch_heatmap",
     # YOLO player/ball detection
     "convert_to_yolo_format",
     "convert_dir_to_yolo_format",
     "convert_soccernet_calibration_to_yolo_pose",
     "build_soccernet_keypoint_dataset",
     "train_yolo",
-    "train_yolo_keypoints",
     "get_jersey_color_class",
     # RT-DETR-X player/ball/referee detection
     "train_detection",

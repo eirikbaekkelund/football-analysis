@@ -1,122 +1,203 @@
 """
 Pitch keypoint detection models.
 
-ViTPoseKeypointDetector and YOLOPoseKeypointDetector detect 29 pitch
-landmark keypoints, used to compute the pitch-to-image homography via
-HomographyEstimator.
+HeatmapPitchDetector uses a DINOv2 ViT-S/14 backbone with a CNN heatmap
+decoder to detect 32 pitch landmark keypoints (Roboflow schema) and a
+broadcast-view confidence score, used to compute the pitch-to-image
+homography via HomographyEstimator.
 
 Example:
-    >>> from torchkick.models.pitch import YOLOPoseKeypointDetector
-    >>> detector = YOLOPoseKeypointDetector("weights/yolo_pitch_pose.pt")
+    >>> from torchkick.models.pitch import HeatmapPitchDetector
+    >>> detector = HeatmapPitchDetector("weights/pitch_heatmap/best.pt")
     >>> keypoints, confidence = detector.detect(frame)
-    >>> # keypoints: np.ndarray [29, 2], confidence: np.ndarray [29]
+    >>> # keypoints: np.ndarray [32, 2], confidence: np.ndarray [32]
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Tuple, Union
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
 import torch
 
 
-class ViTPoseKeypointDetector:
+class DINOv2PitchModel(torch.nn.Module):
     """
-    ViTPose-L pitch landmark detector.
+    DINOv2 ViT-S/14 backbone + lightweight CNN heatmap decoder for pitch
+    landmark detection.
 
-    Detects 29 pitch keypoints (center circle, penalty spots, corner flags,
-    18-yard box corners, goal posts, etc.) aligned to the SoccerNet
-    calibration dataset's LINE_CLASSES ordering.
-
-    Also provides optional player pose estimation (ankle keypoints) for
-    more accurate pitch projection (feet position vs. bbox center).
+    Backbone outputs 40×40 patch tokens (for 560×560 input) which are decoded
+    to 32 per-keypoint heatmaps at 320×320 resolution.  A secondary head on
+    the CLS token predicts whether the frame is a broadcast view.
 
     Args:
-        weights_path: Path to ViTPose-L fine-tuned checkpoint.
-        device: Torch device string.
-        input_size: (width, height) model input. Default (192, 256) = ViTPose default.
-        use_fp16: Use FP16 inference on GPU.
-        conf_threshold: Minimum keypoint confidence to accept.
+        backbone_name: DINOv2 hub model name ("dinov2_vits14" or "dinov2_vitb14").
+        num_keypoints: Number of output heatmap channels (default 32).
+
+    Input:  [B, 3, 560, 560]  (ImageNet-normalised RGB)
+    Output: (logits [B, 32, 320, 320],  pitch_logit [B, 1])
+    """
+
+    def __init__(
+        self,
+        backbone_name: str = "dinov2_vits14",
+        num_keypoints: int = 32,
+    ) -> None:
+        super().__init__()
+        self.num_keypoints = num_keypoints
+
+        # --- backbone ---
+        self.backbone = torch.hub.load(
+            "facebookresearch/dinov2",
+            backbone_name,
+            pretrained=True,
+        )
+        embed_dim: int = self.backbone.embed_dim  # 384 for ViT-S, 768 for ViT-B
+
+        # --- pitch-presence head (CLS token → scalar logit) ---
+        self.pitch_head = torch.nn.Linear(embed_dim, 1)
+
+        # --- heatmap decoder (patch tokens → 32 heatmaps at 8× upsampling) ---
+        def _block(in_ch: int, out_ch: int) -> torch.nn.Sequential:
+            return torch.nn.Sequential(
+                torch.nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+                torch.nn.BatchNorm2d(out_ch),
+                torch.nn.ReLU(inplace=True),
+            )
+
+        self.decoder = torch.nn.Sequential(
+            # project backbone dim → 256
+            torch.nn.Conv2d(embed_dim, 256, 1, bias=False),
+            torch.nn.BatchNorm2d(256),
+            torch.nn.ReLU(inplace=True),
+            # stage 1: 40×40 → 80×80
+            _block(256, 256),
+            torch.nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            # stage 2: 80×80 → 160×160
+            _block(256, 128),
+            torch.nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            # stage 3: 160×160 → 320×320
+            _block(128, 64),
+            torch.nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            # 1×1 projection to keypoint channels (no activation — raw logits)
+            torch.nn.Conv2d(64, num_keypoints, 1),
+        )
+
+        torch.nn.init.constant_(self.pitch_head.bias, 2.0)  # prior: most frames are broadcast
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: [B, 3, H, W]
+
+        Returns:
+            logits:       [B, 32, H/8*4, W/8*4]  raw heatmap logits (no sigmoid)
+            pitch_logit:  [B, 1]                  raw broadcast-view logit
+        """
+        B = x.shape[0]
+        features = self.backbone.forward_features(x)
+        # patch tokens: [B, num_patches, embed_dim]
+        patch_tokens = features["x_norm_patchtokens"]
+        cls_token = features["x_norm_clstoken"]  # [B, embed_dim]
+
+        # reshape patch tokens to spatial grid
+        n_patches = patch_tokens.shape[1]
+        grid_size = int(n_patches**0.5)
+        spatial = patch_tokens.permute(0, 2, 1).reshape(B, -1, grid_size, grid_size)
+
+        logits = self.decoder(spatial)  # [B, 32, 320, 320]
+        pitch_logit = self.pitch_head(cls_token)  # [B, 1]
+        return logits, pitch_logit
+
+
+class HeatmapPitchDetector:
+    """
+    DINOv2+heatmap pitch landmark detector.
+
+    Drop-in replacement for YOLOPoseKeypointDetector — same detect() interface.
+
+    Detects 32 pitch keypoints (Roboflow schema) and a broadcast-view
+    confidence score.  If the frame is not a broadcast view (pitch_conf < 0.5)
+    empty arrays are returned immediately so the caller can skip homography.
+
+    Args:
+        weights_path:      Path to .pt checkpoint saved by train_pitch_heatmap.
+        device:            Torch device string (default "cuda").
+        conf_threshold:    Minimum heatmap peak value to accept a keypoint.
+        pitch_threshold:   Minimum pitch-presence score to proceed.
+        use_fp16:          Use FP16 inference on CUDA (default True).
 
     Example:
-        >>> detector = ViTPoseKeypointDetector("weights/vitpose_pitch.pth")
+        >>> detector = HeatmapPitchDetector("weights/pitch_heatmap/best.pt")
         >>> keypoints, confidence = detector.detect(frame)
-        >>> # keypoints: np.ndarray [29, 2], confidence: np.ndarray [29]
+        >>> # keypoints: np.ndarray [32, 2], confidence: np.ndarray [32]
     """
+
+    NUM_KEYPOINTS = 32
+    INPUT_SIZE = 560
+    HEATMAP_SIZE = 320
+    _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
     def __init__(
         self,
         weights_path: Union[str, Path],
         device: str = "cuda",
-        input_size: Tuple[int, int] = (192, 256),
-        use_fp16: bool = True,
         conf_threshold: float = 0.3,
-        num_keypoints: int = 29,
+        pitch_threshold: float = 0.5,
+        use_fp16: bool = True,
     ) -> None:
-        self.NUM_KEYPOINTS = num_keypoints
         self.device = torch.device(device)
-        self.input_size = input_size  # (W, H)
-        self.use_fp16 = use_fp16 and "cuda" in device
         self.conf_threshold = conf_threshold
-        self._backbone = None
-        self._coord_head = None
-        self._vis_head = None
+        self.pitch_threshold = pitch_threshold
+        self.use_fp16 = use_fp16 and "cuda" in str(device)
+        self._model: Optional[DINOv2PitchModel] = None
         self._load_model(str(weights_path))
 
     def _load_model(self, weights_path: str) -> None:
-        try:
-            import timm
+        ckpt = torch.load(weights_path, map_location=self.device, weights_only=False)
+        cfg = ckpt.get("config", {})
+        backbone = cfg.get("backbone_variant", "dinov2_vits14")
+        nkp = cfg.get("num_keypoints", self.NUM_KEYPOINTS)
 
-            # ViT backbone outputs CLS token [B, backbone_dim]; no classification head
-            backbone = timm.create_model(
-                "vit_large_patch16_224",
-                pretrained=True,
-                num_classes=0,  # remove classification head → [B, 1024]
-            )
-            backbone_dim = backbone.num_features  # 1024 for ViT-L
-
-            # Explicit regression head (unbounded — no Sigmoid to avoid gradient saturation)
-            self._coord_head = torch.nn.Linear(backbone_dim, self.NUM_KEYPOINTS * 2)
-            # Visibility head (sigmoid at inference, BCE at training)
-            self._vis_head = torch.nn.Linear(backbone_dim, self.NUM_KEYPOINTS)
-
-            if Path(weights_path).exists():
-                checkpoint = torch.load(weights_path, map_location=self.device, weights_only=True)
-                state = checkpoint.get("model_state_dict", checkpoint)
-                backbone.load_state_dict(
-                    {k.removeprefix("backbone."): v for k, v in state.items() if k.startswith("backbone.")},
-                    strict=False,
-                )
-                self._coord_head.load_state_dict(
-                    {k.removeprefix("coord_head."): v for k, v in state.items() if k.startswith("coord_head.")},
-                    strict=False,
-                )
-                self._vis_head.load_state_dict(
-                    {k.removeprefix("vis_head."): v for k, v in state.items() if k.startswith("vis_head.")},
-                    strict=False,
-                )
-
-            self._backbone = backbone.to(self.device).eval()
-            self._coord_head = self._coord_head.to(self.device).eval()
-            self._vis_head = self._vis_head.to(self.device).eval()
-
-            if self.use_fp16:
-                self._backbone = self._backbone.half()
-                self._coord_head = self._coord_head.half()
-                self._vis_head = self._vis_head.half()
-        except ImportError:
-            raise ImportError("timm>=0.9.0 required. Install: pip install torchkick[reid]")
-
-    def _encode_frame(self, frame_rgb: np.ndarray) -> torch.Tensor:
-        w_in, h_in = self.input_size
-        resized = cv2.resize(frame_rgb, (w_in, h_in))
-        tensor = torch.from_numpy(resized).permute(2, 0, 1).float() / 255.0
-        tensor = tensor.unsqueeze(0).to(self.device)
+        model = DINOv2PitchModel(backbone_name=backbone, num_keypoints=nkp)
+        model.load_state_dict(ckpt["model_state_dict"])
+        model.eval()
         if self.use_fp16:
-            tensor = tensor.half()
-        return tensor
+            model = model.half()
+        model = model.to(self.device)
+        self._model = model
+
+    def _preprocess(self, frame: np.ndarray) -> torch.Tensor:
+        """BGR frame → [1, 3, 560, 560] normalised tensor."""
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rsz = cv2.resize(rgb, (self.INPUT_SIZE, self.INPUT_SIZE), interpolation=cv2.INTER_LINEAR)
+        img = rsz.astype(np.float32) / 255.0
+        img = (img - self._MEAN) / self._STD
+        t = torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0)  # [1, 3, H, W]
+        if self.use_fp16:
+            t = t.half()
+        return t.to(self.device)
+
+    @staticmethod
+    def _subpixel_argmax(hm: np.ndarray) -> Tuple[float, float]:
+        """3-point parabolic sub-pixel refinement on argmax neighbourhood."""
+        hy, hx = np.unravel_index(np.argmax(hm), hm.shape)
+        H, W = hm.shape
+        dx = dy = 0.0
+        if 1 <= hx < W - 1:
+            a, b, c = hm[hy, hx - 1], hm[hy, hx], hm[hy, hx + 1]
+            denom = a - 2 * b + c
+            if abs(denom) > 1e-6:
+                dx = 0.5 * (a - c) / denom
+        if 1 <= hy < H - 1:
+            a, b, c = hm[hy - 1, hx], hm[hy, hx], hm[hy + 1, hx]
+            denom = a - 2 * b + c
+            if abs(denom) > 1e-6:
+                dy = 0.5 * (a - c) / denom
+        return float(hx) + dx, float(hy) + dy
 
     @torch.inference_mode()
     def detect(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -124,199 +205,53 @@ class ViTPoseKeypointDetector:
         Detect pitch landmark keypoints in a BGR frame.
 
         Args:
-            frame: BGR image array.
+            frame: BGR image array (any resolution).
 
         Returns:
-            keypoints: np.ndarray [29, 2] — pixel coordinates (x, y).
-            confidence: np.ndarray [29] — confidence scores in [0, 1].
+            keypoints:  np.ndarray [32, 2]  pixel coordinates (x, y) in original frame.
+            confidence: np.ndarray [32]     scores in [0, 1]; 0 = not visible / below threshold.
         """
-        if self._backbone is None:
-            return np.zeros((self.NUM_KEYPOINTS, 2)), np.zeros(self.NUM_KEYPOINTS)
+        empty = (
+            np.zeros((self.NUM_KEYPOINTS, 2), dtype=np.float32),
+            np.zeros(self.NUM_KEYPOINTS, dtype=np.float32),
+        )
+        if self._model is None:
+            return empty
 
         h_orig, w_orig = frame.shape[:2]
-        w_in, h_in = self.input_size
+        inp = self._preprocess(frame)
 
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        tensor = self._encode_frame(frame_rgb)
+        logits, pitch_logit = self._model(inp)
 
-        features = self._backbone(tensor)  # [1, 1024]
-        coords = self._coord_head(features)[0].float().cpu().numpy().reshape(self.NUM_KEYPOINTS, 2)
-        confidence = torch.sigmoid(self._vis_head(features)[0]).float().cpu().numpy()
+        # --- pitch-presence gate ---
+        pitch_conf = float(torch.sigmoid(pitch_logit[0, 0]).cpu())
+        if pitch_conf < self.pitch_threshold:
+            return empty
 
-        # Scale from input_size back to original frame
-        coords[:, 0] *= w_orig / w_in
-        coords[:, 1] *= h_orig / h_in
+        # --- decode heatmaps ---
+        heatmaps = torch.sigmoid(logits[0]).float().cpu().numpy()  # [32, 320, 320]
+        hm_w = hm_h = self.HEATMAP_SIZE
 
-        # Zero confidence for OOB or below threshold
-        valid = (coords[:, 0] >= 0) & (coords[:, 0] < w_orig) & (coords[:, 1] >= 0) & (coords[:, 1] < h_orig)
-        confidence[~valid] = 0.0
-        confidence[confidence < self.conf_threshold] = 0.0
+        kps = np.zeros((self.NUM_KEYPOINTS, 2), dtype=np.float32)
+        conf = np.zeros(self.NUM_KEYPOINTS, dtype=np.float32)
 
-        return coords.astype(np.float32), confidence
+        for k in range(self.NUM_KEYPOINTS):
+            hm = heatmaps[k]
+            peak = float(hm.max())
+            if peak < self.conf_threshold:
+                continue
+            hx, hy = self._subpixel_argmax(hm)
+            # scale from heatmap space to original image space
+            kps[k, 0] = (hx + 0.5) / hm_w * w_orig
+            kps[k, 1] = (hy + 0.5) / hm_h * h_orig
+            conf[k] = peak
 
-    @torch.inference_mode()
-    def detect_player_pose(
-        self,
-        player_crops: list,
-    ) -> np.ndarray:
-        """
-        Estimate ankle (feet) keypoints for player crops (sequential).
-
-        Args:
-            player_crops: List of BGR player crop images.
-
-        Returns:
-            np.ndarray [N, 2] — (x, y) ankle pixel coords relative to each crop.
-        """
-        return self.detect_player_pose_batch(player_crops)
-
-    @torch.inference_mode()
-    def detect_player_pose_batch(
-        self,
-        player_crops: list,
-    ) -> np.ndarray:
-        """
-        Estimate ankle (feet) keypoints for player crops in a single batched forward pass.
-
-        Stacks all crops into one tensor batch, runs the backbone once, and extracts
-        the lowest valid keypoint per crop as the ground-contact ankle position.
-        This is 3–5× faster than calling ``detect_player_pose`` sequentially.
-
-        Args:
-            player_crops: List of BGR player crop images (any resolution).
-
-        Returns:
-            np.ndarray [N, 2] — (x, y) ankle pixel coords relative to each crop's top-left.
-                Fallback to (crop_w/2, crop_h) when pose estimation fails for a crop.
-        """
-        if not player_crops or self._backbone is None:
-            return np.zeros((len(player_crops), 2), dtype=np.float32)
-
-        w_in, h_in = self.input_size
-        crop_sizes: list = []
-        tensors: list = []
-
-        for crop in player_crops:
-            h_crop, w_crop = crop.shape[:2]
-            crop_sizes.append((h_crop, w_crop))
-            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            tensors.append(self._encode_frame(crop_rgb))  # [1, C, H, W]
-
-        # Single batched forward pass
-        batch = torch.cat(tensors, dim=0)  # [N, C, H, W]
-        features = self._backbone(batch)  # [N, backbone_dim]
-        coords_all = self._coord_head(features).float().cpu().numpy()  # [N, NUM_KP * 2]
-
-        results = []
-        for i, (h_crop, w_crop) in enumerate(crop_sizes):
-            raw = coords_all[i].reshape(-1, 2)
-            raw[:, 0] *= w_crop / w_in
-            raw[:, 1] *= h_crop / h_in
-            valid = (raw[:, 0] >= 0) & (raw[:, 0] < w_crop) & (raw[:, 1] >= 0) & (raw[:, 1] < h_crop)
-            if valid.any():
-                lowest_idx = int(raw[valid, 1].argmax())
-                ankle = raw[valid][lowest_idx]
-            else:
-                ankle = np.array([w_crop / 2.0, float(h_crop)], dtype=np.float32)
-            results.append(ankle)
-
-        return np.array(results, dtype=np.float32)
-
-
-class YOLOPoseKeypointDetector:
-    """
-    YOLO-pose pitch landmark detector (production path, ~3-5× faster than ViTPose).
-
-    Detects the same 29 pitch keypoints as ViTPoseKeypointDetector but runs at
-    320×320 input for real-time inference (~3ms/frame on RTX 3090).
-
-    Same interface as ViTPoseKeypointDetector:
-        detect(frame) → (keypoints [29, 2], confidence [29])
-
-    Train with:
-        yolo pose train data=pitch_keypoints.yaml model=yolo11n-pose.pt imgsz=320
-
-    Args:
-        weights_path: Path to YOLO-pose fine-tuned weights (.pt).
-        device: Torch device string or int.
-        input_size: Inference image size (default 320).
-        conf_threshold: Minimum keypoint confidence to accept.
-
-    Example:
-        >>> detector = YOLOPoseKeypointDetector("weights/yolo_pitch_pose.pt")
-        >>> keypoints, confidence = detector.detect(frame)
-        >>> # keypoints: np.ndarray [29, 2], confidence: np.ndarray [29]
-    """
-
-    def __init__(
-        self,
-        weights_path: Union[str, Path],
-        device: str = "cuda",
-        input_size: int = 320,
-        conf_threshold: float = 0.3,
-        num_keypoints: int = 29,
-    ) -> None:
-        self.NUM_KEYPOINTS = num_keypoints
-        self.device = device
-        self.input_size = input_size
-        self.conf_threshold = conf_threshold
-        self._model = None
-        self._load_model(str(weights_path))
-
-    def _load_model(self, weights_path: str) -> None:
-        try:
-            from ultralytics import YOLO
-
-            self._model = YOLO(weights_path)
-        except ImportError:
-            raise ImportError("ultralytics required. Install: pip install ultralytics")
-
-    @torch.inference_mode()
-    def detect(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Detect pitch landmark keypoints in a BGR frame.
-
-        Args:
-            frame: BGR image array.
-
-        Returns:
-            keypoints: np.ndarray [29, 2] — pixel coordinates (x, y).
-            confidence: np.ndarray [29] — confidence scores in [0, 1].
-        """
-        if self._model is None:
-            return np.zeros((self.NUM_KEYPOINTS, 2)), np.zeros(self.NUM_KEYPOINTS)
-
-        results = self._model.predict(
-            frame,
-            imgsz=self.input_size,
-            device=self.device,
-            verbose=False,
-        )
-
-        if not results or results[0].keypoints is None:
-            return np.zeros((self.NUM_KEYPOINTS, 2)), np.zeros(self.NUM_KEYPOINTS)
-
-        kp_data = results[0].keypoints
-        if kp_data.xy is None or len(kp_data.xy) == 0:
-            return np.zeros((self.NUM_KEYPOINTS, 2)), np.zeros(self.NUM_KEYPOINTS)
-
-        coords = kp_data.xy[0].cpu().numpy()  # [N, 2]
-        confidence = (
-            kp_data.conf[0].cpu().numpy() if kp_data.conf is not None else np.ones(len(coords), dtype=np.float32)
-        )
-
-        # Pad/truncate to NUM_KEYPOINTS
-        n = len(coords)
-        if n < self.NUM_KEYPOINTS:
-            pad = self.NUM_KEYPOINTS - n
-            coords = np.vstack([coords, np.zeros((pad, 2), dtype=np.float32)])
-            confidence = np.concatenate([confidence, np.zeros(pad, dtype=np.float32)])
-
-        confidence[confidence < self.conf_threshold] = 0.0
-        return coords[: self.NUM_KEYPOINTS].astype(np.float32), confidence[: self.NUM_KEYPOINTS]
+        return kps, conf
 
 
 __all__ = [
     "ViTPoseKeypointDetector",
     "YOLOPoseKeypointDetector",
+    "DINOv2PitchModel",
+    "HeatmapPitchDetector",
 ]
