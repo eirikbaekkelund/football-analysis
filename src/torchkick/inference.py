@@ -76,6 +76,8 @@ def load_models(
     pitch_weights: Optional[str] = None,
     pitch_detector_type: str = "yolo",
     conf_threshold: float = 0.3,
+    enable_pose: bool = False,
+    pose_weights: Optional[str] = None,
 ) -> Tuple:
     """
     Load detection and homography models, and optionally the ReID embedder.
@@ -180,7 +182,20 @@ def load_models(
         except Exception as e:
             print(f"[warn] Could not load ReID embedder: {e}. Continuing without ReID.")
 
-    return detector, pitch_kp_detector, reid_embedder
+    body_pose_detector = None
+    if enable_pose:
+        try:
+            from torchkick.models.pose import BodyPoseDetector
+
+            body_pose_detector = BodyPoseDetector(
+                model_name=pose_weights or "usyd-community/vitpose-base-simple",
+                device=str(device),
+            )
+            print(f"BodyPoseDetector loaded ({pose_weights or 'usyd-community/vitpose-base-simple'})")
+        except Exception as e:
+            print(f"[warn] Could not load BodyPoseDetector: {e}. Pose estimation disabled.")
+
+    return detector, pitch_kp_detector, reid_embedder, body_pose_detector
 
 
 def _detect_and_project_sam3_mlx(
@@ -322,6 +337,8 @@ def detect_and_project(
     reid_embedder=None,
     reid_interval: int = 5,
     siglip_embedder=None,
+    body_pose_detector=None,
+    enable_pose: bool = False,
 ) -> TrajectoryStore:
     """
     Pass 1: Detection, tracking, and projection.
@@ -362,6 +379,13 @@ def detect_and_project(
     )
     # Feet-projection capability: only ViTPoseKeypointDetector has detect_player_pose_batch
     _can_feet_project = pitch_kp_detector is not None and hasattr(pitch_kp_detector, "detect_player_pose_batch")
+
+    # Instantiate lifter once (LBFGS optimiser is created fresh per-player inside refine_lbfgs)
+    _lifter = None
+    if enable_pose and body_pose_detector is not None:
+        from torchkick.tracking.lifting import PoseLift3D
+
+        _lifter = PoseLift3D(use_lbfgs=True)
 
     # Special-case MLX Sam3 video predictor: it drives frame iteration itself
     if model_type == "sam3_mlx":
@@ -422,6 +446,8 @@ def detect_and_project(
 
             # Per-frame feet keypoints cache (filled every reid_interval frames)
             _feet_cache: Dict[int, Tuple[float, float]] = {}
+            # Per-frame pose cache {track_id → (pose_2d [17,2], pose_2d_scores [17], pose_3d [17,3])}
+            _pose_cache: Dict[int, tuple] = {}
 
             # Run detection
             if model_type == "yolo":
@@ -537,6 +563,26 @@ def detect_and_project(
                     _attach_reid_embeddings(
                         store, frame_idx, active_tracks, valid_detections, det_embeddings, reid_embedder
                     )
+
+            # Pose estimation — runs after all model branches have populated store
+            if enable_pose and _lifter is not None and body_pose_detector is not None:
+                # Collect boxes and track_ids for all observations added this frame
+                frame_tracks = [
+                    (tid, track)
+                    for tid, track in store.tracks.items()
+                    if track.observations and track.observations[-1].frame_idx == frame_idx
+                ]
+                if frame_tracks:
+                    boxes_this_frame = np.array([t.observations[-1].box for _, t in frame_tracks], dtype=np.float32)
+                    pose_results = body_pose_detector.detect_batch(frame_bgr, boxes_this_frame)
+                    camera = homography.get_camera_model(frame_bgr.shape[:2])
+                    kp3d_list = _lifter.lift_batch(pose_results, camera)
+
+                    for (tid, track), pr, kp3d in zip(frame_tracks, pose_results, kp3d_list):
+                        obs = track.observations[-1]
+                        obs.pose_2d = pr.keypoints
+                        obs.pose_2d_scores = pr.scores
+                        obs.pose_3d = kp3d if camera is not None else None
 
             progress.update()
             if progress.should_log():
@@ -760,6 +806,7 @@ def render_visualization(
     max_duration: Optional[float] = None,
     draw_overlay: bool = True,
     draw_dominance: bool = True,
+    enable_pose: bool = False,
 ) -> str:
     """
     Pass 4: Render output visualization.
@@ -796,8 +843,13 @@ def render_visualization(
                     'role': info.get('role', 'unknown'),
                     'team': info.get('team', -1),
                     'slot_key': slot_key,
+                    'pose_2d': obs.pose_2d,
+                    'pose_2d_scores': obs.pose_2d_scores,
                 }
             )
+
+    if enable_pose:
+        from torchkick.utils.visualization import draw_skeleton_2d
 
     output_path = generate_output_path(video_path, prefix="torchkick_analysis", duration=max_duration)
 
@@ -874,6 +926,11 @@ def render_visualization(
 
                     cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, 2)
                     cv2.putText(frame_bgr, str(label), (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+                    if enable_pose and obs.get('pose_2d') is not None and obs.get('pose_2d_scores') is not None:
+                        draw_skeleton_2d(
+                            frame_bgr, obs['pose_2d'], obs['pose_2d_scores'], color=color, conf_threshold=0.3
+                        )
 
                 # Build pitch positions with velocity
                 pitch_positions = []
@@ -1004,6 +1061,8 @@ def run_analysis(
     pitch_weights: Optional[str] = None,
     pitch_detector_type: str = "yolo",
     conf_threshold: float = 0.3,
+    enable_pose: bool = False,
+    pose_weights: Optional[str] = None,
 ) -> str:
     """
     Run complete match analysis pipeline.
@@ -1059,7 +1118,7 @@ def run_analysis(
     print(f"Device: {dev}")
 
     # Load models
-    detector, pitch_kp_detector, reid_embedder = load_models(
+    detector, pitch_kp_detector, reid_embedder, body_pose_detector = load_models(
         dev,
         model_path,
         model_type,
@@ -1067,6 +1126,8 @@ def run_analysis(
         pitch_weights=pitch_weights,
         pitch_detector_type=pitch_detector_type,
         conf_threshold=conf_threshold,
+        enable_pose=enable_pose,
+        pose_weights=pose_weights,
     )
 
     # Zero-shot SigLIP team embedder — used when no ReID weights are provided
@@ -1092,6 +1153,8 @@ def run_analysis(
         reid_embedder=reid_embedder,
         reid_interval=reid_interval,
         siglip_embedder=siglip_embedder,
+        body_pose_detector=body_pose_detector,
+        enable_pose=enable_pose,
     )
 
     # Pass 1.5: Re-link fragmented tracks via ReID similarity
@@ -1112,6 +1175,7 @@ def run_analysis(
         max_duration=duration,
         draw_overlay=draw_overlay,
         draw_dominance=draw_dominance,
+        enable_pose=enable_pose,
     )
 
     print("\n" + "=" * 60)

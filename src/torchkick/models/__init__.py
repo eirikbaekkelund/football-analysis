@@ -38,6 +38,9 @@ from torchkick.models.player import (
     RFDETRDetector,
 )
 
+# Body pose estimation
+from torchkick.models.pose import BodyPoseDetector, PoseResult
+
 __all__ = [
     # Ball
     "BallDetector",
@@ -51,4 +54,7 @@ __all__ = [
     "PlayerDetector",
     "RTDETRDetector",
     "RFDETRDetector",
+    # Body pose
+    "BodyPoseDetector",
+    "PoseResult",
 ]

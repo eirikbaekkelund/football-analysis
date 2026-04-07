@@ -192,6 +192,27 @@ class TrackVisualizer:
             2,
         )
 
+    def draw_skeleton(
+        self,
+        frame: np.ndarray,
+        keypoints: np.ndarray,
+        scores: np.ndarray,
+        team_id: Optional[int | str] = None,
+        conf_threshold: float = 0.3,
+    ) -> None:
+        """
+        Draw a COCO-17 skeleton using the team colour (in-place).
+
+        Args:
+            frame: BGR image array to draw on.
+            keypoints: [17, 2] float32 full-frame pixel coordinates.
+            scores: [17] float32 per-keypoint confidence.
+            team_id: Team index for colour lookup (uses unknown colour if None).
+            conf_threshold: Minimum keypoint confidence to draw.
+        """
+        color = self.colors.get_team_color(team_id)
+        draw_skeleton_2d(frame, keypoints, scores, color=color, conf_threshold=conf_threshold)
+
     def draw_status(
         self,
         frame: np.ndarray,
@@ -210,6 +231,61 @@ class TrackVisualizer:
         """
         color = (0, 255, 0) if ok else (0, 0, 255)
         cv2.putText(frame, text, position, self.font, 0.7, color, 2)
+
+
+# COCO-17 skeleton connections (matches BodyPoseDetector.COCO_SKELETON)
+_COCO_SKELETON: List[Tuple[int, int]] = [
+    (0, 1),
+    (0, 2),
+    (1, 3),
+    (2, 4),  # head
+    (5, 6),  # shoulders
+    (5, 7),
+    (7, 9),  # left arm
+    (6, 8),
+    (8, 10),  # right arm
+    (5, 11),
+    (6, 12),  # torso sides
+    (11, 12),  # hips
+    (11, 13),
+    (13, 15),  # left leg
+    (12, 14),
+    (14, 16),  # right leg
+]
+
+
+def draw_skeleton_2d(
+    frame: np.ndarray,
+    keypoints: np.ndarray,
+    scores: np.ndarray,
+    color: Tuple[int, int, int] = (0, 255, 0),
+    conf_threshold: float = 0.3,
+    joint_radius: int = 3,
+    limb_thickness: int = 2,
+) -> None:
+    """
+    Draw a COCO-17 skeleton on a frame in-place.
+
+    Only draws joints and limbs where confidence is above conf_threshold.
+
+    Args:
+        frame: BGR image array (modified in-place).
+        keypoints: [17, 2] float32 pixel coordinates (x, y).
+        scores: [17] float32 confidence per keypoint.
+        color: BGR colour for limbs and joints.
+        conf_threshold: Minimum score to render a joint or limb endpoint.
+        joint_radius: Radius of joint circles in pixels.
+        limb_thickness: Line thickness for limb connections.
+    """
+    for i, (x, y) in enumerate(keypoints):
+        if scores[i] >= conf_threshold:
+            cv2.circle(frame, (int(x), int(y)), joint_radius, color, -1)
+
+    for i, j in _COCO_SKELETON:
+        if scores[i] >= conf_threshold and scores[j] >= conf_threshold:
+            pt1 = (int(keypoints[i, 0]), int(keypoints[i, 1]))
+            pt2 = (int(keypoints[j, 0]), int(keypoints[j, 1]))
+            cv2.line(frame, pt1, pt2, color, limb_thickness)
 
 
 def draw_detection_boxes(
@@ -263,4 +339,5 @@ __all__ = [
     "ColorScheme",
     "TrackVisualizer",
     "draw_detection_boxes",
+    "draw_skeleton_2d",
 ]

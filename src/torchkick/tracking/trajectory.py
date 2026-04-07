@@ -64,6 +64,9 @@ class TrajectoryStore:
         box: np.ndarray,
         pitch_pos: Optional[Tuple[float, float]] = None,
         rep_mask: Optional[np.ndarray] = None,
+        pose_2d: Optional[np.ndarray] = None,
+        pose_2d_scores: Optional[np.ndarray] = None,
+        pose_3d: Optional[np.ndarray] = None,
     ) -> None:
         """
         Add a single observation for a track.
@@ -74,6 +77,9 @@ class TrajectoryStore:
             box: Bounding box [x1, y1, x2, y2].
             pitch_pos: Optional pitch position in meters.
             rep_mask: Optional representative mask (stored every N frames).
+            pose_2d: Optional [17, 2] COCO keypoints in full-frame pixel space.
+            pose_2d_scores: Optional [17] per-keypoint confidence scores.
+            pose_3d: Optional [17, 3] keypoints in world coordinates (metres).
         """
         if track_id not in self.tracks:
             self.tracks[track_id] = TrackData(track_id=track_id)
@@ -83,6 +89,9 @@ class TrajectoryStore:
             box=box,
             pitch_pos=pitch_pos,
             rep_mask=rep_mask,
+            pose_2d=pose_2d,
+            pose_2d_scores=pose_2d_scores,
+            pose_3d=pose_3d,
         )
         self.tracks[track_id].observations.append(obs)
         self.total_frames = max(self.total_frames, frame_idx + 1)

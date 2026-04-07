@@ -396,6 +396,11 @@ class HomographyEstimator:
         self._kalman: Optional[CameraPoseKalmanFilter] = CameraPoseKalmanFilter() if use_kalman else None
         self._last_image_size: Optional[Tuple[int, int]] = None
 
+        # Inlier correspondences from the most recent successful estimate() call.
+        # Used by get_camera_model() to recover a full K[R|t] via solvePnP.
+        self._matched_src: Optional[np.ndarray] = None  # [M, 2] image pixel coords
+        self._matched_dst: Optional[np.ndarray] = None  # [M, 2] pitch 2D coords (metres)
+
         # Load line classes
         try:
             from torchkick.soccernet.calibration_data import LINE_CLASSES
@@ -553,10 +558,14 @@ class HomographyEstimator:
             self.H = H2
             self.inliers = mask2.ravel() == 1
             self.num_inliers = inliers2
+            self._matched_src = src_points[self.inliers]
+            self._matched_dst = dst_mirrored[self.inliers]
         else:
             self.H = H1
             self.inliers = mask1.ravel() == 1 if H1 is not None else np.zeros(len(src_points), dtype=bool)
             self.num_inliers = inliers1
+            self._matched_src = src_points[self.inliers]
+            self._matched_dst = dst_points[self.inliers]
 
         if self.H is None or self.num_inliers < self.min_inliers:
             self.frames_since_valid += 1
@@ -699,6 +708,42 @@ class HomographyEstimator:
         return (
             float(np.clip(x, -MAX_X, MAX_X)),
             float(np.clip(y, -MAX_Y, MAX_Y)),
+        )
+
+    def get_camera_model(
+        self,
+        image_size: Tuple[int, int],
+    ) -> Optional[object]:
+        """
+        Build a calibrated CameraModel from the current RANSAC inlier correspondences.
+
+        Uses the matched pitch 2D ↔ image pixel pairs stored after the most recent
+        successful estimate() call. The pitch 2D coords are treated as 3D points with
+        z=0 (all pitch landmarks lie on the ground plane) and solvePnP recovers the
+        full K[R|t] camera model.
+
+        Args:
+            image_size: (height, width) of the source frame.
+
+        Returns:
+            CameraModel or None if no valid correspondences exist.
+        """
+        if self._matched_src is None or self._matched_dst is None:
+            return None
+        if len(self._matched_src) < 4:
+            return None
+
+        from torchkick.tracking.lifting import build_camera_model
+
+        h, w = image_size
+        f = float(max(h, w))
+        approx_K = np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1]], dtype=np.float64)
+
+        return build_camera_model(
+            matched_src=self._matched_src,
+            matched_dst=self._matched_dst,
+            image_size=image_size,
+            approx_K=approx_K,
         )
 
 

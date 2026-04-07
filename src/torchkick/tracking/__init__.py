@@ -79,6 +79,13 @@ from torchkick.tracking.homography import (
     GeometricConstraintSolver,
 )
 
+# 3D pose lifting
+from torchkick.tracking.lifting import (
+    CameraModel,
+    build_camera_model,
+    PoseLift3D,
+)
+
 # Visualization
 from torchkick.tracking.pitch_viz import (
     COLOR_TEAM_1,
@@ -123,6 +130,10 @@ __all__ = [
     "HomographyKalmanFilter",
     "HomographyEstimator",
     "GeometricConstraintSolver",
+    # 3D lifting
+    "CameraModel",
+    "build_camera_model",
+    "PoseLift3D",
     # Visualization
     "PitchVisualizer",
 ]

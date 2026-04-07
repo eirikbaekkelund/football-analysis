@@ -58,6 +58,12 @@ class TrackObservation(BaseModel):
     team_probs: Optional[np.ndarray] = None
     # Feet pixel coords from ViTPose ankle keypoints — more accurate than bbox center for projection
     keypoint_feet_uv: Optional[Tuple[float, float]] = None
+    # Full COCO-17 body pose in full-frame pixel coords [17, 2]
+    pose_2d: Optional[np.ndarray] = None
+    # Confidence score per keypoint [17]
+    pose_2d_scores: Optional[np.ndarray] = None
+    # COCO-17 keypoints in world coordinates [17, 3] (metres, pitch frame, z=0 ground)
+    pose_3d: Optional[np.ndarray] = None
 
 
 class TrackData(BaseModel):

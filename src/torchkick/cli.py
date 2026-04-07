@@ -380,6 +380,19 @@ def dataset(
     default=0.3,
     help="Detection confidence threshold (default 0.3; lower for early-stage checkpoints).",
 )
+@click.option(
+    "--pose",
+    "enable_pose",
+    is_flag=True,
+    default=False,
+    help="Enable body pose estimation and 3D lifting.",
+)
+@click.option(
+    "--pose-weights",
+    type=str,
+    default=None,
+    help="ViTPose HF model ID or local path (default: usyd-community/vitpose-base-simple).",
+)
 def analyze(
     video: str,
     model: str | None,
@@ -393,6 +406,8 @@ def analyze(
     pitch_weights: str | None,
     pitch_detector_type: str,
     conf_threshold: float,
+    enable_pose: bool,
+    pose_weights: str | None,
 ) -> None:
     """
     Run full match analysis pipeline.
@@ -428,6 +443,8 @@ def analyze(
         pitch_weights=pitch_weights,
         pitch_detector_type=pitch_detector_type,
         conf_threshold=conf_threshold,
+        enable_pose=enable_pose,
+        pose_weights=pose_weights,
     )
 
     click.echo(f"Analysis complete! Output: {output_path}")
@@ -521,6 +538,12 @@ def train() -> None:
 @click.option("--no-compile", is_flag=True, help="Disable torch.compile.")
 @click.option("--fsdp", is_flag=True, help="Enable FSDP for multi-GPU training.")
 @click.option("--wandb-project", type=str, default=None)
+@click.option(
+    "--focal-gamma", type=float, default=3.0, help="VFL focal gamma (default 3.0; raise to suppress flat scores)."
+)
+@click.option(
+    "--resume", type=click.Path(exists=True), default=None, help="Resume training from a saved checkpoint (.pth)."
+)
 def train_detection_cmd(
     soccernet: str | None,
     soccernet_dir: str | None,
@@ -539,6 +562,8 @@ def train_detection_cmd(
     no_compile: bool,
     fsdp: bool,
     wandb_project: str | None,
+    focal_gamma: float,
+    resume: str | None,
 ) -> None:
     """
     Train RT-DETR player detector from any combination of data sources.
@@ -618,6 +643,8 @@ def train_detection_cmd(
         use_fsdp=fsdp,
         save_dir=save_dir,
         wandb_project=wandb_project,
+        focal_gamma=focal_gamma,
+        resume_from=resume,
     )
     click.echo(f"Training complete! Best model: {weights}")
 

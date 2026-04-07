@@ -72,6 +72,8 @@ def train_detection(
     save_dir: str = "weights/detection/",
     device: Optional[str] = None,
     wandb_project: Optional[str] = None,
+    focal_gamma: float = 3.0,
+    resume_from: Optional[str] = None,
 ) -> str:
     """
     Train RT-DETR-X on mixed soccer detection data.
@@ -162,20 +164,36 @@ def train_detection(
     # Model
     model, _ = _get_model_and_processor(model_name, num_labels=num_labels)
 
-    # Initialize classification head biases to focal-loss prior (≈ -4.6).
-    # Keeps initial sigmoid outputs near 0.01, stabilising Hungarian matching
-    # when the head is randomly reinitialised (num_labels != COCO 80).
-    import math
+    # Override VFL focal gamma
+    if hasattr(model, "config") and hasattr(model.config, "focal_loss_gamma"):
+        model.config.focal_loss_gamma = focal_gamma
+        print(f"Focal gamma → {focal_gamma}")
 
-    prior_bias = -math.log((1 - 0.01) / 0.01)  # ≈ -4.6
-    for name, module in model.named_modules():
-        if hasattr(module, "bias") and module.bias is not None:
-            if "class_embed" in name and module.bias.shape[0] == num_labels:
-                torch.nn.init.constant_(module.bias, prior_bias)
-    enc = getattr(getattr(model, "model", model), "enc_score_head", None)
-    if enc is not None and enc.bias is not None and enc.bias.shape[0] == num_labels:
-        torch.nn.init.constant_(enc.bias, prior_bias)
-    print(f"Classification head biases initialised to {prior_bias:.3f} (focal prior p=0.01)")
+    start_epoch = 1
+    best_map50 = 0.0
+    if resume_from:
+        import math
+
+        ckpt = torch.load(resume_from, map_location="cpu")
+        model.load_state_dict(ckpt["model_state_dict"])
+        start_epoch = ckpt["epoch"] + 1
+        best_map50 = ckpt.get("map50", 0.0)
+        print(f"Resumed from {resume_from} (epoch {ckpt['epoch']}, mAP@0.5={best_map50:.4f})")
+    else:
+        # Initialize classification head biases to focal-loss prior (≈ -4.6).
+        # Keeps initial sigmoid outputs near 0.01, stabilising Hungarian matching
+        # when the head is randomly reinitialised (num_labels != COCO 80).
+        import math
+
+        prior_bias = -math.log((1 - 0.01) / 0.01)  # ≈ -4.6
+        for name, module in model.named_modules():
+            if hasattr(module, "bias") and module.bias is not None:
+                if "class_embed" in name and module.bias.shape[0] == num_labels:
+                    torch.nn.init.constant_(module.bias, prior_bias)
+        enc = getattr(getattr(model, "model", model), "enc_score_head", None)
+        if enc is not None and enc.bias is not None and enc.bias.shape[0] == num_labels:
+            torch.nn.init.constant_(enc.bias, prior_bias)
+        print(f"Classification head biases initialised to {prior_bias:.3f} (focal prior p=0.01)")
 
     if use_fsdp:
         try:
@@ -208,16 +226,17 @@ def train_detection(
         [
             {"params": backbone_params, "lr": learning_rate * lr_backbone_scale},
             {"params": other_params, "lr": learning_rate},
-            {"params": cls_head_params, "lr": learning_rate * 10},
+            {"params": cls_head_params, "lr": learning_rate * 50},
         ],
         weight_decay=1e-4,
     )
     print(
         f"Optimizer groups: backbone={sum(p.numel() for p in backbone_params)/1e6:.1f}M@{learning_rate*lr_backbone_scale:.0e}  "
-        f"cls_head={sum(p.numel() for p in cls_head_params)/1e6:.2f}M@{learning_rate*10:.0e}  "
+        f"cls_head={sum(p.numel() for p in cls_head_params)/1e6:.2f}M@{learning_rate*50:.0e}  "
         f"other={sum(p.numel() for p in other_params)/1e6:.1f}M@{learning_rate:.0e}"
     )
-    total_steps = (n_train // (batch_size * grad_accumulation)) * epochs
+    remaining_epochs = epochs - start_epoch + 1
+    total_steps = (n_train // (batch_size * grad_accumulation)) * remaining_epochs
     warmup_steps = int(total_steps * warmup_ratio)
     try:
         from transformers import get_cosine_schedule_with_warmup
@@ -228,7 +247,6 @@ def train_detection(
 
     scaler = torch.amp.GradScaler("cuda") if dev.type == "cuda" else None
 
-    best_map50 = 0.0
     best_ckpt = str(save_path / "rtdetr_best.pth")
     try:
         from torchmetrics.detection import MeanAveragePrecision
@@ -238,7 +256,7 @@ def train_detection(
         map_metric = None
         print("torchmetrics not found; checkpoint will fall back to val_loss. Install: pip install torchkick[training]")
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         model.train()
         train_loss = 0.0
         optimizer.zero_grad()
@@ -270,7 +288,7 @@ def train_detection(
                 loss = outputs.loss / grad_accumulation
 
             # One-time sanity check after first forward pass
-            if epoch == 1 and step == 0:
+            if epoch == start_epoch and step == 0:
                 print("\n=== SANITY CHECK (epoch 1, step 0) ===")
                 # --- Inputs ---
                 print(f"  [input] images: {images.shape} {images.dtype}")
