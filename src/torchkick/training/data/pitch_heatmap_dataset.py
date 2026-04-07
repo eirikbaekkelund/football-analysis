@@ -190,7 +190,7 @@ class PitchHeatmapDataset(Dataset):
             [
                 A.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.08, p=0.7),
                 A.RandomGamma(gamma_limit=(75, 130), p=0.4),
-                A.GaussNoise(var_limit=(5.0, 30.0), p=0.3),
+                A.GaussNoise(std_range=(0.02, 0.11), p=0.3),
                 A.MotionBlur(blur_limit=7, p=0.3),
                 A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
             ]
