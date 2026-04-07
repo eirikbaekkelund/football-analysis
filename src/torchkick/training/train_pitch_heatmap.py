@@ -433,8 +433,8 @@ def train_pitch_heatmap(
         print(
             f"Ep {epoch+1:3d}/{epochs} | "
             f"train {train_loss:.5f} | val {val_loss:.5f} | "
-            f"PCK@10={pck10['all']:.3f} (L={pck10['left']:.3f} "
-            f"C={pck10['center']:.3f} R={pck10['right']:.3f}) | "
+            f"PCK@10={pck10['all']:.3f} PCK@20={pck20['all']:.3f} "
+            f"(L={pck10['left']:.3f} C={pck10['center']:.3f} R={pck10['right']:.3f}) | "
             f"vis={avg_vis:.1f} | {elapsed:.1f}s"
         )
 
