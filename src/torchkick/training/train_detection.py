@@ -72,7 +72,7 @@ def train_detection(
     save_dir: str = "weights/detection/",
     device: Optional[str] = None,
     wandb_project: Optional[str] = None,
-    conf_threshold: float = 0.1,
+    conf_threshold: float = 0.01,
 ) -> str:
     """
     Train RT-DETR-X on mixed soccer detection data.
@@ -395,32 +395,19 @@ def train_detection(
                         )
                     map_metric.update(preds_map, targets_map)
 
-                if epoch == 1 and not val_sanity_done:
+                if not val_sanity_done:
                     val_sanity_done = True
-                    print("\n=== VAL SANITY CHECK (epoch 1, first val batch) ===")
-                    print(
-                        f"  [input] images: {images.shape}  mean/std: {images.mean().item():.3f}/{images.std().item():.3f}"
-                    )
-                    total_boxes = sum(len(lbl["boxes"]) for lbl in hf_labels)
-                    all_labels_list = [lbl["class_labels"] for lbl in hf_labels if len(lbl["class_labels"])]
-                    if all_labels_list:
-                        all_cls = torch.cat(all_labels_list)
-                        unique, counts = all_cls.unique(return_counts=True)
-                        print(
-                            f"  [input] boxes: {total_boxes}  label dist: { {int(k): int(v) for k, v in zip(unique, counts)} }"
-                        )
-                    print(f"  [output] val loss: {out.loss.item():.4f}")
-                    loss_dict = getattr(out, "loss_dict", {})
-                    if loss_dict:
-                        for k, v in loss_dict.items():
-                            print(f"    {k}: {v.item():.4f}")
                     if hasattr(out, "logits"):
-                        person_scores_val = out.logits.sigmoid()[:, :, 0]  # class-0 (person)
+                        person_scores_val = out.logits.sigmoid()[:, :, 0]
+                        max_scores = person_scores_val.max(dim=-1).values
                         print(
-                            f"  [output] logits: {out.logits.shape}  (expect [B, 300, {num_labels}])  "
-                            f"max person score per image: {person_scores_val.max(dim=-1).values.tolist()}"
+                            f"  [val] epoch {epoch} first batch — "
+                            f"max person scores: min={max_scores.min():.3f} "
+                            f"mean={max_scores.mean():.3f} "
+                            f"max={max_scores.max():.3f} "
+                            f"above_thresh={( max_scores > conf_threshold).sum().item()}/{len(max_scores)}",
+                            flush=True,
                         )
-                    print("====================================================\n", flush=True)
 
         avg_train = train_loss / len(train_loader)
         avg_val = val_loss / len(val_loader)
