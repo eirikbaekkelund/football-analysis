@@ -36,13 +36,29 @@ import torch
 from torch.utils.data import DataLoader, random_split
 
 
-def _make_lr_lambda(warmup_steps: int, decay_steps: int, min_lr_ratio: float = 0.01):
-    """Linear warmup then cosine decay to min_lr_ratio, held flat beyond decay_steps."""
+def _make_phased_lr_lambda(
+    phase1_steps: int,
+    ramp_steps: int,
+    total_steps: int,
+    phase1_ratio: float = 0.01,
+    min_lr_ratio: float = 0.01,
+):
+    """
+    Three-phase LR schedule:
+      1. Hold at phase1_ratio for phase1_steps steps  (near-frozen / protect pretrained weights).
+      2. Linear ramp from phase1_ratio → 1.0 over ramp_steps steps.
+      3. Cosine decay from 1.0 → min_lr_ratio over remaining steps.
+    Set phase1_steps=0 and phase1_ratio=0.0 to get a plain warmup + cosine schedule.
+    """
+    ramp_end = phase1_steps + ramp_steps
 
-    def lr_lambda(current_step: int) -> float:
-        if current_step < warmup_steps:
-            return float(current_step) / float(max(1, warmup_steps))
-        progress = float(current_step - warmup_steps) / float(max(1, decay_steps - warmup_steps))
+    def lr_lambda(step: int) -> float:
+        if step < phase1_steps:
+            return phase1_ratio
+        if step < ramp_end:
+            t = (step - phase1_steps) / max(1, ramp_steps)
+            return phase1_ratio + (1.0 - phase1_ratio) * t
+        progress = (step - ramp_end) / max(1, total_steps - ramp_end)
         return max(min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress))))
 
     return lr_lambda
@@ -127,7 +143,9 @@ def train_detection(
     batch_size: int = 32,
     learning_rate: float = 1e-5,
     lr_backbone_scale: float = 0.1,
-    warmup_ratio: float = 0.05,
+    warmup_ratio: float = 0.02,
+    backbone_phase1_epochs: int = 5,
+    backbone_ramp_epochs: int = 5,
     grad_accumulation: int = 2,
     val_split: float = 0.15,
     use_fsdp: bool = False,
@@ -302,19 +320,28 @@ def train_detection(
     remaining_epochs = epochs - start_epoch + 1
     steps_per_epoch = n_train // (batch_size * grad_accumulation)
     total_steps = steps_per_epoch * remaining_epochs
-    warmup_steps = int(total_steps * warmup_ratio)
-    cls_head_decay_steps = warmup_steps + steps_per_epoch * min(cls_head_decay_epochs, remaining_epochs)
+
+    # Per-group phased schedules:
+    #   backbone  — hold near-frozen for phase1 epochs, ramp over ramp epochs, cosine decay rest
+    #   other     — short warmup then full cosine decay
+    #   cls_head  — short warmup then aggressive cosine decay (cls_head_decay_epochs)
+    backbone_phase1_steps = backbone_phase1_epochs * steps_per_epoch
+    backbone_ramp_steps = backbone_ramp_epochs * steps_per_epoch
+    other_warmup_steps = int(total_steps * warmup_ratio)
+    cls_head_total_steps = other_warmup_steps + steps_per_epoch * min(cls_head_decay_epochs, remaining_epochs)
+
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
         lr_lambda=[
-            _make_lr_lambda(warmup_steps, total_steps),  # backbone: full cosine
-            _make_lr_lambda(warmup_steps, total_steps),  # other:    full cosine
-            _make_lr_lambda(warmup_steps, cls_head_decay_steps),  # cls_head: aggressive decay
+            _make_phased_lr_lambda(backbone_phase1_steps, backbone_ramp_steps, total_steps),          # backbone
+            _make_phased_lr_lambda(0, other_warmup_steps, total_steps, phase1_ratio=0.0),             # other
+            _make_phased_lr_lambda(0, other_warmup_steps, cls_head_total_steps, phase1_ratio=0.0),    # cls_head
         ],
     )
     print(
-        f"Scheduler: backbone/other cosine over {remaining_epochs} epochs | "
-        f"cls_head cosine over {min(cls_head_decay_epochs, remaining_epochs)} epochs → 1% peak"
+        f"Scheduler: backbone phase1={backbone_phase1_epochs}ep → ramp={backbone_ramp_epochs}ep → cosine | "
+        f"cls_head warmup → decay over {min(cls_head_decay_epochs, remaining_epochs)}ep | "
+        f"other warmup → cosine over {remaining_epochs}ep"
     )
 
     scaler = torch.amp.GradScaler("cuda") if dev.type == "cuda" else None

@@ -555,6 +555,18 @@ def train() -> None:
     help="Backbone: r50/r101 (COCO pretrained ResNet) or swin_t (ImageNet-22k Swin-T via timm).",
 )
 @click.option("--mlp-head", is_flag=True, default=False, help="Replace linear cls heads with 2-layer MLP + LayerNorm.")
+@click.option(
+    "--backbone-phase1-epochs",
+    type=int,
+    default=5,
+    help="Epochs to hold backbone at near-zero LR before ramping. Protects pretrained features during head warm-up.",
+)
+@click.option(
+    "--backbone-ramp-epochs",
+    type=int,
+    default=5,
+    help="Epochs to linearly ramp backbone LR from near-zero to peak after phase1.",
+)
 def train_detection_cmd(
     soccernet: str | None,
     soccernet_dir: str | None,
@@ -579,6 +591,8 @@ def train_detection_cmd(
     cls_head_decay_epochs: int,
     backbone: str,
     mlp_head: bool,
+    backbone_phase1_epochs: int,
+    backbone_ramp_epochs: int,
 ) -> None:
     """
     Train RT-DETR player detector from any combination of data sources.
@@ -664,6 +678,8 @@ def train_detection_cmd(
         cls_head_decay_epochs=cls_head_decay_epochs,
         backbone=backbone,
         use_mlp_head=mlp_head,
+        backbone_phase1_epochs=backbone_phase1_epochs,
+        backbone_ramp_epochs=backbone_ramp_epochs,
     )
     click.echo(f"Training complete! Best model: {weights}")
 
