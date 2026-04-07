@@ -251,12 +251,17 @@ def convert_dir_to_yolo_format(
     output_dir: str,
     val_ratio: float = 0.15,
     seed: int = 42,
+    frame_stride: int = 1,
 ) -> None:
     """
     Convert a pre-extracted SoccerNet directory to YOLO format with train/val split.
 
     Expects layout: <soccernet_dir>/<seq_name>/img1/<frame>.jpg
                     <soccernet_dir>/<seq_name>/gt/gt.txt  (MOT format)
+
+    Args:
+        frame_stride: Keep every Nth frame (1 = all frames, 5 = every 5th).
+            Use 5 to reduce a ~25 GB dataset to ~5 GB when disk space is limited.
     """
     output_dir = Path(output_dir)
     for split in ("train", "val"):
@@ -290,7 +295,11 @@ def convert_dir_to_yolo_format(
             names=["frame", "track_id", "x", "y", "w", "h", "conf", "class_id", "visibility", "unused"],
         )
 
-        for frame_id in df["frame"].unique():
+        frame_ids = sorted(df["frame"].unique())
+        for i, frame_id in enumerate(frame_ids):
+            if i % frame_stride != 0:
+                continue
+
             img_path = img_dir / f"{frame_id:06d}.jpg"
             if not img_path.exists():
                 continue
@@ -337,6 +346,7 @@ def train_yolo(
     base_model: str = "yolo11l.pt",
     device: int = 0,
     project: str = "player_tracker",
+    frame_stride: int = 1,
 ) -> str:
     """
     Train YOLO model for player detection.
@@ -365,11 +375,12 @@ def train_yolo(
     """
     from ultralytics import YOLO
 
-    # Determine dataset directory
+    # Determine dataset directory — prefer root FS over /workspace to avoid filling 20G volume
     if data_dir is None:
-        default_base = "yolo_dataset"
         if os.path.exists("/workspace"):
-            default_base = "/workspace/yolo_dataset"
+            default_base = "/yolo_dataset"
+        else:
+            default_base = "yolo_dataset"
         data_dir = os.environ.get("YOLO_DATASET_DIR", default_base)
         if use_colors:
             data_dir += "_colors"
@@ -377,7 +388,7 @@ def train_yolo(
     # Convert data if needed
     if not os.path.exists(data_dir):
         if soccernet_dir is not None:
-            convert_dir_to_yolo_format(soccernet_dir, data_dir)
+            convert_dir_to_yolo_format(soccernet_dir, data_dir, frame_stride=frame_stride)
         else:
             if data_zip is None:
                 data_zip = "soccernet/tracking/tracking/train.zip"

@@ -699,6 +699,12 @@ def train_detection_cmd(
 @click.option(
     "--save-dir", type=str, default="/workspace/weights/yolo_detection/", help="Output directory for weights."
 )
+@click.option(
+    "--frame-stride",
+    type=int,
+    default=1,
+    help="Keep every Nth frame during dataset conversion (default 1 = all frames). Use 5 to cut disk usage ~5x.",
+)
 def train_yolo_cmd(
     data: str | None,
     soccernet_dir: str | None,
@@ -707,6 +713,7 @@ def train_yolo_cmd(
     colors: bool,
     base_model: str,
     save_dir: str,
+    frame_stride: int,
 ) -> None:
     """
     Train YOLO player detector on SoccerNet data.
@@ -729,6 +736,7 @@ def train_yolo_cmd(
         use_colors=colors,
         base_model=base_model,
         project=save_dir,
+        frame_stride=frame_stride,
     )
 
     click.echo(f"Training complete! Best model: {weights}")
