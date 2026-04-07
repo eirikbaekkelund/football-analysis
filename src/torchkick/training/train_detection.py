@@ -398,14 +398,14 @@ def train_detection(
                 if not val_sanity_done:
                     val_sanity_done = True
                     if hasattr(out, "logits"):
-                        person_scores_val = out.logits.sigmoid()[:, :, 0]
-                        max_scores = person_scores_val.max(dim=-1).values
+                        s = out.logits.sigmoid()[:, :, 0]  # [B, 300]
+                        top25 = s.topk(25, dim=-1).values   # [B, 25]
                         print(
-                            f"  [val] epoch {epoch} first batch — "
-                            f"max person scores: min={max_scores.min():.3f} "
-                            f"mean={max_scores.mean():.3f} "
-                            f"max={max_scores.max():.3f} "
-                            f"above_thresh={( max_scores > conf_threshold).sum().item()}/{len(max_scores)}",
+                            f"  [val ep{epoch}] score dist — "
+                            f"top1: {s.max(dim=-1).values.mean():.4f}  "
+                            f"top25_mean: {top25.mean():.4f}  "
+                            f"above_0.01: {(s > 0.01).float().sum(dim=-1).mean():.1f}/img  "
+                            f"above_0.1: {(s > 0.1).float().sum(dim=-1).mean():.1f}/img",
                             flush=True,
                         )
 
