@@ -75,7 +75,6 @@ def load_models(
     reid_weights: Optional[str] = None,
     pitch_weights: Optional[str] = None,
     pitch_detector_type: str = "yolo",
-    conf_threshold: float = 0.3,
     enable_pose: bool = False,
     pose_weights: Optional[str] = None,
 ) -> Tuple:
@@ -122,52 +121,9 @@ def load_models(
 
         detector = YOLO(model_path)
         detector.to(device)
-    elif model_type == "fcnn":
-        from torchkick.training import get_player_detector_model
-
-        detector = get_player_detector_model(num_classes=2)
-        checkpoint = torch.load(model_path, map_location=device, weights_only=True)
-        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            detector.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            detector.load_state_dict(checkpoint)
-        detector.to(device)
-        detector.eval()
-    elif model_type == "rtdetr":
-        from torchkick.models import RTDETRDetector
-
-        detector = RTDETRDetector(
-            weights_path=model_path,  # None → uses base HuggingFace weights
-            device=str(device),
-            conf_threshold=conf_threshold,
-        )
-    elif model_type == "rfdetr":
-        from torchkick.models import RFDETRDetector
-
-        detector = RFDETRDetector(
-            weights_path=model_path,  # None → downloads pretrained weights
-            device=str(device),
-        )
-    elif model_type == "sam3_mlx":
-        # MLX-based SAM3 lightweight predictor (CPU/MLX backend)
-        from torchkick.models.sam_3._mlx.videopredictor import Sam3VideoPredictorMLX
-
-        # resolve assets relative to package
-        script_dir = Path(__file__).parent / "models" / "sam_3" / "_mlx"
-        bpe_path = str((script_dir / "assets" / "bpe.txt.gz").resolve())
-        checkpoint_path = str((script_dir / "assets" / "model.safetensors").resolve())
-
-        detector = Sam3VideoPredictorMLX.from_assets(bpe_path=bpe_path, checkpoint_path=checkpoint_path)
-    elif model_type == "sam3_pytorch":
-        # Defer loading to the external sam3 pytorch implementation (requires GPU/triton)
-        from sam3 import Sam3VideoPredictor
-
-        predictor = Sam3VideoPredictor.from_pretrained("facebook/sam3")
-        detector = predictor
-    else:
-        raise ValueError(
-            f"Unknown model type: {model_type}. Use 'yolo', 'fcnn', 'rtdetr', 'rfdetr', 'sam3_mlx' or 'sam3_pytorch'."
-        )
+    
+   
+    
 
     reid_embedder = None
     if reid_weights is not None:
@@ -765,10 +721,89 @@ def smooth_trajectories(store: TrajectoryStore) -> int:
     return count
 
 
+def calibrate_team_centroids(
+    video_path: str,
+    detector,
+    embedder,
+    calibration_duration: float = 120.0,
+    n_sample_frames: int = 40,
+    conf: float = 0.25,
+) -> Optional[np.ndarray]:
+    """
+    Fit k=3 team centroids from randomly sampled frames in the first
+    ``calibration_duration`` seconds of a video.
+
+    Samples ``n_sample_frames`` random frames, runs detection on each,
+    embeds all player crops, then fits k-means with k=3.  The smallest
+    cluster is remapped to label 2 (referee convention).
+
+    Args:
+        video_path: Input video path.
+        detector: YOLO model (``ultralytics.YOLO``).
+        embedder: ``DINOv2ReIDEmbedder`` or ``SigLIPTeamEmbedder`` with
+            an ``embed(crops)`` method that returns ``[N, D]`` float32.
+        calibration_duration: Seconds of video to sample from (default 120).
+        n_sample_frames: Number of frames to randomly sample.
+        conf: Detection confidence threshold.
+
+    Returns:
+        ``np.ndarray [3, D]`` centroids (team0, team1, ref) or None if
+        fewer than 10 crops are found.
+    """
+    import random
+
+    print(f"Calibrating team centroids from first {calibration_duration:.0f}s …")
+
+    all_crops: List[np.ndarray] = []
+
+    with VideoReader(video_path, max_duration=calibration_duration) as reader:
+        total = reader.max_frames
+        sampled_set = set(random.sample(range(total), min(n_sample_frames, total)))
+
+        for frame_idx, frame_bgr in enumerate(reader):
+            if frame_idx not in sampled_set:
+                continue
+
+            results = detector(frame_bgr, verbose=False, conf=conf, classes=[0])
+            if results[0].boxes is None or len(results[0].boxes) == 0:
+                continue
+
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            for box in results[0].boxes.xyxy.cpu().numpy():
+                crop = _crop_box(frame_rgb, box.tolist())
+                if crop is not None and crop.size > 0:
+                    # embedder expects BGR crops
+                    all_crops.append(cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
+
+    if len(all_crops) < 10:
+        print(f"[warn] Only {len(all_crops)} crops for calibration — skipping centroid fit.")
+        return None
+
+    print(f"  Embedding {len(all_crops)} crops …")
+    embeddings = embedder.embed(all_crops)  # [N, D]
+
+    from sklearn.cluster import KMeans
+
+    km = KMeans(n_clusters=3, random_state=42, n_init=10)
+    labels = km.fit_predict(embeddings)
+
+    # Remap smallest cluster → ref (label 2)
+    counts = np.bincount(labels, minlength=3)
+    ref_cluster = int(np.argmin(counts))
+    centers = km.cluster_centers_.copy()
+    if ref_cluster != 2:
+        centers[[2, ref_cluster]] = centers[[ref_cluster, 2]]
+
+    print(f"  Cluster sizes: team0={counts[0 if ref_cluster!=0 else 2]}, "
+          f"team1={counts[1 if ref_cluster!=1 else 2]}, ref={counts[ref_cluster]}")
+    return centers.astype(np.float32)
+
+
 def assign_identities(
     store: TrajectoryStore,
     reid_embedder=None,
     siglip_embedder=None,
+    team_centroids: Optional[np.ndarray] = None,
 ) -> Tuple[Dict, PitchSlotManager]:
     """
     Pass 3: Identity assignment and team classification.
@@ -779,6 +814,9 @@ def assign_identities(
             team clustering.
         siglip_embedder: Optional ``SigLIPTeamEmbedder`` used as zero-shot
             fallback when ``reid_embedder`` is None.
+        team_centroids: Optional ``[3, D]`` centroids from
+            ``calibrate_team_centroids()``.  Passed to ``IdentityAssigner``
+            for embedding-aware goalkeeper detection.
 
     Returns:
         (assignments, slot_manager) tuple.
@@ -787,7 +825,13 @@ def assign_identities(
     print("PASS 3: Identity Assignment")
     print("=" * 60)
 
-    assigner = IdentityAssigner(fps=store.fps, embedder=reid_embedder, siglip_embedder=siglip_embedder, debug=True)
+    assigner = IdentityAssigner(
+        fps=store.fps,
+        embedder=reid_embedder,
+        siglip_embedder=siglip_embedder,
+        team_centroids=team_centroids,
+        debug=True,
+    )
     assignments = assigner.assign_roles(store)
 
     slot_manager = PitchSlotManager(fps=store.fps, debug=True)
@@ -1141,6 +1185,20 @@ def run_analysis(
         except Exception as e:
             print(f"[info] SigLIP unavailable: {e}. Team classification disabled.")
 
+    # Calibrate team centroids from first 2 mins (used by goalkeeper detection)
+    team_centroids = None
+    _calib_embedder = reid_embedder or siglip_embedder
+    if _calib_embedder is not None and model_type == "yolo":
+        try:
+            team_centroids = calibrate_team_centroids(
+                video_path,
+                detector,
+                _calib_embedder,
+                calibration_duration=120.0,
+            )
+        except Exception as e:
+            print(f"[warn] Centroid calibration failed: {e}. Continuing without calibration.")
+
     # Pass 1: Detection and projection
     store = detect_and_project(
         video_path,
@@ -1164,7 +1222,12 @@ def run_analysis(
     smooth_trajectories(store)
 
     # Pass 3: Identity assignment
-    assignments, slot_manager = assign_identities(store, reid_embedder=reid_embedder, siglip_embedder=siglip_embedder)
+    assignments, slot_manager = assign_identities(
+        store,
+        reid_embedder=reid_embedder,
+        siglip_embedder=siglip_embedder,
+        team_centroids=team_centroids,
+    )
 
     # Pass 4: Visualization
     output_path = render_visualization(

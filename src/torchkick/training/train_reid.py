@@ -432,3 +432,160 @@ def train_reid(
 
     print(f"\nTraining complete. Best checkpoint: {ckpt}")
     return ckpt
+
+
+def train_reid_from_video(
+    video_path: str,
+    yolo_weights: str,
+    save_dir: str = "weights/reid/",
+    calibration_duration: float = 120.0,
+    n_sample_frames: int = 60,
+    min_crops_per_class: int = 20,
+    epochs: int = 20,
+    batch_size: int = 64,
+    lora_rank: int = 16,
+    device: Optional[str] = None,
+    tmp_dir: Optional[str] = None,
+    keep_tmp: bool = False,
+) -> str:
+    """
+    Build a labeled crop dataset from a video and train DINOv2+ArcFace ReID.
+
+    Pipeline:
+        1. Randomly sample ``n_sample_frames`` frames from the first
+           ``calibration_duration`` seconds.
+        2. Run YOLO detection on each frame and extract player crops.
+        3. Embed all crops with ``SigLIPTeamEmbedder`` (zero-shot, no labels).
+        4. Cluster into k=3 (home, away, referee) via k-means; remap smallest
+           cluster → ref (label 2).
+        5. Write crops to ``tmp_dir/{0,1,2}/`` (label-dir format).
+        6. Fine-tune ``DINOv2ReIDBackbone`` + ``ArcFaceHead`` on the pseudo-labels.
+
+    Args:
+        video_path: Input video path.
+        yolo_weights: Path to YOLO detection weights (e.g. best.pt).
+        save_dir: Directory for the trained checkpoint.
+        calibration_duration: Seconds of video to sample from (default 120).
+        n_sample_frames: Number of frames to randomly sample for crop extraction.
+        min_crops_per_class: Skip training if any cluster has fewer crops than
+            this (indicates bad clustering).
+        epochs: ArcFace training epochs.
+        batch_size: Training batch size.
+        lora_rank: LoRA rank for DINOv2 adapters.
+        device: Device string (auto-detected when None).
+        tmp_dir: Directory for temporary crop storage. Defaults to a system
+            temp directory.
+        keep_tmp: If True, do not delete the temporary crop directory after
+            training (useful for debugging pseudo-labels).
+
+    Returns:
+        Path to best checkpoint.
+    """
+    import random
+    import shutil
+    import tempfile
+
+    import cv2
+    import numpy as np
+
+    from ultralytics import YOLO
+
+    dev_str = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    # -----------------------------------------------------------------------
+    # Step 1-2: Sample frames and extract crops
+    # -----------------------------------------------------------------------
+    print(f"Extracting crops from first {calibration_duration:.0f}s of {video_path} …")
+
+    detector = YOLO(yolo_weights)
+    detector.to(torch.device(dev_str))
+
+    all_crops: list = []
+
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    total_frames = min(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), int(calibration_duration * fps))
+    sampled_indices = sorted(random.sample(range(max(1, total_frames)), min(n_sample_frames, total_frames)))
+
+    for frame_idx in sampled_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame_bgr = cap.read()
+        if not ret:
+            continue
+        results = detector(frame_bgr, verbose=False, conf=0.25, classes=[0])
+        if results[0].boxes is None or len(results[0].boxes) == 0:
+            continue
+        for box in results[0].boxes.xyxy.cpu().numpy():
+            x1, y1, x2, y2 = map(int, box)
+            x1, y1 = max(0, x1), max(0, y1)
+            crop = frame_bgr[y1:y2, x1:x2]
+            if crop.size > 0 and (x2 - x1) >= 16 and (y2 - y1) >= 16:
+                all_crops.append(cv2.resize(crop, (128, 256)))
+    cap.release()
+
+    print(f"  Extracted {len(all_crops)} crops.")
+    if len(all_crops) < 30:
+        raise RuntimeError(
+            f"Only {len(all_crops)} crops found — too few to cluster. "
+            "Try a longer calibration_duration or lower conf threshold."
+        )
+
+    # -----------------------------------------------------------------------
+    # Step 3-4: SigLIP embed + k-means pseudo-labels
+    # -----------------------------------------------------------------------
+    from torchkick.models.reid import SigLIPTeamEmbedder
+    from sklearn.cluster import KMeans
+
+    embedder = SigLIPTeamEmbedder(device=dev_str)
+    print("  Embedding crops with SigLIP …")
+    embeddings = embedder.embed(all_crops)  # [N, 768]
+
+    km = KMeans(n_clusters=3, random_state=42, n_init=10)
+    labels = km.fit_predict(embeddings)
+
+    counts = np.bincount(labels, minlength=3)
+    ref_cluster = int(np.argmin(counts))
+    if ref_cluster != 2:
+        swap = {ref_cluster: 2, 2: ref_cluster}
+        labels = np.array([swap.get(int(l), int(l)) for l in labels])
+        counts[[2, ref_cluster]] = counts[[ref_cluster, 2]]
+
+    print(f"  Pseudo-labels: team0={counts[0]}, team1={counts[1]}, ref={counts[2]}")
+
+    for cls in range(3):
+        if counts[cls] < min_crops_per_class:
+            raise RuntimeError(
+                f"Class {cls} has only {counts[cls]} crops (min={min_crops_per_class}). "
+                "Clustering may have failed. Try more sample frames."
+            )
+
+    # -----------------------------------------------------------------------
+    # Step 5: Write crops to label-dir format
+    # -----------------------------------------------------------------------
+    tmp_root = Path(tmp_dir) if tmp_dir else Path(tempfile.mkdtemp(prefix="torchkick_reid_"))
+    for cls in range(3):
+        (tmp_root / str(cls)).mkdir(parents=True, exist_ok=True)
+
+    for i, (crop, label) in enumerate(zip(all_crops, labels)):
+        cv2.imwrite(str(tmp_root / str(int(label)) / f"crop_{i:06d}.jpg"), crop)
+
+    print(f"  Written pseudo-labeled crops to {tmp_root}")
+
+    # -----------------------------------------------------------------------
+    # Step 6: Train DINOv2 + ArcFace on pseudo-labels
+    # -----------------------------------------------------------------------
+    ckpt = train_reid(
+        data_dir=str(tmp_root),
+        stage="supervised",
+        num_classes=3,
+        lora_rank=lora_rank,
+        epochs=epochs,
+        batch_size=batch_size,
+        save_dir=save_dir,
+        device=dev_str,
+    )
+
+    if not keep_tmp and tmp_dir is None:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+    return ckpt

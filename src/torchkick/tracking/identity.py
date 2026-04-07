@@ -60,11 +60,13 @@ class IdentityAssigner:
         fps: float = 30.0,
         embedder: Optional["DINOv2ReIDEmbedder"] = None,
         siglip_embedder: Optional["SigLIPTeamEmbedder"] = None,
+        team_centroids: Optional[np.ndarray] = None,
         debug: bool = True,
     ) -> None:
         self.fps = fps
         self.embedder = embedder
         self.siglip_embedder = siglip_embedder
+        self.team_centroids = team_centroids  # [3, D] from calibrate_team_centroids()
         self.debug = debug
 
     def assign_roles(
@@ -96,7 +98,9 @@ class IdentityAssigner:
             return {}
 
         # Find special roles by position
-        goalie_candidates = self._find_goalie_candidates(track_stats)
+        goalie_candidates = self._find_goalie_candidates(
+            track_stats, store=store, team_centroids=self.team_centroids
+        )
         linesman_candidates = self._find_linesman_candidates(track_stats, exclude=goalie_candidates)
         remaining_ids = [
             tid for tid in track_stats.keys() if tid not in goalie_candidates and tid not in linesman_candidates
@@ -170,25 +174,80 @@ class IdentityAssigner:
 
         return results
 
-    def _find_goalie_candidates(self, track_stats: Dict) -> Set[int]:
-        """Find tracks predominantly in penalty areas."""
-        candidates = set()
+    def _find_goalie_candidates(
+        self,
+        track_stats: Dict,
+        store: Optional["TrajectoryStore"] = None,
+        team_centroids: Optional[np.ndarray] = None,
+    ) -> Set[int]:
+        """
+        Find goalkeeper candidates by position isolation.
 
-        for tid, stats in track_stats.items():
-            mean_x = stats["mean_x"]
-            std_x = stats["std_x"]
+        A track qualifies if:
+        1. It is the most extreme-x player on one side of the pitch
+        2. It is ≥ ``isolation_gap`` metres behind the next field player
+        3. Its mean_x is outside ±20 m from centre (clearly in defensive half)
 
-            in_left_penalty = mean_x < -PENALTY_AREA_X and std_x < 10
-            in_right_penalty = mean_x > PENALTY_AREA_X and std_x < 10
+        When ``team_centroids`` is provided, tracks whose embedding has high
+        cosine distance from both team centroids (different-coloured jersey)
+        are accepted with a looser isolation gap (3 m instead of 5 m).
+        """
+        candidates: Set[int] = set()
 
-            if (in_left_penalty or in_right_penalty) and stats["n_samples"] > 50:
+        # Only stable, long tracks
+        stable = {
+            tid: s
+            for tid, s in track_stats.items()
+            if s["std_x"] < 12 and s["n_samples"] > 50
+        }
+        if len(stable) < 3:
+            return candidates
+
+        # Identify embedding outliers (different jersey → lower threshold)
+        outlier_tids: Set[int] = set()
+        if team_centroids is not None and store is not None:
+            for tid in stable:
+                track = store.get_track(tid)
+                if track is None:
+                    continue
+                embeds = [o.reid_embedding for o in track.observations if o.reid_embedding is not None]
+                if not embeds:
+                    continue
+                mean_emb = np.mean(embeds, axis=0).astype(np.float64)
+                norm = np.linalg.norm(mean_emb)
+                if norm < 1e-8:
+                    continue
+                mean_emb /= norm
+                # Cosine distance from team0 and team1 centroids (index 0 and 1)
+                dists = []
+                for i in range(2):
+                    c = team_centroids[i].astype(np.float64)
+                    c /= np.linalg.norm(c) + 1e-8
+                    dists.append(1.0 - float(np.dot(mean_emb, c)))
+                if min(dists) > 0.35:
+                    outlier_tids.add(tid)
+
+        sorted_by_x = sorted(stable.items(), key=lambda kv: kv[1]["mean_x"])
+
+        def _check_side(tid: int, stats: Dict, gap: float, side: str) -> None:
+            threshold = 3.0 if tid in outlier_tids else 5.0
+            if abs(stats["mean_x"]) > 20 and gap >= threshold:
                 candidates.add(tid)
                 if self.debug:
-                    side = "LEFT" if in_left_penalty else "RIGHT"
                     print(
-                        f"[DEBUG] Track {tid} -> GOALIE candidate ({side}): "
-                        f"mean_x={mean_x:.1f}m, std_x={std_x:.1f}m"
+                        f"[DEBUG] Track {tid} → GOALIE ({side}): "
+                        f"mean_x={stats['mean_x']:.1f}m, gap={gap:.1f}m"
+                        + (" [outlier jersey]" if tid in outlier_tids else "")
                     )
+
+        if len(sorted_by_x) >= 2:
+            left_tid, left_s = sorted_by_x[0]
+            _, next_s = sorted_by_x[1]
+            _check_side(left_tid, left_s, next_s["mean_x"] - left_s["mean_x"], "LEFT")
+
+            right_tid, right_s = sorted_by_x[-1]
+            _, prev_s = sorted_by_x[-2]
+            _check_side(right_tid, right_s, right_s["mean_x"] - prev_s["mean_x"], "RIGHT")
 
         return candidates
 

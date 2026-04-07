@@ -764,7 +764,7 @@ def train_yolo_keypoints_cmd(
     Example:
         $ torchkick train yolo-keypoints --data pitch.yaml --epochs 100
     """
-    from torchkick.training.train_ball_detector import train_yolo_keypoints
+    from torchkick.training.train_yolo_detection import train_yolo_keypoints
 
     click.echo(f"Training YOLO-pose keypoints (mosaic=0.0)")
     weights = train_yolo_keypoints(
@@ -885,6 +885,59 @@ def train_reid_cmd(
     click.echo(f"Training complete! Best model: {weights}")
 
 
+@train.command("reid-video")
+@click.option("--video", "-v", type=click.Path(exists=True), required=True, help="Input video path.")
+@click.option(
+    "--yolo-weights",
+    type=click.Path(exists=True),
+    required=True,
+    help="YOLO detection weights for crop extraction.",
+)
+@click.option("--save-dir", type=str, default="weights/reid/")
+@click.option("--calibration-duration", type=float, default=120.0, help="Seconds to sample from (default 120).")
+@click.option("--n-sample-frames", type=int, default=60, help="Number of frames to sample.")
+@click.option("--epochs", "-e", type=int, default=20)
+@click.option("--batch-size", "-b", type=int, default=64)
+@click.option("--lora-rank", type=int, default=16)
+@click.option("--keep-tmp", is_flag=True, help="Keep the temporary pseudo-labeled crop directory.")
+def train_reid_video_cmd(
+    video: str,
+    yolo_weights: str,
+    save_dir: str,
+    calibration_duration: float,
+    n_sample_frames: int,
+    epochs: int,
+    batch_size: int,
+    lora_rank: int,
+    keep_tmp: bool,
+) -> None:
+    """
+    Auto-label player crops from a video and train DINOv2+ArcFace ReID.
+
+    Runs YOLO on sampled frames, clusters crops into home/away/ref with
+    SigLIP + k-means, then fine-tunes DINOv2+LoRA+ArcFace on the
+    pseudo-labels.  No manually labeled data required.
+
+    Example:
+        $ torchkick train reid-video --video match.mp4 --yolo-weights best.pt --epochs 20
+    """
+    from torchkick.training import train_reid_from_video
+
+    click.echo(f"Training ReID from video: {video}")
+    weights = train_reid_from_video(
+        video_path=video,
+        yolo_weights=yolo_weights,
+        save_dir=save_dir,
+        calibration_duration=calibration_duration,
+        n_sample_frames=n_sample_frames,
+        epochs=epochs,
+        batch_size=batch_size,
+        lora_rank=lora_rank,
+        keep_tmp=keep_tmp,
+    )
+    click.echo(f"Training complete! Best model: {weights}")
+
+
 @train.command("distill")
 @click.option(
     "--teacher-weights",
@@ -963,139 +1016,6 @@ def label() -> None:
     """
     pass
 
-
-@label.command("grounded-sam")
-@click.option("--video", "-v", type=click.Path(exists=True), required=True, help="Input video file.")
-@click.option("--project-id", type=int, required=True, help="CVAT project ID to upload annotations to.")
-@click.option("--frame-step", type=int, default=5, help="Process every N-th frame (default 5).")
-@click.option(
-    "--reid-weights", type=click.Path(), default=None, help="Optional ReID student weights for team assignment."
-)
-@click.option("--no-sam", is_flag=True, help="Skip SAM2 mask refinement (faster, boxes only).")
-@click.option("--box-threshold", type=float, default=0.35)
-@click.option("--text-threshold", type=float, default=0.25)
-@click.option("--prompt", type=str, default="soccer player . ball . referee", help="GroundingDINO text prompt.")
-def label_grounded_sam(
-    video: str,
-    project_id: int,
-    frame_step: int,
-    reid_weights: str | None,
-    no_sam: bool,
-    box_threshold: float,
-    text_threshold: float,
-    prompt: str,
-) -> None:
-    """
-    Auto-label a video with GroundingDINO + SAM2.
-
-    Detects players, ball, and referee via text-guided GroundingDINO,
-    optionally refines detections to instance masks with SAM2, and
-    uploads annotations to CVAT.
-
-    Example:
-        $ torchkick label grounded-sam --video match.mp4 --project-id 1
-        $ torchkick label grounded-sam --video match.mp4 --project-id 1 --no-sam
-    """
-    import torch
-    from torchkick.annotation.grounded_sam import GroundedSAMPipeline
-
-    reid_embedder = None
-    if reid_weights:
-        try:
-            from torchkick.models.reid import DINOv2ReIDEmbedder
-
-            dev = "cuda" if torch.cuda.is_available() else "cpu"
-            reid_embedder = DINOv2ReIDEmbedder(weights_path=reid_weights, device=dev)
-            click.echo(f"ReID embedder loaded from {reid_weights}")
-        except Exception as e:
-            click.echo(f"[warn] Could not load ReID embedder: {e}")
-
-    pipeline = GroundedSAMPipeline(
-        reid_embedder=reid_embedder,
-        text_prompt=prompt,
-        box_threshold=box_threshold,
-        text_threshold=text_threshold,
-    )
-
-    click.echo(f"Running Grounded-SAM on: {video}")
-    annotations = pipeline.process_video(
-        video_path=video,
-        frame_step=frame_step,
-        use_sam=not no_sam,
-    )
-
-    click.echo(f"Generated {len(annotations)} annotations. CVAT upload project_id={project_id}.")
-    click.echo("(CVAT upload via annotation.client — wire project_id when client is configured)")
-
-
-@label.command("active-learning")
-@click.option("--video-dir", type=click.Path(exists=True), required=True, help="Directory containing MP4 videos.")
-@click.option("--project-id", type=int, required=True, help="CVAT project ID.")
-@click.option("--budget", type=int, default=100, help="Maximum frames to upload per iteration.")
-@click.option("--frame-step", type=int, default=5)
-@click.option("--reid-weights", type=click.Path(), default=None, help="ReID student weights for uncertainty scoring.")
-@click.option(
-    "--uncertainty-weight", type=float, default=0.5, help="Mix of uncertainty (0) vs diversity (1) selection."
-)
-def label_active_learning(
-    video_dir: str,
-    project_id: int,
-    budget: int,
-    frame_step: int,
-    reid_weights: str | None,
-    uncertainty_weight: float,
-) -> None:
-    """
-    Run one iteration of the active learning labeling loop.
-
-    Scores unlabeled video frames by uncertainty (MC Dropout) and
-    diversity (coreset) and uploads the most informative subset to CVAT.
-
-    Example:
-        $ torchkick label active-learning \\
-              --video-dir data/videos/ --project-id 1 --budget 100
-    """
-    import torch
-    from torchkick.annotation.grounded_sam import GroundedSAMPipeline
-    from torchkick.annotation.active_learning import ActiveLearningLoop
-
-    reid_embedder = None
-    if reid_weights:
-        try:
-            from torchkick.models.reid import DINOv2ReIDEmbedder
-
-            dev = "cuda" if torch.cuda.is_available() else "cpu"
-            reid_embedder = DINOv2ReIDEmbedder(weights_path=reid_weights, device=dev)
-        except Exception as e:
-            click.echo(f"[warn] Could not load ReID embedder: {e}")
-
-    pipeline = GroundedSAMPipeline(reid_embedder=reid_embedder)
-
-    # CVAT client — requires environment vars CVAT_HOST / CVAT_TOKEN
-    try:
-        from torchkick.annotation.client import CVATClient
-
-        cvat_client = CVATClient()
-    except Exception as e:
-        raise click.UsageError(
-            f"Could not initialise CVAT client: {e}. " "Set CVAT_HOST and CVAT_TOKEN environment variables."
-        )
-
-    loop = ActiveLearningLoop(
-        pipeline=pipeline,
-        cvat_client=cvat_client,
-        embedder=reid_embedder,
-        budget=budget,
-        uncertainty_weight=uncertainty_weight,
-    )
-
-    click.echo(f"Running active learning on {video_dir} (budget={budget})")
-    result = loop.run(
-        video_dir=video_dir,
-        project_id=project_id,
-        frame_step=frame_step,
-    )
-    click.echo(f"Selected {result['selected']} frames → {len(result['uploaded_task_ids'])} CVAT tasks created")
 
 
 @train.command("body-pose")
