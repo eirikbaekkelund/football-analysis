@@ -48,19 +48,69 @@ def _make_lr_lambda(warmup_steps: int, decay_steps: int, min_lr_ratio: float = 0
     return lr_lambda
 
 
-def _get_model_and_processor(model_name: str, num_labels: int = 2):
+_BACKBONE_HF_MAP = {
+    "r50": "PekingU/rtdetr_r50vd",
+    "r101": "PekingU/rtdetr_r101vd",
+}
+
+
+def _build_swin_t_rtdetr(num_labels: int):
+    from transformers import RTDetrConfig, RTDetrForObjectDetection, RTDetrImageProcessor
+
+    config = RTDetrConfig(
+        backbone="swin_tiny_patch4_window7_224",
+        use_timm_backbone=True,
+        backbone_kwargs={"pretrained": True, "out_indices": (1, 2, 3)},
+        encoder_in_channels=[192, 384, 768],
+        num_labels=num_labels,
+    )
+    model = RTDetrForObjectDetection(config)
+    processor = RTDetrImageProcessor()
+    print("Backbone: Swin-T (ImageNet-22k pretrained via timm)")
+    return model, processor
+
+
+def _get_model_and_processor(num_labels: int, backbone: str = "r101"):
     try:
         from transformers import RTDetrForObjectDetection, RTDetrImageProcessor
 
-        processor = RTDetrImageProcessor.from_pretrained(model_name)
+        if backbone == "swin_t":
+            return _build_swin_t_rtdetr(num_labels)
+
+        hf_name = _BACKBONE_HF_MAP.get(backbone, backbone)
+        processor = RTDetrImageProcessor.from_pretrained(hf_name)
         model = RTDetrForObjectDetection.from_pretrained(
-            model_name,
+            hf_name,
             num_labels=num_labels,
             ignore_mismatched_sizes=True,
         )
+        print(f"Backbone: {backbone} ({hf_name})")
         return model, processor
     except ImportError:
         raise ImportError("transformers>=4.35.0 required. Install: pip install torchkick[reid]")
+
+
+def _replace_cls_heads_with_mlp(model, num_labels: int, hidden_dim: int = 256):
+    """Replace linear class_embed + enc_score_head with 2-layer MLP heads."""
+    import torch.nn as nn
+
+    def make_mlp():
+        return nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_labels),
+        )
+
+    inner = getattr(model, "model", model)
+    decoder = getattr(inner, "decoder", None)
+    if decoder is not None and hasattr(decoder, "class_embed"):
+        n = len(decoder.class_embed)
+        decoder.class_embed = nn.ModuleList([make_mlp() for _ in range(n)])
+    if hasattr(inner, "enc_score_head"):
+        inner.enc_score_head = make_mlp()
+    print(f"cls heads → MLP({hidden_dim}→{hidden_dim}→{num_labels}) + LayerNorm")
+    return model
 
 
 def _collate_fn(batch):
@@ -89,6 +139,8 @@ def train_detection(
     resume_from: Optional[str] = None,
     cls_head_lr_scale: float = 20.0,
     cls_head_decay_epochs: int = 30,
+    backbone: str = "r101",
+    use_mlp_head: bool = False,
 ) -> str:
     """
     Train RT-DETR-X on mixed soccer detection data.
@@ -177,7 +229,7 @@ def train_detection(
     print(f"Train: {n_train} samples | Val: {n_val} samples")
 
     # Model
-    model, _ = _get_model_and_processor(model_name, num_labels=num_labels)
+    model, _ = _get_model_and_processor(num_labels=num_labels, backbone=backbone)
 
     # Override VFL focal gamma
     if hasattr(model, "config") and hasattr(model.config, "focal_loss_gamma"):
@@ -187,27 +239,24 @@ def train_detection(
     start_epoch = 1
     best_map50 = 0.0
     if resume_from:
-        import math
-
         ckpt = torch.load(resume_from, map_location="cpu")
-        model.load_state_dict(ckpt["model_state_dict"])
+        model.load_state_dict(ckpt["model_state_dict"], strict=not use_mlp_head)
         start_epoch = ckpt["epoch"] + 1
         best_map50 = ckpt.get("map50", 0.0)
         print(f"Resumed from {resume_from} (epoch {ckpt['epoch']}, mAP@0.5={best_map50:.4f})")
-    else:
-        # Initialize classification head biases to focal-loss prior (≈ -4.6).
-        # Keeps initial sigmoid outputs near 0.01, stabilising Hungarian matching
-        # when the head is randomly reinitialised (num_labels != COCO 80).
-        import math
 
+    if use_mlp_head:
+        model = _replace_cls_heads_with_mlp(model, num_labels=num_labels)
+
+    # Initialize classification head biases to focal-loss prior (≈ -4.6).
+    # For MLP heads this targets the last Linear layer (bias.shape[0] == num_labels).
+    # Skipped on clean resume without MLP swap (weights already trained).
+    if not resume_from or use_mlp_head:
         prior_bias = -math.log((1 - 0.01) / 0.01)  # ≈ -4.6
         for name, module in model.named_modules():
             if hasattr(module, "bias") and module.bias is not None:
-                if "class_embed" in name and module.bias.shape[0] == num_labels:
+                if ("class_embed" in name or "enc_score_head" in name) and module.bias.shape[0] == num_labels:
                     torch.nn.init.constant_(module.bias, prior_bias)
-        enc = getattr(getattr(model, "model", model), "enc_score_head", None)
-        if enc is not None and enc.bias is not None and enc.bias.shape[0] == num_labels:
-            torch.nn.init.constant_(enc.bias, prior_bias)
         print(f"Classification head biases initialised to {prior_bias:.3f} (focal prior p=0.01)")
 
     if use_fsdp:
