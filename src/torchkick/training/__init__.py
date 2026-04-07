@@ -17,6 +17,8 @@ Example:
 from torchkick.training.train_yolo_detection import (
     convert_to_yolo_format,
     convert_dir_to_yolo_format,
+    convert_soccernet_calibration_to_yolo_pose,
+    build_soccernet_keypoint_dataset,
     train_yolo,
     train_yolo_keypoints,
     get_jersey_color_class,
@@ -32,6 +34,8 @@ __all__ = [
     # YOLO player/ball detection
     "convert_to_yolo_format",
     "convert_dir_to_yolo_format",
+    "convert_soccernet_calibration_to_yolo_pose",
+    "build_soccernet_keypoint_dataset",
     "train_yolo",
     "train_yolo_keypoints",
     "get_jersey_color_class",

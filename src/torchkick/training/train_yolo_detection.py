@@ -431,8 +431,256 @@ def train_yolo(
     return best_weights
 
 
+# ---------------------------------------------------------------------------
+# SoccerNet calibration → YOLO-pose (32-keypoint Roboflow schema)
+# ---------------------------------------------------------------------------
+
+# 26 of 32 Roboflow pitch keypoints are directly derivable from SoccerNet
+# line-class endpoints (sorted by image x then y).
+# Keys: (LINE_CLASS_NAME, sorted_endpoint_index)  →  RF vertex index (0-31)
+# Missing RF indices: 8, 10, 11, 18, 19, 21 (penalty spots + inner box intersections)
+_SOCCERNET_TO_RF_VERTEX: dict = {
+    # Pitch corners / boundary lines
+    ("Side line top",    0): 0,  ("Side line top",    1): 24,
+    ("Side line bottom", 0): 5,  ("Side line bottom", 1): 29,
+    ("Side line left",   0): 0,  ("Side line left",   1): 5,
+    ("Side line right",  0): 24, ("Side line right",  1): 29,
+    # Halfway line
+    ("Middle line", 0): 13, ("Middle line", 1): 16,
+    # Left penalty area
+    ("Big rect. left top",    0): 1,  ("Big rect. left top",    1): 9,
+    ("Big rect. left bottom", 0): 4,  ("Big rect. left bottom", 1): 12,
+    ("Big rect. left main",   0): 9,  ("Big rect. left main",   1): 12,
+    # Left goal area
+    ("Small rect. left top",    0): 2, ("Small rect. left top",    1): 6,
+    ("Small rect. left bottom", 0): 3, ("Small rect. left bottom", 1): 7,
+    ("Small rect. left main",   0): 6, ("Small rect. left main",   1): 7,
+    # Right penalty area (sorted by x: front end first, goal line end second)
+    ("Big rect. right top",    0): 17, ("Big rect. right top",    1): 25,
+    ("Big rect. right bottom", 0): 20, ("Big rect. right bottom", 1): 28,
+    ("Big rect. right main",   0): 17, ("Big rect. right main",   1): 20,
+    # Right goal area
+    ("Small rect. right top",    0): 22, ("Small rect. right top",    1): 26,
+    ("Small rect. right bottom", 0): 23, ("Small rect. right bottom", 1): 27,
+    ("Small rect. right main",   0): 22, ("Small rect. right main",   1): 23,
+}
+
+# Symmetric flip pairs for horizontal augmentation (YOLO-pose flip_idx field)
+_RF_FLIP_IDX: list = [
+    24, 25, 26, 27, 28, 29,  # 0-5 → 24-29
+    22, 23, 21,               # 6-8 → 22, 23, 21
+    17, 18, 19, 20,           # 9-12 → 17-20
+    13, 14, 15, 16,           # 13-16 self (halfway + circle top/bottom)
+    9, 10, 11, 12,            # 17-20 → 9-12
+    8,                        # 21 → 8
+    6, 7,                     # 22-23 → 6-7
+    0, 1, 2, 3, 4, 5,         # 24-29 → 0-5
+    31, 30,                   # 30-31 → 31, 30 (circle left ↔ right)
+]
+
+
+def convert_soccernet_calibration_to_yolo_pose(
+    zip_path: str,
+    output_dir: str,
+    split: str = "train",
+    imgsz: int = 640,
+) -> int:
+    """
+    Convert one SoccerNet calibration zip to YOLO-pose format (32-keypoint schema).
+
+    26 of the 32 Roboflow pitch keypoints are derived from SoccerNet line
+    endpoints.  The 6 unreachable ones (penalty spots RF[8,21] and inner box
+    corners RF[10,11,18,19]) are written with visibility=0.
+
+    When the same RF vertex appears in multiple line classes (e.g. RF[0] is
+    both "Side line top" pt[0] and "Side line left" pt[0]), pixel coordinates
+    are averaged across all contributing lines.
+
+    Output layout::
+
+        output_dir/
+          images/<split>/<frame_id>.jpg
+          labels/<split>/<frame_id>.txt  # one row: 0 0.5 0.5 1.0 1.0 kp0…kp31
+
+    Args:
+        zip_path: Path to the SoccerNet calibration zip for one split.
+        output_dir: Root directory for the YOLO-pose dataset.
+        split: Subfolder name, e.g. ``"train"`` or ``"valid"``.
+        imgsz: Resize images to this square size (default 640).
+
+    Returns:
+        Number of successfully converted samples.
+    """
+    import json
+    from collections import defaultdict
+    from io import BytesIO
+
+    import fsspec
+    from PIL import Image
+
+    out = Path(output_dir)
+    img_dir = out / "images" / split
+    lbl_dir = out / "labels" / split
+    img_dir.mkdir(parents=True, exist_ok=True)
+    lbl_dir.mkdir(parents=True, exist_ok=True)
+
+    with fsspec.open(zip_path, "rb") as f:
+        zip_fs = fsspec.filesystem("zip", fo=f)
+        all_files = zip_fs.ls("", detail=False)
+        root_dirs = [p for p in all_files if zip_fs.isdir(p)]
+        root = root_dirs[0].rstrip("/") if root_dirs else ""
+        prefix = f"{root}/" if root else ""
+        entries = zip_fs.ls(prefix, detail=False)
+        json_paths = sorted(e for e in entries if e.endswith(".json"))
+
+        converted = 0
+        for json_path in tqdm(json_paths, desc=f"  {split}", unit="img"):
+            frame_id = Path(json_path).stem
+            img_path = json_path.replace(".json", ".jpg")
+            if not zip_fs.exists(img_path):
+                continue
+
+            with zip_fs.open(json_path, "r") as jf:
+                annotations = json.load(jf)
+            if not annotations:
+                continue
+
+            # Load + resize image
+            with zip_fs.open(img_path, "rb") as imgf:
+                img = Image.open(BytesIO(imgf.read())).convert("RGB")
+            img = img.resize((imgsz, imgsz), Image.BILINEAR)
+            img.save(img_dir / f"{frame_id}.jpg", quality=90)
+
+            # Build [32, 3] keypoint array: (x_norm, y_norm, visibility)
+            # Accumulate multiple contributions per RF index then average
+            accum: dict = defaultdict(list)  # rf_idx → [(x, y), ...]
+
+            for class_name, pts in annotations.items():
+                class_name = class_name.strip()
+                if not pts:
+                    continue
+
+                if class_name == "Circle central":
+                    # Find the 4 cardinal points by position
+                    sorted_pts = sorted(pts, key=lambda p: (p["x"], p["y"]))
+                    if len(sorted_pts) >= 2:
+                        # left-most x → RF[30], right-most x → RF[31]
+                        accum[30].append((sorted_pts[0]["x"], sorted_pts[0]["y"]))
+                        accum[31].append((sorted_pts[-1]["x"], sorted_pts[-1]["y"]))
+                    by_y = sorted(pts, key=lambda p: p["y"])
+                    if len(by_y) >= 2:
+                        # top-most y → RF[14], bottom-most y → RF[15]
+                        accum[14].append((by_y[0]["x"], by_y[0]["y"]))
+                        accum[15].append((by_y[-1]["x"], by_y[-1]["y"]))
+                    continue
+
+                # Non-circle: sort by (x, y) for canonical endpoint order
+                sorted_pts = sorted(pts, key=lambda p: (p["x"], p["y"]))
+                for ep_idx in range(min(2, len(sorted_pts))):
+                    key = (class_name, ep_idx)
+                    rf_idx = _SOCCERNET_TO_RF_VERTEX.get(key)
+                    if rf_idx is not None:
+                        p = sorted_pts[ep_idx]
+                        accum[rf_idx].append((p["x"], p["y"]))
+
+            # Average duplicates, build flat label
+            kp = np.zeros((32, 3), dtype=np.float32)  # (x, y, vis)
+            for rf_idx, coords in accum.items():
+                xs = [c[0] for c in coords]
+                ys = [c[1] for c in coords]
+                kp[rf_idx, 0] = float(np.mean(xs))
+                kp[rf_idx, 1] = float(np.mean(ys))
+                kp[rf_idx, 2] = 2.0  # labeled and visible
+
+            # YOLO-pose row: class cx cy w h  kp0x kp0y kp0v ... kp31x kp31y kp31v
+            row = [0, 0.5, 0.5, 1.0, 1.0]
+            for i in range(32):
+                row.extend([kp[i, 0], kp[i, 1], int(kp[i, 2])])
+
+            with open(lbl_dir / f"{frame_id}.txt", "w") as lf:
+                lf.write(" ".join(f"{v:.6f}" if isinstance(v, float) else str(v) for v in row) + "\n")
+
+            converted += 1
+
+    return converted
+
+
+def build_soccernet_keypoint_dataset(
+    calibration_dir: str,
+    output_dir: str,
+    splits: Optional[list] = None,
+    imgsz: int = 640,
+) -> str:
+    """
+    Convert SoccerNet calibration splits to a YOLO-pose dataset and write a
+    ``dataset.yaml`` file ready for ``train_yolo_keypoints``.
+
+    Looks for ``<calibration_dir>/<split>.zip`` for each requested split.
+    Skips splits whose zip files don't exist.
+
+    Args:
+        calibration_dir: Directory containing ``train.zip``, ``valid.zip``, etc.
+        output_dir: Root directory for the converted dataset.
+        splits: List of split names to convert (default ``["train", "valid"]``).
+        imgsz: Resize images to this square size.
+
+    Returns:
+        Absolute path to the generated ``dataset.yaml``.
+
+    Example:
+        >>> yaml_path = build_soccernet_keypoint_dataset(
+        ...     calibration_dir="data/soccernet/calibration",
+        ...     output_dir="data/pitch_keypoints",
+        ... )
+        >>> weights = train_yolo_keypoints(data_yaml=yaml_path, epochs=100)
+    """
+    if splits is None:
+        splits = ["train", "valid"]
+
+    calib = Path(calibration_dir)
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    yaml_splits: dict = {}
+    total = 0
+    for split in splits:
+        zip_path = calib / f"{split}.zip"
+        if not zip_path.exists():
+            print(f"  [skip] {zip_path} not found")
+            continue
+        print(f"Converting {zip_path.name} …")
+        n = convert_soccernet_calibration_to_yolo_pose(str(zip_path), str(out), split=split, imgsz=imgsz)
+        print(f"  → {n} samples written to {out}/images/{split}/")
+        yaml_splits[split] = f"images/{split}"
+        total += n
+
+    if not yaml_splits:
+        raise RuntimeError(f"No calibration zips found in {calibration_dir}")
+
+    # Write dataset.yaml
+    yaml_path = out / "dataset.yaml"
+    train_key = yaml_splits.get("train", next(iter(yaml_splits.values())))
+    val_key = yaml_splits.get("valid", yaml_splits.get("val", train_key))
+
+    yaml_lines = [
+        f"path: {out.resolve()}",
+        f"train: {train_key}",
+        f"val: {val_key}",
+        "",
+        f"kpt_shape: [32, 3]",
+        f"flip_idx: {_RF_FLIP_IDX}",
+        "",
+        "nc: 1",
+        "names: ['pitch']",
+    ]
+    yaml_path.write_text("\n".join(yaml_lines) + "\n")
+    print(f"\nDataset YAML → {yaml_path}  ({total} total samples)")
+    return str(yaml_path)
+
+
 def train_yolo_keypoints(
-    data_yaml: str,
+    data_yaml: Optional[str] = None,
+    soccernet_calibration_dir: Optional[str] = None,
     base_model: str = "yolo11n-pose.pt",
     epochs: int = 100,
     imgsz: int = 320,
@@ -440,14 +688,25 @@ def train_yolo_keypoints(
     save_dir: str = "weights/keypoints/",
 ) -> str:
     """
-    Train YOLO-pose pitch keypoint detector.
+    Train YOLO-pose pitch keypoint detector (32-keypoint Roboflow schema).
 
-    Uses ``mosaic=0.0`` — Roboflow confirmed mosaic augmentation degrades YOLO-pose
-    keypoint results by shuffling spatial relationships between pitch landmarks.
+    Accepts a pre-built YOLO-pose dataset YAML (``data_yaml``), or a
+    SoccerNet calibration directory (``soccernet_calibration_dir``) that is
+    automatically converted to YOLO-pose format before training.  Both can
+    be supplied to merge datasets (Roboflow YAML + SoccerNet auto-convert).
+
+    Uses ``mosaic=0.0`` — mosaic augmentation shuffles spatial landmark
+    positions and degrades keypoint AP on structured pitch layouts.
 
     Args:
-        data_yaml: Path to YOLO-pose dataset YAML file.
-        base_model: Base YOLO-pose model to finetune.
+        data_yaml: Path to a pre-built YOLO-pose dataset YAML.
+        soccernet_calibration_dir: Directory containing SoccerNet calibration
+            zips (``train.zip``, ``valid.zip``).  Auto-converted to YOLO-pose
+            format targeting the 32-keypoint schema.  When both ``data_yaml``
+            and ``soccernet_calibration_dir`` are supplied, SoccerNet data is
+            converted and its YAML is used (pass ``data_yaml`` separately
+            for Roboflow data and merge the datasets by hand if needed).
+        base_model: Base YOLO-pose model to finetune (e.g. ``yolo11n-pose.pt``).
         epochs: Training epochs.
         imgsz: Input image size (320 is fastest for pitch keypoints).
         device: CUDA device index.
@@ -457,9 +716,27 @@ def train_yolo_keypoints(
         Path to best model weights.
 
     Example:
+        >>> # From a pre-built Roboflow YAML
         >>> weights = train_yolo_keypoints("pitch_keypoints.yaml", epochs=100)
+
+        >>> # Auto-convert SoccerNet calibration data
+        >>> weights = train_yolo_keypoints(
+        ...     soccernet_calibration_dir="data/soccernet/calibration",
+        ...     epochs=100,
+        ... )
     """
     from ultralytics import YOLO
+
+    if soccernet_calibration_dir is not None:
+        converted_dir = str(Path(save_dir).parent / "soccernet_kp_dataset")
+        print(f"Converting SoccerNet calibration data → {converted_dir}")
+        data_yaml = build_soccernet_keypoint_dataset(
+            calibration_dir=soccernet_calibration_dir,
+            output_dir=converted_dir,
+        )
+
+    if data_yaml is None:
+        raise ValueError("Provide data_yaml or soccernet_calibration_dir.")
 
     model = YOLO(base_model)
     results = model.train(

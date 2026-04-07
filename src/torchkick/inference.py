@@ -33,24 +33,11 @@ from torchkick.tracking import (
     HomographyEstimator,
     PitchVisualizer,
     PITCH_LINE_COORDINATES,
+    HALF_LENGTH,
+    HALF_WIDTH,
 )
 from torchkick.utils import VideoReader, VideoWriter, ProgressTracker, generate_output_path
 from torchkick.utils.crops import crop_box as _crop_box
-
-
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
-
-
-def _box_iou(a, b) -> float:
-    """IoU between two [x1, y1, x2, y2] boxes."""
-    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
-    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
-    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
-    if inter == 0:
-        return 0.0
-    return inter / ((a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter + 1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -495,25 +482,35 @@ def render_visualization(
                     cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, 2)
                     cv2.putText(frame_bgr, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
-                # Build pitch minimap
-                pitch_img = pitch_viz.base_pitch.copy()
+                # Build pitch minimap via PitchVisualizer (margin-correct positioning)
+                minimap_entries = []
                 for obs in obs_list:
                     pos = obs.get("pitch_pos")
                     if pos is None:
                         continue
                     role = obs["role"]
                     team = obs["team"]
-                    px = int((pos[0] + 52.5) / 105.0 * pitch_w)
-                    py = int((pos[1] + 34.0) / 68.0 * pitch_h)
-                    px = max(2, min(pitch_w - 3, px))
-                    py = max(2, min(pitch_h - 3, py))
                     if role == "goalie":
-                        dot_color = _GK_COLOR_T0 if team == 0 else _GK_COLOR_T1
+                        # Encode GK as team offset 10 — handled below
+                        minimap_entries.append((pos[0], pos[1], obs["track_id"], team + 10))
                     elif role in ("referee", "linesman"):
+                        minimap_entries.append((pos[0], pos[1], obs["track_id"], 2))
+                    else:
+                        minimap_entries.append((pos[0], pos[1], obs["track_id"], team))
+
+                pitch_img = pitch_viz.base_pitch.copy()
+                for x, y, tid, team_code in minimap_entries:
+                    if abs(x) > HALF_LENGTH + 5 or abs(y) > HALF_WIDTH + 5:
+                        continue
+                    px_dot, py_dot = pitch_viz._pitch_to_pixel(x, y)  # margin-aware
+                    if team_code >= 10:
+                        dot_color = _GK_COLOR_T0 if (team_code - 10) == 0 else _GK_COLOR_T1
+                    elif team_code == 2:
                         dot_color = _REF_COLOR
                     else:
-                        dot_color = _TEAM_COLORS.get(team, _TEAM_COLORS[-1])
-                    cv2.circle(pitch_img, (px, py), 4, dot_color, -1)
+                        dot_color = _TEAM_COLORS.get(team_code, _TEAM_COLORS[-1])
+                    cv2.circle(pitch_img, (px_dot, py_dot), 5, dot_color, -1)
+                    cv2.circle(pitch_img, (px_dot, py_dot), 5, (0, 0, 0), 1)
 
                 pitch_scaled = cv2.resize(pitch_img, (int(pitch_w * scale), meta.height))
                 writer.write(np.hstack([frame_bgr, pitch_scaled]))

@@ -224,24 +224,47 @@ def train_yolo_cmd(
 # ---- YOLO-pose pitch keypoints ----------------------------------------------
 
 @train.command("yolo-keypoints")
-@click.option("--data", "-d", type=click.Path(exists=True), required=True, help="YOLO-pose dataset YAML.")
+@click.option("--data", "-d", type=click.Path(exists=True), default=None, help="Pre-built YOLO-pose dataset YAML.")
+@click.option("--soccernet-calibration-dir", type=click.Path(exists=True), default=None,
+              help="SoccerNet calibration dir (train.zip / valid.zip). Auto-converts to 32-keypoint YOLO-pose format.")
 @click.option("--epochs", "-e", type=int, default=300)
 @click.option("--imgsz", type=int, default=320)
 @click.option("--base-model", type=str, default="yolo11n-pose.pt")
 @click.option("--save-dir", type=str, default="weights/keypoints/")
-def train_yolo_keypoints_cmd(data: str, epochs: int, imgsz: int, base_model: str, save_dir: str) -> None:
+def train_yolo_keypoints_cmd(
+    data: str | None,
+    soccernet_calibration_dir: str | None,
+    epochs: int,
+    imgsz: int,
+    base_model: str,
+    save_dir: str,
+) -> None:
     """
-    Train YOLO-pose pitch keypoint detector.
+    Train YOLO-pose pitch keypoint detector (32-keypoint schema).
 
     Uses mosaic=0.0 to prevent spatial landmark shuffling.
+    Accepts a pre-built YOLO-pose YAML (--data) or auto-converts SoccerNet
+    calibration data (--soccernet-calibration-dir).
 
     Example:
         $ torchkick train yolo-keypoints --data pitch.yaml --epochs 100
+        $ torchkick train yolo-keypoints \\
+              --soccernet-calibration-dir data/soccernet/calibration --epochs 200
     """
     from torchkick.training.train_yolo_detection import train_yolo_keypoints
 
+    if data is None and soccernet_calibration_dir is None:
+        raise click.UsageError("Provide --data (YAML) or --soccernet-calibration-dir.")
+
     click.echo("Training YOLO-pose keypoints (mosaic=0.0)")
-    weights = train_yolo_keypoints(data_yaml=data, base_model=base_model, epochs=epochs, imgsz=imgsz, save_dir=save_dir)
+    weights = train_yolo_keypoints(
+        data_yaml=data,
+        soccernet_calibration_dir=soccernet_calibration_dir,
+        base_model=base_model,
+        epochs=epochs,
+        imgsz=imgsz,
+        save_dir=save_dir,
+    )
     click.echo(f"Done → {weights}")
 
 
