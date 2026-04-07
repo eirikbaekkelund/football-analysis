@@ -254,22 +254,28 @@ def train_detection(
         model.config.focal_loss_gamma = focal_gamma
         print(f"Focal gamma → {focal_gamma}")
 
+    # Replace heads BEFORE loading checkpoint so key names align for MLP-to-MLP resumes.
+    if use_mlp_head:
+        model = _replace_cls_heads_with_mlp(model, num_labels=num_labels)
+
     start_epoch = 1
     best_map50 = 0.0
+    ckpt_has_mlp_heads = False
     if resume_from:
         ckpt = torch.load(resume_from, map_location="cpu")
-        model.load_state_dict(ckpt["model_state_dict"], strict=not use_mlp_head)
+        # Detect whether checkpoint already has trained MLP heads (Sequential keys contain ".0.weight")
+        ckpt_has_mlp_heads = any(
+            ("class_embed" in k or "enc_score_head" in k) and ".0.weight" in k
+            for k in ckpt["model_state_dict"]
+        )
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
         start_epoch = ckpt["epoch"] + 1
         best_map50 = ckpt.get("map50", 0.0)
         print(f"Resumed from {resume_from} (epoch {ckpt['epoch']}, mAP@0.5={best_map50:.4f})")
 
-    if use_mlp_head:
-        model = _replace_cls_heads_with_mlp(model, num_labels=num_labels)
-
     # Initialize classification head biases to focal-loss prior (≈ -4.6).
-    # For MLP heads this targets the last Linear layer (bias.shape[0] == num_labels).
-    # Skipped on clean resume without MLP swap (weights already trained).
-    if not resume_from or use_mlp_head:
+    # Skipped when resuming a checkpoint that already has trained MLP heads.
+    if not resume_from or (use_mlp_head and not ckpt_has_mlp_heads):
         prior_bias = -math.log((1 - 0.01) / 0.01)  # ≈ -4.6
         for name, module in model.named_modules():
             if hasattr(module, "bias") and module.bias is not None:
