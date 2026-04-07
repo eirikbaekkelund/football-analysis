@@ -72,7 +72,6 @@ def train_detection(
     save_dir: str = "weights/detection/",
     device: Optional[str] = None,
     wandb_project: Optional[str] = None,
-    conf_threshold: float = 0.01,
 ) -> str:
     """
     Train RT-DETR-X on mixed soccer detection data.
@@ -161,7 +160,7 @@ def train_detection(
     print(f"Train: {n_train} samples | Val: {n_val} samples")
 
     # Model
-    model, processor = _get_model_and_processor(model_name, num_labels=num_labels)
+    model, _ = _get_model_and_processor(model_name, num_labels=num_labels)
 
     # Initialize classification head biases to focal-loss prior (≈ -4.6).
     # Keeps initial sigmoid outputs near 0.01, stabilising Hungarian matching
@@ -192,15 +191,31 @@ def train_detection(
         model = torch.compile(model, mode="reduce-overhead")
         print("Model compiled with torch.compile.")
 
-    # Optimizer & Scheduler — backbone gets 10x lower LR to prevent catastrophic forgetting
+    # Three-group optimizer:
+    # - backbone:   0.1x LR  — prevent catastrophic forgetting of pretrained features
+    # - cls heads:  10x LR   — re-initialized from scratch, needs fast convergence
+    # - everything else: 1x  — pretrained encoder/decoder, moderate update
     backbone_params = [p for n, p in model.named_parameters() if "backbone" in n]
-    other_params = [p for n, p in model.named_parameters() if "backbone" not in n]
+    cls_head_params = [
+        p for n, p in model.named_parameters() if ("class_embed" in n or "enc_score_head" in n) and "backbone" not in n
+    ]
+    other_params = [
+        p
+        for n, p in model.named_parameters()
+        if "backbone" not in n and "class_embed" not in n and "enc_score_head" not in n
+    ]
     optimizer = torch.optim.AdamW(
         [
             {"params": backbone_params, "lr": learning_rate * lr_backbone_scale},
             {"params": other_params, "lr": learning_rate},
+            {"params": cls_head_params, "lr": learning_rate * 10},
         ],
         weight_decay=1e-4,
+    )
+    print(
+        f"Optimizer groups: backbone={sum(p.numel() for p in backbone_params)/1e6:.1f}M@{learning_rate*lr_backbone_scale:.0e}  "
+        f"cls_head={sum(p.numel() for p in cls_head_params)/1e6:.2f}M@{learning_rate*10:.0e}  "
+        f"other={sum(p.numel() for p in other_params)/1e6:.1f}M@{learning_rate:.0e}"
     )
     total_steps = (n_train // (batch_size * grad_accumulation)) * epochs
     warmup_steps = int(total_steps * warmup_ratio)
@@ -299,11 +314,11 @@ def train_detection(
             if (step + 1) % grad_accumulation == 0:
                 if scaler:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                 if not isinstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR):
                     import warnings
@@ -379,12 +394,11 @@ def train_detection(
                         y2 = (cy + bh / 2) * input_size
                         abs_boxes = torch.stack([x1, y1, x2, y2], dim=-1)
                         person_scores = scores_img[:, 0]  # class-0 (person) confidence
-                        keep = person_scores > conf_threshold
                         preds_map.append(
                             {
-                                "boxes": abs_boxes[keep].cpu(),
-                                "scores": person_scores[keep].cpu(),
-                                "labels": torch.zeros(keep.sum(), dtype=torch.long),
+                                "boxes": abs_boxes.cpu(),
+                                "scores": person_scores.cpu(),
+                                "labels": torch.zeros(len(person_scores), dtype=torch.long),
                             }
                         )
                         targets_map.append(
@@ -399,7 +413,7 @@ def train_detection(
                     val_sanity_done = True
                     if hasattr(out, "logits"):
                         s = out.logits.sigmoid()[:, :, 0]  # [B, 300]
-                        top25 = s.topk(25, dim=-1).values   # [B, 25]
+                        top25 = s.topk(25, dim=-1).values  # [B, 25]
                         print(
                             f"  [val ep{epoch}] score dist — "
                             f"top1: {s.max(dim=-1).values.mean():.4f}  "

@@ -13,7 +13,6 @@ Usage:
 """
 
 import argparse
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -49,12 +48,12 @@ def main():
     n_train = len(full_ds) - n_val
     generator = torch.Generator().manual_seed(42)
     val_ds, _ = random_split(full_ds, [n_val, n_train], generator=generator)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            num_workers=4, collate_fn=_collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4, collate_fn=_collate_fn)
     print(f"Val set: {n_val} samples")
 
     # Model
     from transformers import RTDetrForObjectDetection
+
     model = RTDetrForObjectDetection.from_pretrained(
         args.model_name, num_labels=args.num_classes, ignore_mismatched_sizes=True
     )
@@ -65,7 +64,7 @@ def main():
     print(f"Loaded checkpoint: {args.checkpoint}  (epoch={ckpt.get('epoch', '?')}  map50={ckpt.get('map50', '?'):.4f})")
 
     # Collect all scores and boxes
-    all_scores = []   # list of [300] tensors
+    all_scores = []  # list of [300] tensors
     all_pred_boxes = []  # list of [300, 4] absolute xyxy
     all_gt_boxes = []
     all_gt_labels = []
@@ -91,24 +90,27 @@ def main():
 
             out = model(pixel_values=images, labels=hf_labels)
             scores = out.logits.sigmoid()[:, :, 0].cpu()  # [B, 300]
-            pred_boxes = out.pred_boxes.cpu()             # [B, 300, 4] norm cxcywh
+            pred_boxes = out.pred_boxes.cpu()  # [B, 300, 4] norm cxcywh
 
             for i in range(len(targets)):
                 s = scores[i]
                 pb = pred_boxes[i]
                 cx, cy, bw, bh = pb.unbind(-1)
-                abs_boxes = torch.stack([
-                    (cx - bw / 2) * input_size,
-                    (cy - bh / 2) * input_size,
-                    (cx + bw / 2) * input_size,
-                    (cy + bh / 2) * input_size,
-                ], dim=-1)
+                abs_boxes = torch.stack(
+                    [
+                        (cx - bw / 2) * input_size,
+                        (cy - bh / 2) * input_size,
+                        (cx + bw / 2) * input_size,
+                        (cy + bh / 2) * input_size,
+                    ],
+                    dim=-1,
+                )
                 all_scores.append(s)
                 all_pred_boxes.append(abs_boxes)
                 all_gt_boxes.append(targets[i]["boxes"])
                 all_gt_labels.append(targets[i]["labels"])
 
-    all_scores_t = torch.stack(all_scores)   # [N_val, 300]
+    all_scores_t = torch.stack(all_scores)  # [N_val, 300]
     print(f"\n=== Score Distribution (across {len(all_scores)} val images) ===")
     flat = all_scores_t.flatten()
     for p in [50, 90, 95, 99, 99.9]:
@@ -139,13 +141,20 @@ def main():
             keep = s > thresh
             preds_per_img.append(keep.sum().item())
             metric.update(
-                [{"boxes": all_pred_boxes[i][keep], "scores": s[keep],
-                  "labels": torch.zeros(keep.sum(), dtype=torch.long)}],
+                [
+                    {
+                        "boxes": all_pred_boxes[i][keep],
+                        "scores": s[keep],
+                        "labels": torch.zeros(keep.sum(), dtype=torch.long),
+                    }
+                ],
                 [{"boxes": all_gt_boxes[i], "labels": all_gt_labels[i]}],
             )
         result = metric.compute()
-        print(f"  {thresh:>10.3f}  {np.mean(preds_per_img):>10.1f}  "
-              f"{result['map_50'].item():>10.4f}  {result['map'].item():>14.4f}")
+        print(
+            f"  {thresh:>10.3f}  {np.mean(preds_per_img):>10.1f}  "
+            f"{result['map_50'].item():>10.4f}  {result['map'].item():>14.4f}"
+        )
 
 
 if __name__ == "__main__":

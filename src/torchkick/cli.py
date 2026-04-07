@@ -498,6 +498,12 @@ def train() -> None:
 )
 @click.option("--epochs", "-e", type=int, default=300)
 @click.option("--batch-size", "-b", type=int, default=8)
+@click.option(
+    "--grad-accumulation",
+    type=int,
+    default=2,
+    help="Gradient accumulation steps. Effective batch = batch_size * grad_accumulation.",
+)
 @click.option("--lr", type=float, default=1e-5)
 @click.option(
     "--lr-backbone-scale",
@@ -510,12 +516,6 @@ def train() -> None:
     type=int,
     default=1,
     help="Number of output classes. Default 1 = player only (SoccerNet has no per-class annotation).",
-)
-@click.option(
-    "--conf-threshold",
-    type=float,
-    default=0.3,
-    help="Person confidence threshold for mAP computation (default 0.3).",
 )
 @click.option("--save-dir", type=str, default="weights/detection/")
 @click.option("--no-compile", is_flag=True, help="Disable torch.compile.")
@@ -531,10 +531,10 @@ def train_detection_cmd(
     person_ball: bool,
     epochs: int,
     batch_size: int,
+    grad_accumulation: int,
     lr: float,
     lr_backbone_scale: float,
     num_classes: int,
-    conf_threshold: float,
     save_dir: str,
     no_compile: bool,
     fsdp: bool,
@@ -611,13 +611,13 @@ def train_detection_cmd(
         num_labels=num_classes,
         epochs=epochs,
         batch_size=batch_size,
+        grad_accumulation=grad_accumulation,
         learning_rate=lr,
         lr_backbone_scale=lr_backbone_scale,
         compile_model=not no_compile,
         use_fsdp=fsdp,
         save_dir=save_dir,
         wandb_project=wandb_project,
-        conf_threshold=conf_threshold,
     )
     click.echo(f"Training complete! Best model: {weights}")
 

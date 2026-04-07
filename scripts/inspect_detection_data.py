@@ -101,25 +101,33 @@ def main():
         labels = tgt["labels"].numpy()
 
         label_dist = {int(l): int((labels == l).sum()) for l in np.unique(labels)}
-        print(f"  sample {i:02d}: {len(boxes)} boxes  labels={label_dist}  "
-              f"sizes={[(int(b[2]-b[0]), int(b[3]-b[1])) for b in boxes[:4]]}")
+        print(
+            f"  sample {i:02d}: {len(boxes)} boxes  labels={label_dist}  "
+            f"sizes={[(int(b[2]-b[0]), int(b[3]-b[1])) for b in boxes[:4]]}"
+        )
 
         for box, label in zip(boxes, labels):
             x1, y1, x2, y2 = map(int, box)
             color = label_colors.get(int(label), (255, 0, 0))
             cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(img, label_names.get(int(label), str(label)),
-                        (x1, max(y1 - 4, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            cv2.putText(
+                img,
+                label_names.get(int(label), str(label)),
+                (x1, max(y1 - 4, 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                color,
+                1,
+            )
 
-        cv2.putText(img, f"n={len(boxes)} {label_dist}", (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(img, f"n={len(boxes)} {label_dist}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         cv2.imwrite(str(out_dir / f"sample_{i:02d}.jpg"), img)
 
     print(f"\nSaved {min(args.n_samples, len(ds))} samples to {args.output_dir}")
 
     all_boxes = [tgt["boxes"] for tgt in targets]
     box_counts = [len(b) for b in all_boxes]
-    all_wh = [(b[:, 2]-b[:, 0], b[:, 3]-b[:, 1]) for b in all_boxes if len(b)]
+    all_wh = [(b[:, 2] - b[:, 0], b[:, 3] - b[:, 1]) for b in all_boxes if len(b)]
     print(f"Boxes per image: min={min(box_counts)} max={max(box_counts)} mean={np.mean(box_counts):.1f}")
     if all_wh:
         ws = torch.cat([w for w, h in all_wh])
