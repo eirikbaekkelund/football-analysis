@@ -524,6 +524,7 @@ def convert_soccernet_calibration_to_yolo_pose(
     output_dir: str,
     split: str = "train",
     imgsz: int = 640,
+    min_keypoints: int = 6,
 ) -> int:
     """
     Convert one SoccerNet calibration zip to YOLO-pose format (32-keypoint schema).
@@ -547,6 +548,10 @@ def convert_soccernet_calibration_to_yolo_pose(
         output_dir: Root directory for the YOLO-pose dataset.
         split: Subfolder name, e.g. ``"train"`` or ``"valid"``.
         imgsz: Resize images to this square size (default 640).
+        min_keypoints: Minimum number of visible keypoints required to keep a
+            sample.  Close-up / goal-mouth shots typically yield 2-4 visible
+            points; broadcast wide shots yield 8-15+.  Samples below this
+            threshold are skipped (default 6).
 
     Returns:
         Number of successfully converted samples.
@@ -632,6 +637,10 @@ def convert_soccernet_calibration_to_yolo_pose(
                 kp[rf_idx, 1] = float(np.clip(np.mean(ys), 0.0, 1.0))
                 kp[rf_idx, 2] = 2.0  # labeled and visible
 
+            # Skip close-up shots with too few visible landmarks
+            if int(np.sum(kp[:, 2] > 0)) < min_keypoints:
+                continue
+
             # YOLO-pose row: class cx cy w h  kp0x kp0y kp0v ... kp31x kp31y kp31v
             row = [0, 0.5, 0.5, 1.0, 1.0]
             for i in range(32):
@@ -650,6 +659,7 @@ def build_soccernet_keypoint_dataset(
     output_dir: str,
     splits: Optional[list] = None,
     imgsz: int = 640,
+    min_keypoints: int = 6,
 ) -> str:
     """
     Convert SoccerNet calibration splits to a YOLO-pose dataset and write a
@@ -689,7 +699,7 @@ def build_soccernet_keypoint_dataset(
             print(f"  [skip] {zip_path} not found")
             continue
         print(f"Converting {zip_path.name} …")
-        n = convert_soccernet_calibration_to_yolo_pose(str(zip_path), str(out), split=split, imgsz=imgsz)
+        n = convert_soccernet_calibration_to_yolo_pose(str(zip_path), str(out), split=split, imgsz=imgsz, min_keypoints=min_keypoints)
         print(f"  → {n} samples written to {out}/images/{split}/")
         yaml_splits[split] = f"images/{split}"
         total += n
