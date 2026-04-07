@@ -27,12 +27,25 @@ CLI:
 
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
 from torch.utils.data import DataLoader, random_split
+
+
+def _make_lr_lambda(warmup_steps: int, decay_steps: int, min_lr_ratio: float = 0.01):
+    """Linear warmup then cosine decay to min_lr_ratio, held flat beyond decay_steps."""
+
+    def lr_lambda(current_step: int) -> float:
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, decay_steps - warmup_steps))
+        return max(min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress))))
+
+    return lr_lambda
 
 
 def _get_model_and_processor(model_name: str, num_labels: int = 2):
@@ -74,6 +87,8 @@ def train_detection(
     wandb_project: Optional[str] = None,
     focal_gamma: float = 3.0,
     resume_from: Optional[str] = None,
+    cls_head_lr_scale: float = 20.0,
+    cls_head_decay_epochs: int = 30,
 ) -> str:
     """
     Train RT-DETR-X on mixed soccer detection data.
@@ -226,24 +241,32 @@ def train_detection(
         [
             {"params": backbone_params, "lr": learning_rate * lr_backbone_scale},
             {"params": other_params, "lr": learning_rate},
-            {"params": cls_head_params, "lr": learning_rate * 50},
+            {"params": cls_head_params, "lr": learning_rate * cls_head_lr_scale},
         ],
         weight_decay=1e-4,
     )
     print(
         f"Optimizer groups: backbone={sum(p.numel() for p in backbone_params)/1e6:.1f}M@{learning_rate*lr_backbone_scale:.0e}  "
-        f"cls_head={sum(p.numel() for p in cls_head_params)/1e6:.2f}M@{learning_rate*50:.0e}  "
+        f"cls_head={sum(p.numel() for p in cls_head_params)/1e6:.2f}M@{learning_rate*cls_head_lr_scale:.0e}  "
         f"other={sum(p.numel() for p in other_params)/1e6:.1f}M@{learning_rate:.0e}"
     )
     remaining_epochs = epochs - start_epoch + 1
-    total_steps = (n_train // (batch_size * grad_accumulation)) * remaining_epochs
+    steps_per_epoch = n_train // (batch_size * grad_accumulation)
+    total_steps = steps_per_epoch * remaining_epochs
     warmup_steps = int(total_steps * warmup_ratio)
-    try:
-        from transformers import get_cosine_schedule_with_warmup
-
-        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-    except ImportError:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    cls_head_decay_steps = warmup_steps + steps_per_epoch * min(cls_head_decay_epochs, remaining_epochs)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=[
+            _make_lr_lambda(warmup_steps, total_steps),  # backbone: full cosine
+            _make_lr_lambda(warmup_steps, total_steps),  # other:    full cosine
+            _make_lr_lambda(warmup_steps, cls_head_decay_steps),  # cls_head: aggressive decay
+        ],
+    )
+    print(
+        f"Scheduler: backbone/other cosine over {remaining_epochs} epochs | "
+        f"cls_head cosine over {min(cls_head_decay_epochs, remaining_epochs)} epochs → 1% peak"
+    )
 
     scaler = torch.amp.GradScaler("cuda") if dev.type == "cuda" else None
 
@@ -338,12 +361,7 @@ def train_detection(
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
-                if not isinstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR):
-                    import warnings
-
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore", UserWarning)
-                        scheduler.step()
+                scheduler.step()
                 optimizer.zero_grad()
 
                 update = (step + 1) // grad_accumulation
@@ -368,9 +386,6 @@ def train_detection(
                     )
 
             train_loss += loss.item() * grad_accumulation
-
-        if isinstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR):
-            scheduler.step()
 
         # Validation
         model.eval()

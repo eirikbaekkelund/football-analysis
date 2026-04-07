@@ -544,6 +544,10 @@ def train() -> None:
 @click.option(
     "--resume", type=click.Path(exists=True), default=None, help="Resume training from a saved checkpoint (.pth)."
 )
+@click.option("--cls-head-lr-scale", type=float, default=20.0, help="cls_head LR multiplier (peak LR = lr * scale).")
+@click.option(
+    "--cls-head-decay-epochs", type=int, default=30, help="Epochs over which cls_head LR cosine-decays to 1%% of peak."
+)
 def train_detection_cmd(
     soccernet: str | None,
     soccernet_dir: str | None,
@@ -564,6 +568,8 @@ def train_detection_cmd(
     wandb_project: str | None,
     focal_gamma: float,
     resume: str | None,
+    cls_head_lr_scale: float,
+    cls_head_decay_epochs: int,
 ) -> None:
     """
     Train RT-DETR player detector from any combination of data sources.
@@ -645,6 +651,8 @@ def train_detection_cmd(
         wandb_project=wandb_project,
         focal_gamma=focal_gamma,
         resume_from=resume,
+        cls_head_lr_scale=cls_head_lr_scale,
+        cls_head_decay_epochs=cls_head_decay_epochs,
     )
     click.echo(f"Training complete! Best model: {weights}")
 
@@ -1071,6 +1079,100 @@ def label_active_learning(
         frame_step=frame_step,
     )
     click.echo(f"Selected {result['selected']} frames → {len(result['uploaded_task_ids'])} CVAT tasks created")
+
+
+@train.command("body-pose")
+@click.option("--data", "-d", type=click.Path(exists=True), required=True, help="Path to downloaded FIFA dataset root.")
+@click.option("--epochs", "-e", type=int, default=30)
+@click.option("--batch-size", "-b", type=int, default=16)
+@click.option("--lr", type=float, default=1e-4, help="Peak learning rate.")
+@click.option(
+    "--model-id", type=str, default="usyd-community/vitpose-base-simple", help="ViTPose HF model ID or local path."
+)
+@click.option("--save-dir", type=str, default="weights/body_pose/")
+@click.option("--wandb-project", type=str, default=None)
+@click.option("--max-samples", type=int, default=None, help="Cap dataset size for smoke tests.")
+def train_body_pose_cmd(
+    data: str,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    model_id: str,
+    save_dir: str,
+    wandb_project: str | None,
+    max_samples: int | None,
+) -> None:
+    """
+    Fine-tune ViTPose on FIFA body pose data (COCO-17 joints).
+
+    Downloads the FIFA dataset first:
+        huggingface-cli download tijiang13/FIFA-Skeletal-Tracking-Light-2026
+            --repo-type dataset --local-dir data/fifa/
+
+    Example:
+        $ torchkick train body-pose --data data/fifa/ --epochs 30
+    """
+    from torchkick.training import train_body_pose
+
+    click.echo(f"Fine-tuning ViTPose on {data}")
+    weights = train_body_pose(
+        data_dir=data,
+        model_id=model_id,
+        epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=lr,
+        save_dir=save_dir,
+        wandb_project=wandb_project,
+        max_samples=max_samples,
+    )
+    click.echo(f"Training complete! Best model: {weights}")
+
+
+@train.command("pose-lifter")
+@click.option("--data", "-d", type=click.Path(exists=True), required=True, help="Path to downloaded FIFA dataset root.")
+@click.option("--epochs", "-e", type=int, default=50)
+@click.option("--batch-size", "-b", type=int, default=512)
+@click.option("--lr", type=float, default=1e-3)
+@click.option("--hidden-dim", type=int, default=1024)
+@click.option("--n-blocks", type=int, default=4)
+@click.option("--save-dir", type=str, default="weights/lifter/")
+@click.option("--wandb-project", type=str, default=None)
+@click.option("--max-samples", type=int, default=None, help="Cap dataset size for smoke tests.")
+def train_pose_lifter_cmd(
+    data: str,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    hidden_dim: int,
+    n_blocks: int,
+    save_dir: str,
+    wandb_project: str | None,
+    max_samples: int | None,
+) -> None:
+    """
+    Train 2D→3D pose lifting MLP on FIFA paired pose data.
+
+    Trains a residual MLP on Body25→COCO-17 remapped 2D/3D pairs.
+    Reported metric: MPJPE (mm) on visible joints.
+
+    Example:
+        $ torchkick train pose-lifter --data data/fifa/ --epochs 50
+    """
+    from torchkick.training import train_pose_lifter
+
+    click.echo(f"Training pose lifter on {data}")
+    weights = train_pose_lifter(
+        data_dir=data,
+        epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=lr,
+        hidden_dim=hidden_dim,
+        n_blocks=n_blocks,
+        save_dir=save_dir,
+        wandb_project=wandb_project,
+        max_samples=max_samples,
+    )
+    click.echo(f"Training complete! Best model: {weights}")
 
 
 if __name__ == "__main__":

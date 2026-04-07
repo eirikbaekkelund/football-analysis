@@ -24,6 +24,8 @@ from torchkick.training.train_detection import train_detection
 from torchkick.training.train_keypoints import train_keypoints
 from torchkick.training.train_reid import train_reid
 from torchkick.training.train_distill import train_distill
+from torchkick.training.train_body_pose import train_body_pose
+from torchkick.training.train_pose_lifter import train_pose_lifter, PoseLiftMLP
 
 __all__ = [
     # Ball detector / YOLO-pose keypoints
@@ -39,4 +41,9 @@ __all__ = [
     "train_reid",
     # Knowledge distillation ViT-L/14 → ViT-S/8
     "train_distill",
+    # ViTPose fine-tuning on FIFA body pose data
+    "train_body_pose",
+    # 2D→3D pose lifting MLP
+    "train_pose_lifter",
+    "PoseLiftMLP",
 ]
