@@ -265,8 +265,7 @@ def train_detection(
         ckpt = torch.load(resume_from, map_location="cpu")
         # Detect whether checkpoint already has trained MLP heads (Sequential keys contain ".0.weight")
         ckpt_has_mlp_heads = any(
-            ("class_embed" in k or "enc_score_head" in k) and ".0.weight" in k
-            for k in ckpt["model_state_dict"]
+            ("class_embed" in k or "enc_score_head" in k) and ".0.weight" in k for k in ckpt["model_state_dict"]
         )
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
         start_epoch = ckpt["epoch"] + 1
@@ -339,9 +338,9 @@ def train_detection(
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
         lr_lambda=[
-            _make_phased_lr_lambda(backbone_phase1_steps, backbone_ramp_steps, total_steps),          # backbone
-            _make_phased_lr_lambda(0, other_warmup_steps, total_steps, phase1_ratio=0.0),             # other
-            _make_phased_lr_lambda(0, other_warmup_steps, cls_head_total_steps, phase1_ratio=0.0),    # cls_head
+            _make_phased_lr_lambda(backbone_phase1_steps, backbone_ramp_steps, total_steps),  # backbone
+            _make_phased_lr_lambda(0, other_warmup_steps, total_steps, phase1_ratio=0.0),  # other
+            _make_phased_lr_lambda(0, other_warmup_steps, cls_head_total_steps, phase1_ratio=0.0),  # cls_head
         ],
     )
     print(

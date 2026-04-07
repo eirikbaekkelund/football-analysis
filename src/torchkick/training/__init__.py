@@ -2,7 +2,7 @@
 Training scripts for football analysis models.
 
 Submodules:
-    train_ball_detector: YOLOv9-nano ball detection training
+    train_yolo_detection: YOLO player/ball detection training
     train_detection: RT-DETR-X player/ball/referee detection
     train_keypoints: ViTPose-L pitch landmark detection
     train_reid: DINOv2+LoRA+ArcFace player re-identification
@@ -14,8 +14,9 @@ Example:
     >>> ball_weights = train_yolo(data_zip="data/train.zip", epochs=30)
 """
 
-from torchkick.training.train_ball_detector import (
+from torchkick.training.train_yolo_detection import (
     convert_to_yolo_format,
+    convert_dir_to_yolo_format,
     train_yolo,
     train_yolo_keypoints,
     get_jersey_color_class,
@@ -28,8 +29,9 @@ from torchkick.training.train_body_pose import train_body_pose
 from torchkick.training.train_pose_lifter import train_pose_lifter, PoseLiftMLP
 
 __all__ = [
-    # Ball detector / YOLO-pose keypoints
+    # YOLO player/ball detection
     "convert_to_yolo_format",
+    "convert_dir_to_yolo_format",
     "train_yolo",
     "train_yolo_keypoints",
     "get_jersey_color_class",

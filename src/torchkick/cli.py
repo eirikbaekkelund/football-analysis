@@ -685,68 +685,50 @@ def train_detection_cmd(
 
 
 @train.command("yolo")
-@click.option(
-    "--data",
-    "-d",
-    type=click.Path(),
-    default=None,
-    help="Path to SoccerNet zip or YOLO dataset directory.",
-)
-@click.option(
-    "--epochs",
-    "-e",
-    type=int,
-    default=100,
-    help="Number of training epochs.",
-)
-@click.option(
-    "--batch-size",
-    "-b",
-    type=int,
-    default=256,
-    help="Training batch size.",
-)
-@click.option(
-    "--colors",
-    is_flag=True,
-    help="Train with jersey color classification (7 classes).",
-)
+@click.option("--data", "-d", type=click.Path(), default=None, help="Path to SoccerNet zip or YOLO dataset directory.")
+@click.option("--soccernet-dir", type=click.Path(exists=True), default=None, help="Pre-extracted SoccerNet directory.")
+@click.option("--epochs", "-e", type=int, default=100)
+@click.option("--batch-size", "-b", type=int, default=32)
+@click.option("--colors", is_flag=True, help="Train with jersey color classification (7 classes).")
 @click.option(
     "--base-model",
     type=str,
-    default="yolo11n.pt",
-    help="Base YOLO model to finetune.",
+    default="yolo11l.pt",
+    help="Base YOLO model: yolo11n/s/m/l/x.pt. Default yolo11l (25M params, best accuracy/speed tradeoff).",
+)
+@click.option(
+    "--save-dir", type=str, default="/workspace/weights/yolo_detection/", help="Output directory for weights."
 )
 def train_yolo_cmd(
     data: str | None,
+    soccernet_dir: str | None,
     epochs: int,
     batch_size: int,
     colors: bool,
     base_model: str,
+    save_dir: str,
 ) -> None:
     """
-    Train YOLO player detector.
-
-    Trains YOLOv11 on SoccerNet tracking data for player detection.
+    Train YOLO player detector on SoccerNet data.
 
     Example:
-        $ torchkick train yolo --epochs 50 --batch-size 256
-        $ torchkick train yolo --data tracking/train.zip --colors
+        $ torchkick train yolo --soccernet-dir /tmp/soccernet_extracted/ --epochs 100
+        $ torchkick train yolo --data tracking/train.zip --base-model yolo11l.pt
     """
     from torchkick.training import train_yolo
 
-    click.echo("Training YOLO player detector")
-    click.echo(f"  Epochs: {epochs}")
-    click.echo(f"  Batch size: {batch_size}")
-    click.echo(f"  Color classification: {colors}")
+    click.echo(f"Training YOLO ({base_model}) player detector")
+    click.echo(f"  Epochs: {epochs} | Batch: {batch_size}")
 
     weights = train_yolo(
         data_zip=data if data and data.endswith(".zip") else None,
         data_dir=data if data and not data.endswith(".zip") else None,
+        soccernet_dir=soccernet_dir,
         epochs=epochs,
         batch_size=batch_size,
         use_colors=colors,
         base_model=base_model,
+        project=save_dir,
     )
 
     click.echo(f"Training complete! Best model: {weights}")

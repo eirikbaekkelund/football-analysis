@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import io
 import os
+import random
+import shutil
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -244,14 +246,93 @@ val: images/val
     print(f"Conversion complete. Dataset YAML: {output_dir / 'dataset.yaml'}")
 
 
+def convert_dir_to_yolo_format(
+    soccernet_dir: str,
+    output_dir: str,
+    val_ratio: float = 0.15,
+    seed: int = 42,
+) -> None:
+    """
+    Convert a pre-extracted SoccerNet directory to YOLO format with train/val split.
+
+    Expects layout: <soccernet_dir>/<seq_name>/img1/<frame>.jpg
+                    <soccernet_dir>/<seq_name>/gt/gt.txt  (MOT format)
+    """
+    output_dir = Path(output_dir)
+    for split in ("train", "val"):
+        (output_dir / "images" / split).mkdir(parents=True, exist_ok=True)
+        (output_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
+
+    root = Path(soccernet_dir)
+    sequences = sorted([d for d in root.iterdir() if d.is_dir() and (d / "gt" / "gt.txt").exists()])
+
+    rng = random.Random(seed)
+    rng.shuffle(sequences)
+    n_val = max(1, int(len(sequences) * val_ratio))
+    val_seqs = {s.name for s in sequences[:n_val]}
+
+    print(f"Converting {len(sequences)} sequences → {len(sequences) - n_val} train / {n_val} val")
+
+    for seq_dir in tqdm(sequences, desc="Converting"):
+        seq_name = seq_dir.name
+        split = "val" if seq_name in val_seqs else "train"
+        out_images = output_dir / "images" / split
+        out_labels = output_dir / "labels" / split
+
+        gt_path = seq_dir / "gt" / "gt.txt"
+        img_dir = seq_dir / "img1"
+
+        df = pd.read_csv(
+            gt_path,
+            header=None,
+            names=["frame", "track_id", "x", "y", "w", "h", "conf", "class_id", "visibility", "unused"],
+        )
+
+        for frame_id in df["frame"].unique():
+            img_path = img_dir / f"{frame_id:06d}.jpg"
+            if not img_path.exists():
+                continue
+
+            img = Image.open(img_path)
+            img_w, img_h = img.size
+            save_name = f"{seq_name}_{frame_id:06d}"
+
+            shutil.copy2(img_path, out_images / f"{save_name}.jpg")
+
+            frame_data = df[df["frame"] == frame_id]
+            yolo_lines = []
+            for _, row in frame_data.iterrows():
+                x, y, w, h = row["x"], row["y"], row["w"], row["h"]
+                cx = float(np.clip((x + w / 2) / img_w, 0, 1))
+                cy = float(np.clip((y + h / 2) / img_h, 0, 1))
+                nw = float(np.clip(w / img_w, 0, 1))
+                nh = float(np.clip(h / img_h, 0, 1))
+                yolo_lines.append(f"0 {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}")
+
+            with open(out_labels / f"{save_name}.txt", "w") as f:
+                f.write("\n".join(yolo_lines))
+
+    yaml_content = f"""path: {output_dir.absolute()}
+train: images/train
+val: images/val
+names:
+  0: player
+"""
+    with open(output_dir / "dataset.yaml", "w") as f:
+        f.write(yaml_content)
+
+    print(f"Conversion complete. Dataset YAML: {output_dir / 'dataset.yaml'}")
+
+
 def train_yolo(
     data_zip: Optional[str] = None,
     data_dir: Optional[str] = None,
-    epochs: int = 50,
-    batch_size: int = 256,
+    soccernet_dir: Optional[str] = None,
+    epochs: int = 100,
+    batch_size: int = 32,
     imgsz: int = 640,
     use_colors: bool = False,
-    base_model: str = "yolo11n.pt",
+    base_model: str = "yolo11l.pt",
     device: int = 0,
     project: str = "player_tracker",
 ) -> str:
@@ -293,16 +374,17 @@ def train_yolo(
 
     # Convert data if needed
     if not os.path.exists(data_dir):
-        if data_zip is None:
-            data_zip = "soccernet/tracking/tracking/train.zip"
+        if soccernet_dir is not None:
+            convert_dir_to_yolo_format(soccernet_dir, data_dir)
+        else:
+            if data_zip is None:
+                data_zip = "soccernet/tracking/tracking/train.zip"
+            if not os.path.exists(data_zip):
+                print("Downloading SoccerNet tracking data...")
+                from torchkick.soccernet import download_soccernet
 
-        if not os.path.exists(data_zip):
-            print(f"Downloading SoccerNet tracking data...")
-            from torchkick.soccernet import download_soccernet
-
-            download_soccernet("tracking", "soccernet/tracking")
-
-        convert_to_yolo_format(data_zip, data_dir, use_colors=use_colors)
+                download_soccernet("tracking", "soccernet/tracking")
+            convert_to_yolo_format(data_zip, data_dir, use_colors=use_colors)
     else:
         print(f"Using existing dataset: {data_dir}")
 
