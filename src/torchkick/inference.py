@@ -1,43 +1,23 @@
 """
 Match analysis inference pipeline.
 
-This module provides the main inference pipeline for football match
-analysis, combining player detection, tracking, homography estimation,
-team classification, and visualization.
+Runs YOLO detection + BotSORT tracking, YOLO-pose pitch keypoint estimation
+for 2D homography, and appearance-based team assignment.
 
+Output: annotated video with team-coloured bounding boxes + 2D pitch minimap.
 
 Example:
-    CLI usage:
-    
-    ```bash
-    # Basic inference
-    torchkick analyze --video match.mp4 --output output.mp4
-    
-    # With specific model
-    torchkick analyze --video match.mp4 --model yolo --duration 60
-    
-    # Full pipeline with all options
-    torchkick analyze \\
-        --video match.mp4 \\
-        --model fcnn \\
-        --duration 120 \\
-        --homography-interval 1 \\
-        --dominance
-    ```
-    
-    Python API:
-    
     >>> from torchkick.inference import run_analysis
-    >>> 
     >>> output = run_analysis(
     ...     video_path="match.mp4",
-    ...     model_type="yolo",
-    ...     duration=60.0,
+    ...     yolo_weights="weights/yolo11l_football/best.pt",
+    ...     pitch_weights="weights/keypoints/best.pt",
     ... )
 """
 
 from __future__ import annotations
 
+import random
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -49,676 +29,33 @@ import torch
 from torchkick.tracking import (
     TrajectoryStore,
     TrajectorySmoother,
-    ByteTracker,
-    MaskIoUTracker,
     IdentityAssigner,
-    PitchSlotManager,
     HomographyEstimator,
     PitchVisualizer,
     PITCH_LINE_COORDINATES,
 )
-from torchkick.utils import (
-    VideoReader,
-    VideoWriter,
-    ProgressTracker,
-    generate_output_path,
-)
-
-
+from torchkick.utils import VideoReader, VideoWriter, ProgressTracker, generate_output_path
 from torchkick.utils.crops import crop_box as _crop_box
 
 
-def load_models(
-    device: torch.device,
-    model_path: str,
-    model_type: str,
-    reid_weights: Optional[str] = None,
-    pitch_weights: Optional[str] = None,
-    pitch_detector_type: str = "yolo",
-    enable_pose: bool = False,
-    pose_weights: Optional[str] = None,
-) -> Tuple:
-    """
-    Load detection and homography models, and optionally the ReID embedder.
-
-    Args:
-        device: Torch device.
-        model_path: Path to detection model weights.
-        model_type: "yolo", "fcnn", "rtdetr", "rfdetr", "sam3_mlx", or "sam3_pytorch".
-        reid_weights: Optional path to ReID student checkpoint. When provided,
-            a ``DINOv2ReIDEmbedder`` is included in the return tuple.
-        pitch_weights: Optional path to pitch keypoint model weights.
-            When provided, loads a ``YOLOPoseKeypointDetector`` or
-            ``ViTPoseKeypointDetector`` for homography estimation.
-            When None, homography estimation is skipped.
-        pitch_detector_type: "yolo" (faster, default) or "vitpose" (more accurate).
-
-    Returns:
-        ``(detector, pitch_kp_detector, reid_embedder)`` — ``pitch_kp_detector``
-        and ``reid_embedder`` are None when the corresponding weights are not given.
-    """
-    # Load pitch keypoint detector (optional)
-    pitch_kp_detector = None
-    if pitch_weights is not None:
-        from torchkick.models.pitch import ViTPoseKeypointDetector, YOLOPoseKeypointDetector
-
-        # YOLO does not support MPS; fall back to CPU on Apple Silicon
-        yolo_device = str(device) if str(device) not in ("mps", "mps:0") else "cpu"
-        if pitch_detector_type == "vitpose":
-            pitch_kp_detector = ViTPoseKeypointDetector(
-                weights_path=pitch_weights,
-                device=str(device),
-            )
-        else:
-            pitch_kp_detector = YOLOPoseKeypointDetector(
-                weights_path=pitch_weights,
-                device=yolo_device,
-            )
-
-    # Load detection model
-    if model_type == "yolo":
-        from ultralytics import YOLO
-
-        detector = YOLO(model_path)
-        detector.to(device)
-    
-   
-    
-
-    reid_embedder = None
-    if reid_weights is not None:
-        try:
-            from torchkick.models.reid import DINOv2ReIDEmbedder
-
-            reid_embedder = DINOv2ReIDEmbedder(
-                weights_path=reid_weights,
-                device=str(device),
-            )
-            print(f"ReID embedder loaded from {reid_weights}")
-        except Exception as e:
-            print(f"[warn] Could not load ReID embedder: {e}. Continuing without ReID.")
-
-    body_pose_detector = None
-    if enable_pose:
-        try:
-            from torchkick.models.pose import BodyPoseDetector
-
-            body_pose_detector = BodyPoseDetector(
-                model_name=pose_weights or "usyd-community/vitpose-base-simple",
-                device=str(device),
-            )
-            print(f"BodyPoseDetector loaded ({pose_weights or 'usyd-community/vitpose-base-simple'})")
-        except Exception as e:
-            print(f"[warn] Could not load BodyPoseDetector: {e}. Pose estimation disabled.")
-
-    return detector, pitch_kp_detector, reid_embedder, body_pose_detector
-
-
-def _detect_and_project_sam3_mlx(
-    video_path: str,
-    predictor: "Sam3VideoPredictorMLX",
-    homography: HomographyEstimator,
-    store: TrajectoryStore,
-    progress: ProgressTracker,
-):
-    """Run MLX-based Sam3 predictor over a video and populate the TrajectoryStore.
-
-    Iterates the propagated mask results frame-by-frame, projects each mask's
-    bounding box to pitch coordinates via the Kalman-smoothed homography, and
-    stores observations.  Kalman prediction covers gaps up to 30 frames without
-    a new keyframe estimate.
-    """
-    sess = predictor.start_session(video_path)
-    session_id = sess["session_id"]
-
-    mask_tracker = MaskIoUTracker(max_age=30, iou_threshold=0.5)
-    rep_mask_interval = max(1, int(store.fps))
-
-    for frame_idx, per_obj in predictor.propagate_in_video(session_id, start_frame_idx=0):
-        progress.update(1)
-
-        frame_masks = []
-        for obj_id, outputs in per_obj.items():
-            masks = outputs.get("masks")
-            if masks is None:
-                continue
-            try:
-                arr = np.array(masks)
-            except Exception:
-                arr = masks
-
-            if hasattr(arr, "ndim"):
-                if arr.ndim == 4:
-                    m = arr[0, 0]
-                elif arr.ndim == 3:
-                    m = arr[0]
-                else:
-                    m = arr
-            else:
-                m = arr
-
-            frame_masks.append((m > 0.5).astype(np.uint8))
-
-        matches = mask_tracker.update(frame_masks)
-
-        for track_id, mask in matches:
-            ys, xs = np.where(mask > 0)
-            if len(xs) == 0:
-                continue
-            x1, x2 = xs.min(), xs.max()
-            y1, y2 = ys.min(), ys.max()
-            box = [float(x1), float(y1), float(x2), float(y2)]
-
-            pitch_pos = homography.project_player_to_pitch(box)
-            rep_mask = mask if (frame_idx % rep_mask_interval == 0) else None
-
-            store.add_observation(
-                track_id=track_id,
-                frame_idx=frame_idx,
-                box=box,
-                pitch_pos=pitch_pos,
-                rep_mask=rep_mask,
-            )
-
-    predictor.close_session(session_id)
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
 
 def _box_iou(a, b) -> float:
-    """Compute IoU between two [x1,y1,x2,y2] boxes."""
-    ix1 = max(a[0], b[0])
-    iy1 = max(a[1], b[1])
-    ix2 = min(a[2], b[2])
-    iy2 = min(a[3], b[3])
+    """IoU between two [x1, y1, x2, y2] boxes."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
     inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
     if inter == 0:
         return 0.0
-    area_a = (a[2] - a[0]) * (a[3] - a[1])
-    area_b = (b[2] - b[0]) * (b[3] - b[1])
-    return inter / (area_a + area_b - inter + 1e-6)
+    return inter / ((a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter + 1e-6)
 
 
-def _attach_reid_embeddings(
-    store: TrajectoryStore,
-    frame_idx: int,
-    active_tracks: list,
-    detections: list,
-    det_embeddings: np.ndarray,
-    reid_embedder=None,
-) -> None:
-    """
-    Match active track boxes to detection boxes via IoU and store ReID embeddings
-    and team_probs (with temporal EMA) in the most recent observation.
-
-    Team probabilities are updated via a 0.7/0.3 EMA stored on the TrackData to
-    prevent per-frame label flipping.  The EMA value is written back to
-    ``obs.team_probs`` so identity assignment always sees smoothed probabilities.
-    """
-    det_probs = None
-    if reid_embedder is not None:
-        _, det_probs = reid_embedder.classify_from_embeddings(det_embeddings)
-
-    for track_id, track_box in active_tracks:
-        best_iou = 0.0
-        best_emb_idx = -1
-        for det_idx, det_box in enumerate(detections):
-            iou = _box_iou(track_box, det_box)
-            if iou > best_iou:
-                best_iou = iou
-                best_emb_idx = det_idx
-
-        if best_emb_idx >= 0 and best_iou > 0.2:
-            track = store.get_track(track_id)
-            if track and track.observations and track.observations[-1].frame_idx == frame_idx:
-                obs = track.observations[-1]
-                obs.reid_embedding = det_embeddings[best_emb_idx]
-                if det_probs is not None:
-                    probs_new = det_probs[best_emb_idx]
-                    # EMA: blend new frame probs into running track estimate
-                    if track.team_probs_ema is None:
-                        track.team_probs_ema = probs_new.copy()
-                    else:
-                        track.team_probs_ema = 0.7 * track.team_probs_ema + 0.3 * probs_new
-                    # Store smoothed probs so identity assignment is stable
-                    obs.team_probs = track.team_probs_ema.copy()
-
-
-def detect_and_project(
-    video_path: str,
-    detector,
-    pitch_kp_detector,
-    model_type: str,
-    max_duration: Optional[float] = None,
-    homography_interval: int = 1,
-    device: Optional[torch.device] = None,
-    reid_embedder=None,
-    reid_interval: int = 5,
-    siglip_embedder=None,
-    body_pose_detector=None,
-    enable_pose: bool = False,
-) -> TrajectoryStore:
-    """
-    Pass 1: Detection, tracking, and projection.
-
-    Args:
-        video_path: Input video path.
-        detector: Detection model.
-        pitch_kp_detector: Pitch keypoint detector (``ViTPoseKeypointDetector``
-            or ``YOLOPoseKeypointDetector``). When None, homography estimation
-            is skipped and only fallback projection is used.
-        model_type: "yolo", "fcnn", or "rtdetr".
-        max_duration: Maximum duration in seconds.
-        homography_interval: Frames between homography updates.
-        device: Torch device.
-        reid_embedder: Optional ``DINOv2ReIDEmbedder`` instance. When provided,
-            crops are extracted for active tracks every ``reid_interval`` frames
-            and stored in ``obs.reid_embedding``. Also passed to
-            ``ByteTracker.update_with_embeddings`` for appearance-guided MOT.
-        reid_interval: Frames between ReID embedding updates (default 5).
-
-    Returns:
-        TrajectoryStore with all observations.
-    """
-    print("=" * 60)
-    print("PASS 1: Detection + Tracking + Projection")
-    print("=" * 60)
-
-    homography = HomographyEstimator(
-        min_correspondences=6,
-        confidence_threshold=0.3,
-        visibility_threshold=0.3,
-        use_kalman=False,
-    )
-
-    # Non-YOLO models use ByteTracker (YOLO has built-in tracking via botsort)
-    tracker = (
-        ByteTracker(track_thresh=0.3, track_buffer=30, match_thresh=0.8) if model_type in ("fcnn", "rtdetr") else None
-    )
-    # Feet-projection capability: only ViTPoseKeypointDetector has detect_player_pose_batch
-    _can_feet_project = pitch_kp_detector is not None and hasattr(pitch_kp_detector, "detect_player_pose_batch")
-
-    # Instantiate lifter once (LBFGS optimiser is created fresh per-player inside refine_lbfgs)
-    _lifter = None
-    if enable_pose and body_pose_detector is not None:
-        from torchkick.tracking.lifting import PoseLift3D
-
-        _lifter = PoseLift3D(use_lbfgs=True)
-
-    # Special-case MLX Sam3 video predictor: it drives frame iteration itself
-    if model_type == "sam3_mlx":
-        with VideoReader(video_path, max_duration=max_duration) as reader:
-            meta = reader.metadata
-            store = TrajectoryStore(fps=meta.fps)
-            progress = ProgressTracker(reader.max_frames, log_interval=100)
-            # detector in this branch is actually Sam3VideoPredictorMLX
-            _detect_and_project_sam3_mlx(
-                video_path=video_path,
-                predictor=detector,
-                homography=homography,
-                store=store,
-                progress=progress,
-            )
-            return store
-
-    with VideoReader(video_path, max_duration=max_duration) as reader:
-        meta = reader.metadata
-        store = TrajectoryStore(fps=meta.fps)
-        progress = ProgressTracker(reader.max_frames, log_interval=100)
-
-        for frame_idx, frame_bgr in enumerate(reader):
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-
-            # Homography update — Kalman prediction covers up to 30-frame gaps automatically
-            if frame_idx % homography_interval == 0 and pitch_kp_detector is not None:
-                kps, conf = pitch_kp_detector.detect(frame_bgr)
-                ok = homography.estimate(kps, conf, conf, frame_bgr.shape[:2])
-                if ok and homography.H_inv is not None:
-                    store.frame_homographies[frame_idx] = homography.H_inv.copy()
-                if frame_idx < 3:
-                    n_vis = int((conf > 0.3).sum())
-                    print(
-                        f"  [DEBUG frame {frame_idx}] homography={ok}, visible_kps={n_vis}, "
-                        f"inliers={homography.num_inliers}"
-                    )
-                    if ok:
-                        # Project 4 known keypoint positions to verify coordinate mapping
-                        import numpy as _np
-
-                        _h, _w = frame_bgr.shape[:2]
-                        _test = _np.array(
-                            [
-                                [_w * 0.48, _h * 0.31],  # halfway-line top area
-                                [_w * 0.48, _h * 0.39],
-                                [_w * 0.49, _h * 0.50],
-                                [_w * 0.49, _h * 0.81],
-                            ]
-                        )
-                        _proj = homography.project_to_pitch(_test)
-                        print(
-                            f"  [DEBUG frame {frame_idx}] halfway-line sample projections "
-                            f"(expect x≈0, y≈-35/−9/+9/+35):"
-                        )
-                        for _pt, _pp in zip(_test, _proj):
-                            print(f"    pixel ({_pt[0]:.0f},{_pt[1]:.0f}) → pitch ({_pp[0]:.2f},{_pp[1]:.2f})")
-
-            # Per-frame feet keypoints cache (filled every reid_interval frames)
-            _feet_cache: Dict[int, Tuple[float, float]] = {}
-            # Per-frame pose cache {track_id → (pose_2d [17,2], pose_2d_scores [17], pose_3d [17,3])}
-            _pose_cache: Dict[int, tuple] = {}
-
-            # Run detection
-            if model_type == "yolo":
-                results = detector.track(
-                    frame_bgr,
-                    persist=True,
-                    tracker="botsort.yaml",
-                    verbose=False,
-                    classes=[0],
-                    conf=0.25,
-                )
-
-                if results[0].boxes.id is not None:
-                    boxes = results[0].boxes.xyxy.cpu().numpy()
-                    track_ids = results[0].boxes.id.int().cpu().tolist()
-
-                    # Feet projection via ViTPose (batched, every reid_interval frames)
-                    if _can_feet_project and frame_idx % reid_interval == 0 and len(boxes) > 0:
-                        crops = [_crop_box(frame_rgb, b.tolist()) for b in boxes]
-                        feet_raw = pitch_kp_detector.detect_player_pose_batch(crops)
-                        for i, (box, tid) in enumerate(zip(boxes, track_ids)):
-                            _feet_cache[tid] = (float(feet_raw[i, 0] + box[0]), float(feet_raw[i, 1] + box[1]))
-
-                    for box, track_id in zip(boxes, track_ids):
-                        pitch_pos = homography.project_player_to_pitch(box.tolist(), feet_uv=_feet_cache.get(track_id))
-                        store.add_observation(
-                            track_id=track_id,
-                            frame_idx=frame_idx,
-                            box=box,
-                            pitch_pos=pitch_pos,
-                        )
-
-            elif model_type == "fcnn":
-                import torchvision
-
-                tensor = torchvision.transforms.functional.to_tensor(frame_rgb).to(device)
-                with torch.no_grad():
-                    predictions = detector([tensor])
-
-                pred = predictions[0]
-                boxes_np = pred['boxes'].cpu().numpy()
-                scores = pred['scores'].cpu().numpy()
-                valid_detections = [b for b, s in zip(boxes_np, scores) if s > 0.3]
-
-                # Appearance-guided tracking: prefer ReID, fall back to SigLIP
-                _active_embedder = reid_embedder if reid_embedder is not None else siglip_embedder
-                if _active_embedder is not None and frame_idx % reid_interval == 0 and valid_detections:
-                    det_crops = [_crop_box(frame_rgb, b) for b in valid_detections]
-                    det_embeddings = _active_embedder.embed(det_crops)
-                    active_tracks = tracker.update_with_embeddings(valid_detections, det_embeddings)
-                    # Feet projection (same crops, shared compute)
-                    if _can_feet_project:
-                        feet_raw = pitch_kp_detector.detect_player_pose_batch(det_crops)
-                        for i, det_box in enumerate(valid_detections):
-                            _feet_cache[i] = (float(feet_raw[i, 0] + det_box[0]), float(feet_raw[i, 1] + det_box[1]))
-                else:
-                    det_embeddings = None
-                    active_tracks = tracker.update(valid_detections)
-
-                for track_id, box in active_tracks:
-                    # Match detection index for feet lookup
-                    best_idx, best_iou = -1, 0.0
-                    for di, db in enumerate(valid_detections):
-                        iou = _box_iou(box, db)
-                        if iou > best_iou:
-                            best_iou, best_idx = iou, di
-                    feet_uv = _feet_cache.get(best_idx) if best_idx >= 0 else None
-                    pitch_pos = homography.project_player_to_pitch(box.tolist(), feet_uv=feet_uv)
-                    store.add_observation(track_id=track_id, frame_idx=frame_idx, box=box, pitch_pos=pitch_pos)
-
-                if det_embeddings is not None and active_tracks:
-                    _attach_reid_embeddings(
-                        store, frame_idx, active_tracks, valid_detections, det_embeddings, reid_embedder
-                    )
-
-            elif model_type in ("rtdetr", "rfdetr"):
-                valid_detections = [list(d.bbox) for d in detector.detect(frame_bgr)]
-
-                if frame_idx == 0:
-                    print(f"  [DEBUG frame 0] detections={len(valid_detections)}")
-                    for _b in valid_detections[:5]:
-                        _pp = homography.project_player_to_pitch(_b)
-                        _cx, _cy = (_b[0] + _b[2]) / 2, (_b[1] + _b[3]) / 2
-                        print(
-                            f"    bbox=({_b[0]:.0f},{_b[1]:.0f},{_b[2]:.0f},{_b[3]:.0f}) "
-                            f"foot=({_cx:.0f},{_cy:.0f}) → pitch={_pp}"
-                        )
-
-                _active_embedder = reid_embedder if reid_embedder is not None else siglip_embedder
-                if _active_embedder is not None and frame_idx % reid_interval == 0 and valid_detections:
-                    det_crops = [_crop_box(frame_rgb, b) for b in valid_detections]
-                    det_embeddings = _active_embedder.embed(det_crops)
-                    active_tracks = tracker.update_with_embeddings(valid_detections, det_embeddings)
-                    if _can_feet_project:
-                        feet_raw = pitch_kp_detector.detect_player_pose_batch(det_crops)
-                        for i, det_box in enumerate(valid_detections):
-                            _feet_cache[i] = (float(feet_raw[i, 0] + det_box[0]), float(feet_raw[i, 1] + det_box[1]))
-                else:
-                    det_embeddings = None
-                    active_tracks = tracker.update(valid_detections)
-
-                for track_id, box in active_tracks:
-                    best_idx, best_iou = -1, 0.0
-                    for di, db in enumerate(valid_detections):
-                        iou = _box_iou(box, db)
-                        if iou > best_iou:
-                            best_iou, best_idx = iou, di
-                    feet_uv = _feet_cache.get(best_idx) if best_idx >= 0 else None
-                    pitch_pos = homography.project_player_to_pitch(box.tolist(), feet_uv=feet_uv)
-                    store.add_observation(track_id=track_id, frame_idx=frame_idx, box=box, pitch_pos=pitch_pos)
-
-                if det_embeddings is not None and active_tracks:
-                    _attach_reid_embeddings(
-                        store, frame_idx, active_tracks, valid_detections, det_embeddings, reid_embedder
-                    )
-
-            # Pose estimation — runs after all model branches have populated store
-            if enable_pose and _lifter is not None and body_pose_detector is not None:
-                # Collect boxes and track_ids for all observations added this frame
-                frame_tracks = [
-                    (tid, track)
-                    for tid, track in store.tracks.items()
-                    if track.observations and track.observations[-1].frame_idx == frame_idx
-                ]
-                if frame_tracks:
-                    boxes_this_frame = np.array([t.observations[-1].box for _, t in frame_tracks], dtype=np.float32)
-                    pose_results = body_pose_detector.detect_batch(frame_bgr, boxes_this_frame)
-                    camera = homography.get_camera_model(frame_bgr.shape[:2])
-                    kp3d_list = _lifter.lift_batch(pose_results, camera)
-
-                    for (tid, track), pr, kp3d in zip(frame_tracks, pose_results, kp3d_list):
-                        obs = track.observations[-1]
-                        obs.pose_2d = pr.keypoints
-                        obs.pose_2d_scores = pr.scores
-                        obs.pose_3d = kp3d if camera is not None else None
-
-            progress.update()
-            if progress.should_log():
-                print(progress.status())
-
-        store.total_frames = frame_idx + 1
-
-    print(f"Complete: {len(store.tracks)} tracks, {store.total_frames} frames")
-
-    # Debug: pitch coordinate range across all observations
-    import numpy as _np
-
-    all_pitch = [
-        (o.pitch_pos[0], o.pitch_pos[1])
-        for t in store.tracks.values()
-        for o in t.observations
-        if o.pitch_pos is not None
-    ]
-    if all_pitch:
-        xs, ys = zip(*all_pitch)
-        print(f"  [DEBUG] pitch x range: [{min(xs):.1f}, {max(xs):.1f}]  (expect [-60, +60])")
-        print(f"  [DEBUG] pitch y range: [{min(ys):.1f}, {max(ys):.1f}]  (expect [-35, +35])")
-        print(
-            f"  [DEBUG] observations with pitch coords: {len(all_pitch)} / "
-            f"{sum(len(t.observations) for t in store.tracks.values())} total"
-        )
-    else:
-        print("  [DEBUG] No pitch projections computed")
-
-    return store
-
-
-def relink_tracks(
-    store: TrajectoryStore,
-    similarity_threshold: float = 0.7,
-    max_gap_frames: int = 150,
-    max_distance_m: float = 15.0,
-) -> int:
-    """
-    Pass 1.5: Merge fragmented track IDs using ReID cosine similarity.
-
-    Soccer tracks fragment frequently due to brief occlusions — the MOT tracker
-    assigns a new ID on re-detection.  This post-hoc pass merges pairs (A, B)
-    where B starts shortly after A ends, they are spatially close at the junction,
-    and their mean ReID embeddings are similar.  Merges are applied greedily in
-    temporal order and union-find handles transitive chains.
-
-    Args:
-        store: TrajectoryStore to modify in-place.
-        similarity_threshold: Minimum cosine similarity to merge two tracks.
-        max_gap_frames: Maximum frame gap between track end and next start.
-        max_distance_m: Maximum pitch-space distance at the junction (meters).
-
-    Returns:
-        Number of track merges performed.
-    """
-    print("=" * 60)
-    print("PASS 1.5: Track Re-linking")
-    print("=" * 60)
-
-    # Build per-track summary: (first_frame, last_frame, mean_embed, last_pos, first_pos)
-    track_info: Dict[int, tuple] = {}
-    for tid, track in store.tracks.items():
-        if not track.observations:
-            continue
-        obs_sorted = sorted(track.observations, key=lambda o: o.frame_idx)
-
-        embeddings = [o.reid_embedding for o in obs_sorted if o.reid_embedding is not None]
-        if not embeddings:
-            continue  # skip tracks without ReID data
-
-        mean_embed = np.mean(embeddings, axis=0).astype(np.float64)
-        norm = np.linalg.norm(mean_embed)
-        mean_embed /= norm + 1e-8
-
-        last_pos = next((o.pitch_pos for o in reversed(obs_sorted) if o.pitch_pos is not None), None)
-        first_pos = next((o.pitch_pos for o in obs_sorted if o.pitch_pos is not None), None)
-
-        track_info[tid] = (
-            obs_sorted[0].frame_idx,  # first_frame
-            obs_sorted[-1].frame_idx,  # last_frame
-            mean_embed,
-            last_pos,
-            first_pos,
-        )
-
-    # Union-find
-    parent: Dict[int, int] = {tid: tid for tid in track_info}
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a: int, b: int) -> None:
-        parent[find(b)] = find(a)
-
-    # Sort by last_frame so we always attach B onto A in temporal order
-    tids_sorted = sorted(track_info, key=lambda t: track_info[t][1])
-    merges = 0
-
-    for i, tid_a in enumerate(tids_sorted):
-        first_a, last_a, embed_a, _, last_pos_a = track_info[tid_a]
-
-        for tid_b in tids_sorted[i + 1 :]:
-            first_b, last_b, embed_b, first_pos_b, _ = track_info[tid_b]
-
-            # B must start after A ends
-            gap = first_b - last_a
-            if gap < 0 or gap > max_gap_frames:
-                continue
-
-            # Already in the same component
-            if find(tid_a) == find(tid_b):
-                continue
-
-            # Spatial gate
-            if last_pos_a is not None and first_pos_b is not None:
-                dist = float(np.hypot(last_pos_a[0] - first_pos_b[0], last_pos_a[1] - first_pos_b[1]))
-                if dist > max_distance_m:
-                    continue
-
-            # ReID gate
-            cos_sim = float(np.dot(embed_a, embed_b))
-            if cos_sim < similarity_threshold:
-                continue
-
-            union(tid_a, tid_b)
-            merges += 1
-
-    # Apply merges: re-map all observations to the root track_id
-    if merges > 0:
-        # Group tracks by root
-        from collections import defaultdict as _dd
-
-        root_groups: Dict[int, List[int]] = _dd(list)
-        for tid in track_info:
-            root_groups[find(tid)].append(tid)
-
-        for root, members in root_groups.items():
-            if len(members) <= 1:
-                continue
-            root_track = store.tracks[root]
-            for tid in members:
-                if tid == root:
-                    continue
-                if tid in store.tracks:
-                    root_track.observations.extend(store.tracks[tid].observations)
-                    del store.tracks[tid]
-            root_track.observations.sort(key=lambda o: o.frame_idx)
-
-    print(f"Complete: {merges} track merges performed ({len(store.tracks)} tracks remaining)")
-    return merges
-
-
-def smooth_trajectories(store: TrajectoryStore) -> int:
-    """
-    Pass 2: Trajectory smoothing.
-
-    Args:
-        store: TrajectoryStore with raw observations.
-
-    Returns:
-        Number of smoothed trajectories.
-    """
-    print("=" * 60)
-    print("PASS 2: Trajectory Smoothing")
-    print("=" * 60)
-
-    smoother = TrajectorySmoother(
-        fps=store.fps,
-        max_speed_ms=12.0,
-        smooth_sigma=7.0,
-    )
-
-    count = smoother.smooth_all(store, min_frames=10)
-
-    print(f"Complete: Smoothed {count} trajectories")
-    return count
+# ---------------------------------------------------------------------------
+# Pass 0: Team centroid calibration (first 2 min)
+# ---------------------------------------------------------------------------
 
 
 def calibrate_team_centroids(
@@ -731,29 +68,26 @@ def calibrate_team_centroids(
 ) -> Optional[np.ndarray]:
     """
     Fit k=3 team centroids from randomly sampled frames in the first
-    ``calibration_duration`` seconds of a video.
+    ``calibration_duration`` seconds.
 
-    Samples ``n_sample_frames`` random frames, runs detection on each,
-    embeds all player crops, then fits k-means with k=3.  The smallest
+    Samples ``n_sample_frames`` random frames, runs YOLO detection, embeds
+    all player crops with ``embedder``, then fits k-means k=3.  The smallest
     cluster is remapped to label 2 (referee convention).
 
     Args:
         video_path: Input video path.
-        detector: YOLO model (``ultralytics.YOLO``).
+        detector: ``ultralytics.YOLO`` model.
         embedder: ``DINOv2ReIDEmbedder`` or ``SigLIPTeamEmbedder`` with
-            an ``embed(crops)`` method that returns ``[N, D]`` float32.
-        calibration_duration: Seconds of video to sample from (default 120).
+            ``embed(crops) -> [N, D]``.
+        calibration_duration: Seconds to sample from (default 120).
         n_sample_frames: Number of frames to randomly sample.
         conf: Detection confidence threshold.
 
     Returns:
         ``np.ndarray [3, D]`` centroids (team0, team1, ref) or None if
-        fewer than 10 crops are found.
+        fewer than 10 crops are collected.
     """
-    import random
-
     print(f"Calibrating team centroids from first {calibration_duration:.0f}s …")
-
     all_crops: List[np.ndarray] = []
 
     with VideoReader(video_path, max_duration=calibration_duration) as reader:
@@ -763,40 +97,264 @@ def calibrate_team_centroids(
         for frame_idx, frame_bgr in enumerate(reader):
             if frame_idx not in sampled_set:
                 continue
-
             results = detector(frame_bgr, verbose=False, conf=conf, classes=[0])
             if results[0].boxes is None or len(results[0].boxes) == 0:
                 continue
-
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             for box in results[0].boxes.xyxy.cpu().numpy():
                 crop = _crop_box(frame_rgb, box.tolist())
                 if crop is not None and crop.size > 0:
-                    # embedder expects BGR crops
                     all_crops.append(cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
 
     if len(all_crops) < 10:
-        print(f"[warn] Only {len(all_crops)} crops for calibration — skipping centroid fit.")
+        print(f"[warn] Only {len(all_crops)} crops for calibration — skipping.")
         return None
 
     print(f"  Embedding {len(all_crops)} crops …")
-    embeddings = embedder.embed(all_crops)  # [N, D]
+    embeddings = embedder.embed(all_crops)
 
     from sklearn.cluster import KMeans
 
     km = KMeans(n_clusters=3, random_state=42, n_init=10)
     labels = km.fit_predict(embeddings)
-
-    # Remap smallest cluster → ref (label 2)
     counts = np.bincount(labels, minlength=3)
     ref_cluster = int(np.argmin(counts))
     centers = km.cluster_centers_.copy()
     if ref_cluster != 2:
         centers[[2, ref_cluster]] = centers[[ref_cluster, 2]]
 
-    print(f"  Cluster sizes: team0={counts[0 if ref_cluster!=0 else 2]}, "
-          f"team1={counts[1 if ref_cluster!=1 else 2]}, ref={counts[ref_cluster]}")
+    team_counts = list(counts)
+    print(
+        f"  Clusters: team0={team_counts[0 if ref_cluster != 0 else 2]}, "
+        f"team1={team_counts[1 if ref_cluster != 1 else 2]}, ref={team_counts[ref_cluster]}"
+    )
     return centers.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Pass 1: Detection, tracking, projection
+# ---------------------------------------------------------------------------
+
+
+def detect_and_project(
+    video_path: str,
+    detector,
+    pitch_kp_detector,
+    max_duration: Optional[float] = None,
+    homography_interval: int = 1,
+    siglip_embedder=None,
+    reid_embedder=None,
+    reid_interval: int = 5,
+    conf: float = 0.25,
+) -> TrajectoryStore:
+    """
+    Pass 1: YOLO detection + BotSORT tracking + 2D pitch projection.
+
+    Runs YOLO with BotSORT on every frame.  Every ``reid_interval`` frames,
+    player crops are embedded with ``siglip_embedder`` (or ``reid_embedder``
+    if provided) and stored in observations for later team clustering.
+
+    Args:
+        video_path: Input video path.
+        detector: ``ultralytics.YOLO`` model.
+        pitch_kp_detector: Pitch keypoint detector (YOLO-pose) for homography.
+            Pass None to skip homography estimation.
+        max_duration: Maximum duration in seconds.
+        homography_interval: Frames between homography updates.
+        siglip_embedder: Zero-shot team embedder (used when reid_embedder is None).
+        reid_embedder: Fine-tuned ReID embedder (takes priority over siglip).
+        reid_interval: Frames between embedding updates.
+        conf: Detection confidence threshold.
+
+    Returns:
+        ``TrajectoryStore`` with all observations.
+    """
+    print("=" * 60)
+    print("PASS 1: Detection + Tracking + Projection")
+    print("=" * 60)
+
+    homography = HomographyEstimator(
+        min_correspondences=6,
+        confidence_threshold=0.3,
+        visibility_threshold=0.3,
+        use_kalman=False,
+    )
+    _embedder = reid_embedder or siglip_embedder
+
+    with VideoReader(video_path, max_duration=max_duration) as reader:
+        meta = reader.metadata
+        store = TrajectoryStore(fps=meta.fps)
+        progress = ProgressTracker(reader.max_frames, log_interval=100)
+
+        for frame_idx, frame_bgr in enumerate(reader):
+            # Homography update
+            if frame_idx % homography_interval == 0 and pitch_kp_detector is not None:
+                kps, conf_kps = pitch_kp_detector.detect(frame_bgr)
+                ok = homography.estimate(kps, conf_kps, conf_kps, frame_bgr.shape[:2])
+                if ok and homography.H_inv is not None:
+                    store.frame_homographies[frame_idx] = homography.H_inv.copy()
+
+            # Detection + tracking
+            results = detector.track(
+                frame_bgr,
+                persist=True,
+                tracker="botsort.yaml",
+                verbose=False,
+                classes=[0],
+                conf=conf,
+            )
+
+            if results[0].boxes.id is None:
+                progress.update()
+                continue
+
+            boxes = results[0].boxes.xyxy.cpu().numpy()
+            track_ids = results[0].boxes.id.int().cpu().tolist()
+
+            # Store observations
+            for box, track_id in zip(boxes, track_ids):
+                pitch_pos = homography.project_player_to_pitch(box.tolist())
+                store.add_observation(
+                    track_id=track_id,
+                    frame_idx=frame_idx,
+                    box=box,
+                    pitch_pos=pitch_pos,
+                )
+
+            # ReID embeddings every reid_interval frames
+            if _embedder is not None and frame_idx % reid_interval == 0 and len(boxes) > 0:
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                crops_bgr = []
+                valid_pairs = []
+                for box, track_id in zip(boxes, track_ids):
+                    crop = _crop_box(frame_rgb, box.tolist())
+                    if crop is not None and crop.size > 0:
+                        crops_bgr.append(cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
+                        valid_pairs.append(track_id)
+
+                if crops_bgr:
+                    embeddings = _embedder.embed(crops_bgr)
+                    for track_id, emb in zip(valid_pairs, embeddings):
+                        track = store.get_track(track_id)
+                        if track and track.observations and track.observations[-1].frame_idx == frame_idx:
+                            track.observations[-1].reid_embedding = emb
+
+            progress.update()
+            if progress.should_log():
+                print(progress.status())
+
+        store.total_frames = frame_idx + 1
+
+    print(f"Complete: {len(store.tracks)} tracks over {store.total_frames} frames")
+    return store
+
+
+# ---------------------------------------------------------------------------
+# Pass 1.5: Track re-linking via ReID
+# ---------------------------------------------------------------------------
+
+
+def relink_tracks(
+    store: TrajectoryStore,
+    similarity_threshold: float = 0.7,
+    max_gap_frames: int = 150,
+    max_distance_m: float = 15.0,
+) -> int:
+    """
+    Merge fragmented track IDs using ReID cosine similarity.
+
+    Merges pairs (A, B) where B starts shortly after A ends, they are
+    spatially close at the junction, and their mean ReID embeddings are
+    similar.  Skips tracks without stored ReID embeddings.
+
+    Returns:
+        Number of track merges performed.
+    """
+    print("=" * 60)
+    print("PASS 1.5: Track Re-linking")
+    print("=" * 60)
+
+    track_info: Dict[int, tuple] = {}
+    for tid, track in store.tracks.items():
+        if not track.observations:
+            continue
+        obs_sorted = sorted(track.observations, key=lambda o: o.frame_idx)
+        embeddings = [o.reid_embedding for o in obs_sorted if o.reid_embedding is not None]
+        if not embeddings:
+            continue
+        mean_embed = np.mean(embeddings, axis=0).astype(np.float64)
+        mean_embed /= np.linalg.norm(mean_embed) + 1e-8
+        last_pos = next((o.pitch_pos for o in reversed(obs_sorted) if o.pitch_pos is not None), None)
+        first_pos = next((o.pitch_pos for o in obs_sorted if o.pitch_pos is not None), None)
+        track_info[tid] = (obs_sorted[0].frame_idx, obs_sorted[-1].frame_idx, mean_embed, last_pos, first_pos)
+
+    parent: Dict[int, int] = {tid: tid for tid in track_info}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    tids_sorted = sorted(track_info, key=lambda t: track_info[t][1])
+    merges = 0
+
+    for i, tid_a in enumerate(tids_sorted):
+        first_a, last_a, embed_a, _, last_pos_a = track_info[tid_a]
+        for tid_b in tids_sorted[i + 1:]:
+            first_b, _, embed_b, first_pos_b, _ = track_info[tid_b]
+            gap = first_b - last_a
+            if gap < 0 or gap > max_gap_frames:
+                continue
+            if find(tid_a) == find(tid_b):
+                continue
+            if last_pos_a is not None and first_pos_b is not None:
+                if float(np.hypot(last_pos_a[0] - first_pos_b[0], last_pos_a[1] - first_pos_b[1])) > max_distance_m:
+                    continue
+            if float(np.dot(embed_a, embed_b)) < similarity_threshold:
+                continue
+            parent[find(tid_b)] = find(tid_a)
+            merges += 1
+
+    if merges > 0:
+        root_groups: Dict[int, List[int]] = defaultdict(list)
+        for tid in track_info:
+            root_groups[find(tid)].append(tid)
+        for root, members in root_groups.items():
+            if len(members) <= 1:
+                continue
+            root_track = store.tracks[root]
+            for tid in members:
+                if tid == root:
+                    continue
+                if tid in store.tracks:
+                    root_track.observations.extend(store.tracks[tid].observations)
+                    del store.tracks[tid]
+            root_track.observations.sort(key=lambda o: o.frame_idx)
+
+    print(f"Complete: {merges} merges ({len(store.tracks)} tracks remaining)")
+    return merges
+
+
+# ---------------------------------------------------------------------------
+# Pass 2: Trajectory smoothing
+# ---------------------------------------------------------------------------
+
+
+def smooth_trajectories(store: TrajectoryStore) -> int:
+    """Pass 2: Gaussian-smooth all trajectories. Returns number smoothed."""
+    print("=" * 60)
+    print("PASS 2: Trajectory Smoothing")
+    print("=" * 60)
+    smoother = TrajectorySmoother(fps=store.fps, max_speed_ms=12.0, smooth_sigma=7.0)
+    count = smoother.smooth_all(store, min_frames=10)
+    print(f"Complete: {count} trajectories smoothed")
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Pass 3: Identity / team assignment
+# ---------------------------------------------------------------------------
 
 
 def assign_identities(
@@ -804,27 +362,28 @@ def assign_identities(
     reid_embedder=None,
     siglip_embedder=None,
     team_centroids: Optional[np.ndarray] = None,
-) -> Tuple[Dict, PitchSlotManager]:
+) -> Dict:
     """
-    Pass 3: Identity assignment and team classification.
+    Pass 3: Team classification and goalkeeper detection.
+
+    Uses per-track ReID embeddings (stored during Pass 1) for k=3 clustering
+    (home, away, referee).  Goalkeeper inference uses position isolation:
+    the most extreme-x track on each side with a ≥5 m gap from the next
+    player is the GK; looser threshold when the track is an embedding outlier
+    from both team centroids (different-coloured jersey).
 
     Args:
-        store: TrajectoryStore with smoothed trajectories.
-        reid_embedder: Optional ``DINOv2ReIDEmbedder`` for embedding-based
-            team clustering.
-        siglip_embedder: Optional ``SigLIPTeamEmbedder`` used as zero-shot
-            fallback when ``reid_embedder`` is None.
-        team_centroids: Optional ``[3, D]`` centroids from
-            ``calibrate_team_centroids()``.  Passed to ``IdentityAssigner``
-            for embedding-aware goalkeeper detection.
+        store: TrajectoryStore with observations.
+        reid_embedder: Fine-tuned ``DINOv2ReIDEmbedder`` (optional).
+        siglip_embedder: Zero-shot ``SigLIPTeamEmbedder`` fallback.
+        team_centroids: ``[3, D]`` centroids from ``calibrate_team_centroids()``.
 
     Returns:
-        (assignments, slot_manager) tuple.
+        Dict mapping track_id → ``{'role', 'team'}``.
     """
     print("=" * 60)
     print("PASS 3: Identity Assignment")
     print("=" * 60)
-
     assigner = IdentityAssigner(
         fps=store.fps,
         embedder=reid_embedder,
@@ -833,36 +392,43 @@ def assign_identities(
         debug=True,
     )
     assignments = assigner.assign_roles(store)
+    print(f"Complete: {len(assignments)} identities assigned")
+    return assignments
 
-    slot_manager = PitchSlotManager(fps=store.fps, debug=True)
-    slot_manager.initialize_from_assignments(store, assignments)
-    slot_manager.build_all_frame_positions(store, store.total_frames)
 
-    print(f"Complete: Assigned {len(assignments)} identities")
-    return assignments, slot_manager
+# ---------------------------------------------------------------------------
+# Pass 4: Visualization
+# ---------------------------------------------------------------------------
+
+_TEAM_COLORS = {
+    0: (0, 0, 255),    # team 0 — red
+    1: (255, 50, 50),  # team 1 — blue
+    -1: (0, 255, 0),   # unknown — green
+}
+_REF_COLOR = (50, 50, 50)     # dark grey
+_GK_COLOR_T0 = (0, 255, 255)  # cyan
+_GK_COLOR_T1 = (255, 255, 0)  # yellow
 
 
 def render_visualization(
     video_path: str,
     store: TrajectoryStore,
     assignments: Dict,
-    slot_manager: PitchSlotManager,
     max_duration: Optional[float] = None,
     draw_overlay: bool = True,
-    draw_dominance: bool = True,
-    enable_pose: bool = False,
 ) -> str:
     """
-    Pass 4: Render output visualization.
+    Pass 4: Render annotated video with 2D pitch minimap.
+
+    Draws team-coloured bounding boxes on the video frame and a pitch
+    minimap showing player positions as coloured dots.
 
     Args:
         video_path: Input video path.
         store: TrajectoryStore with all data.
-        assignments: Identity assignments.
-        slot_manager: Pitch slot manager.
+        assignments: ``track_id → {'role', 'team'}`` from ``assign_identities()``.
         max_duration: Maximum duration in seconds.
-        draw_overlay: Draw pitch lines on video.
-        draw_dominance: Draw space control heatmap.
+        draw_overlay: Draw pitch line overlay on video frame.
 
     Returns:
         Path to output video.
@@ -873,263 +439,155 @@ def render_visualization(
 
     pitch_viz = PitchVisualizer()
 
-    # Build frame observations lookup
-    frame_observations = defaultdict(list)
+    # Build per-frame lookup
+    frame_obs: Dict[int, list] = defaultdict(list)
     for track_id, track in store.tracks.items():
-        info = assignments.get(track_id, {'role': 'unknown', 'team': -1})
-        slot_key = slot_manager.track_to_slot.get(track_id, None)
-
+        info = assignments.get(track_id, {"role": "unknown", "team": -1})
         for obs in track.observations:
-            frame_observations[obs.frame_idx].append(
-                {
-                    'track_id': track_id,
-                    'box': obs.box,
-                    'role': info.get('role', 'unknown'),
-                    'team': info.get('team', -1),
-                    'slot_key': slot_key,
-                    'pose_2d': obs.pose_2d,
-                    'pose_2d_scores': obs.pose_2d_scores,
-                }
-            )
-
-    if enable_pose:
-        from torchkick.utils.visualization import draw_skeleton_2d
+            frame_obs[obs.frame_idx].append({
+                "box": obs.box,
+                "pitch_pos": obs.pitch_pos,
+                "role": info.get("role", "unknown"),
+                "team": info.get("team", -1),
+                "track_id": track_id,
+            })
 
     output_path = generate_output_path(video_path, prefix="torchkick_analysis", duration=max_duration)
-
     current_H_inv = None
-    position_history: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
-    smoothed_velocity: Dict[str, Tuple[float, float]] = defaultdict(lambda: (0.0, 0.0))
-
-    # Physical constraints
-    MAX_SPEED = 10.0
-    VELOCITY_SMOOTHING = 0.3
 
     with VideoReader(video_path, max_duration=max_duration) as reader:
         meta = reader.metadata
-
         pitch_h, pitch_w = pitch_viz.base_pitch.shape[:2]
         scale = meta.height / pitch_h
         output_w = meta.width + int(pitch_w * scale)
-
         progress = ProgressTracker(reader.max_frames, log_interval=100)
 
         with VideoWriter(output_path, meta.fps, (output_w, meta.height)) as writer:
             for frame_idx, frame_bgr in enumerate(reader):
-                obs_list = frame_observations.get(frame_idx, [])
+                obs_list = frame_obs.get(frame_idx, [])
 
-                # Update homography
+                # Update homography for overlay
                 if draw_overlay:
                     for check_idx in range(frame_idx, -1, -1):
                         if check_idx in store.frame_homographies:
                             current_H_inv = store.frame_homographies[check_idx]
                             break
-
-                # Draw pitch overlay
-                if draw_overlay and current_H_inv is not None:
-                    frame_bgr = _draw_pitch_overlay(frame_bgr, current_H_inv)
-
-                # Get slot positions
-                slot_positions = slot_manager.get_frame_positions(frame_idx)
-
-                # Update position history
-                for slot in slot_positions:
-                    slot_key = slot['slot_key']
-                    x, y = slot['position']
-                    position_history[slot_key].append((x, y))
-                    position_history[slot_key] = position_history[slot_key][-60:]
+                    if current_H_inv is not None:
+                        frame_bgr = _draw_pitch_overlay(frame_bgr, current_H_inv)
 
                 # Draw bounding boxes
                 for obs in obs_list:
-                    box = obs['box']
-                    role = obs['role']
-                    team = obs['team']
-                    slot_key = obs.get('slot_key')
-
+                    box = obs["box"]
+                    role = obs["role"]
+                    team = obs["team"]
                     x1, y1, x2, y2 = map(int, box)
-                    display_id = slot_key if slot_key else f"?{obs['track_id']}"
 
-                    if role == 'goalie':
-                        color = (0, 255, 255) if team == 0 else (255, 255, 0)
-                        label = f"GK:{display_id}"
-                    elif role == 'referee':
-                        color = (0, 0, 0)
+                    if role == "goalie":
+                        color = _GK_COLOR_T0 if team == 0 else _GK_COLOR_T1
+                        label = f"GK{obs['track_id']}"
+                    elif role in ("referee", "linesman"):
+                        color = _REF_COLOR
                         label = "REF"
-                    elif role == 'linesman':
-                        color = (128, 128, 128)
-                        label = "LN"
-                    elif team == 0:
-                        color = (0, 0, 255)
-                        label = display_id
-                    elif team == 1:
-                        color = (255, 0, 0)
-                        label = display_id
                     else:
-                        color = (0, 255, 0)
-                        label = display_id
+                        color = _TEAM_COLORS.get(team, _TEAM_COLORS[-1])
+                        label = str(obs["track_id"])
 
                     cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(frame_bgr, str(label), (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    cv2.putText(frame_bgr, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
-                    if enable_pose and obs.get('pose_2d') is not None and obs.get('pose_2d_scores') is not None:
-                        draw_skeleton_2d(
-                            frame_bgr, obs['pose_2d'], obs['pose_2d_scores'], color=color, conf_threshold=0.3
-                        )
+                # Build pitch minimap
+                pitch_img = pitch_viz.base_pitch.copy()
+                for obs in obs_list:
+                    pos = obs.get("pitch_pos")
+                    if pos is None:
+                        continue
+                    role = obs["role"]
+                    team = obs["team"]
+                    px = int((pos[0] + 52.5) / 105.0 * pitch_w)
+                    py = int((pos[1] + 34.0) / 68.0 * pitch_h)
+                    px = max(2, min(pitch_w - 3, px))
+                    py = max(2, min(pitch_h - 3, py))
+                    if role == "goalie":
+                        dot_color = _GK_COLOR_T0 if team == 0 else _GK_COLOR_T1
+                    elif role in ("referee", "linesman"):
+                        dot_color = _REF_COLOR
+                    else:
+                        dot_color = _TEAM_COLORS.get(team, _TEAM_COLORS[-1])
+                    cv2.circle(pitch_img, (px, py), 4, dot_color, -1)
 
-                # Build pitch positions with velocity
-                pitch_positions = []
-                dt = 1.0 / meta.fps
-
-                for slot in slot_positions:
-                    x, y = slot['position']
-                    team = slot['team']
-                    slot_id = slot['slot_id']
-                    slot_key = slot['slot_key']
-
-                    prev_vx, prev_vy = smoothed_velocity[slot_key]
-
-                    # Compute velocity from history
-                    vx, vy = 0.0, 0.0
-                    if slot_key in position_history and len(position_history[slot_key]) >= 2:
-                        hist = position_history[slot_key]
-                        prev_x, prev_y = hist[-2] if len(hist) >= 2 else hist[-1]
-                        dx = x - prev_x
-                        dy = y - prev_y
-                        vx = dx / dt
-                        vy = dy / dt
-
-                    # Smooth velocity
-                    vx = prev_vx * (1 - VELOCITY_SMOOTHING) + vx * VELOCITY_SMOOTHING
-                    vy = prev_vy * (1 - VELOCITY_SMOOTHING) + vy * VELOCITY_SMOOTHING
-
-                    # Clamp speed
-                    speed = np.sqrt(vx**2 + vy**2)
-                    if speed > MAX_SPEED:
-                        vx *= MAX_SPEED / speed
-                        vy *= MAX_SPEED / speed
-
-                    smoothed_velocity[slot_key] = (vx, vy)
-
-                    # Flip Y for visualization
-                    pitch_positions.append((x, -y, vx, -vy, slot_id, team if team >= 0 else 2))
-
-                # Draw pitch view
-                if pitch_positions and draw_dominance:
-                    trail_history = {}
-                    for slot in slot_positions:
-                        slot_key = slot['slot_key']
-                        if slot_key in position_history:
-                            trail_history[slot['slot_id']] = [(hx, -hy) for hx, hy in position_history[slot_key][-60:]]
-
-                    pitch_img = pitch_viz.draw_with_trails(
-                        pitch_positions,
-                        trail_history,
-                        trail_length=60,
-                        draw_vectors=True,
-                        draw_dominance=True,
-                    )
-                else:
-                    pitch_img = (
-                        pitch_viz.draw_players(
-                            [
-                                (x, -y, slot['slot_id'], slot['team'])
-                                for slot, (x, y, _, _, _, _) in zip(slot_positions, pitch_positions)
-                            ]
-                        )
-                        if pitch_positions
-                        else pitch_viz.base_pitch.copy()
-                    )
-
-                # Combine frames
                 pitch_scaled = cv2.resize(pitch_img, (int(pitch_w * scale), meta.height))
-                combined = np.hstack([frame_bgr, pitch_scaled])
-                writer.write(combined)
+                writer.write(np.hstack([frame_bgr, pitch_scaled]))
 
                 progress.update()
                 if progress.should_log():
                     print(f"Pass 4: {progress.status()}")
 
-    print(f"Complete: Video saved to {output_path}")
+    print(f"Complete: {output_path}")
     return output_path
 
 
 def _draw_pitch_overlay(
     frame: np.ndarray,
-    homography_H_inv: np.ndarray,
+    H_inv: np.ndarray,
     color: Tuple[int, int, int] = (0, 255, 255),
     thickness: int = 2,
 ) -> np.ndarray:
-    """Draw pitch lines on frame using homography."""
+    """Draw pitch line wireframe on a frame using inverse homography."""
     frame_viz = frame.copy()
     h, w = frame.shape[:2]
-
-    for class_name, points in PITCH_LINE_COORDINATES.items():
+    for _, points in PITCH_LINE_COORDINATES.items():
         pitch_pts = np.array([p.to_array() for _, p in points], dtype=np.float32)
-
-        ones = np.ones((pitch_pts.shape[0], 1), dtype=np.float32)
-        pts_h = np.hstack([pitch_pts, ones])
-
-        projected = (homography_H_inv @ pts_h.T).T
+        ones = np.ones((len(pitch_pts), 1), dtype=np.float32)
+        projected = (H_inv @ np.hstack([pitch_pts, ones]).T).T
         projected = projected[:, :2] / projected[:, 2:3]
-
-        valid_pts = []
-        for pt in projected:
-            x, y = int(pt[0]), int(pt[1])
-            if -500 < x < w + 500 and -500 < y < h + 500:
-                valid_pts.append((x, y))
-
-        if len(valid_pts) < 2:
-            continue
-
-        if "Circle" in class_name and len(valid_pts) >= 3:
-            pts = np.array(valid_pts, dtype=np.int32)
-            cv2.polylines(frame_viz, [pts], isClosed=True, color=color, thickness=thickness)
-        else:
-            for i in range(len(valid_pts) - 1):
-                cv2.line(frame_viz, valid_pts[i], valid_pts[i + 1], color, thickness)
-
+        valid = [(int(p[0]), int(p[1])) for p in projected if -500 < p[0] < w + 500 and -500 < p[1] < h + 500]
+        if len(valid) >= 2:
+            for i in range(len(valid) - 1):
+                cv2.line(frame_viz, valid[i], valid[i + 1], color, thickness)
     return frame_viz
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
 
 
 def run_analysis(
     video_path: str,
-    model_path: Optional[str] = None,
-    model_type: str = "rfdetr",
+    yolo_weights: str,
+    pitch_weights: Optional[str] = None,
+    reid_weights: Optional[str] = None,
     duration: Optional[float] = None,
     homography_interval: int = 1,
-    draw_overlay: bool = True,
-    draw_dominance: bool = True,
-    device: Optional[str] = None,
-    reid_weights: Optional[str] = None,
     reid_interval: int = 5,
-    pitch_weights: Optional[str] = None,
-    pitch_detector_type: str = "yolo",
-    conf_threshold: float = 0.3,
-    enable_pose: bool = False,
-    pose_weights: Optional[str] = None,
+    conf: float = 0.25,
+    draw_overlay: bool = True,
+    device: Optional[str] = None,
 ) -> str:
     """
     Run complete match analysis pipeline.
 
-    This is the main entry point for the inference pipeline, combining
-    detection, tracking, projection, identity assignment, and visualization.
+    Passes:
+        0. Calibrate team centroids from first 2 min (random frame sample)
+        1. YOLO detection + BotSORT tracking + 2D pitch projection
+        1.5. Re-link fragmented tracks via ReID cosine similarity
+        2. Smooth trajectories
+        3. Assign team identities + goalkeeper detection
+        4. Render annotated video with pitch minimap
 
     Args:
-        video_path: Path to input video.
-        model_path: Path to detection model weights.
-            If None, uses pretrained weights for the selected model_type.
-        model_type: Detection backend. Recommended: "rfdetr" (DINOv2 backbone,
-            AP50 73.6, ~5ms/frame — default). Alternatives: "yolo" (fastest),
-            "rtdetr" (~60 AP50), "sam3_mlx" (local dev/CPU).
-        duration: Maximum duration in seconds.
+        video_path: Input video path.
+        yolo_weights: Path to YOLO player detection weights.
+        pitch_weights: Path to YOLO-pose pitch keypoint weights.
+            If None, homography/2D projection is skipped.
+        reid_weights: Path to fine-tuned ReID checkpoint.
+            If None, SigLIP zero-shot team embedder is used automatically.
+        duration: Maximum duration in seconds (None = full video).
         homography_interval: Frames between homography updates.
-        draw_overlay: Draw pitch lines on video.
-        draw_dominance: Draw space control heatmap.
-        device: Device string ("cuda" or "cpu").
-        reid_weights: Optional path to distilled ReID student checkpoint.
-            Enables appearance-guided tracking and DINOv2-based team
-            classification. Without this, SigLIP zero-shot clustering is used.
-        reid_interval: Frames between ReID embedding extraction (default 5).
+        reid_interval: Frames between embedding extraction.
+        conf: Detection confidence threshold.
+        draw_overlay: Draw pitch line wireframe on video.
+        device: Device string (auto-detected when None).
 
     Returns:
         Path to output video.
@@ -1137,20 +595,10 @@ def run_analysis(
     Example:
         >>> output = run_analysis(
         ...     video_path="match.mp4",
-        ...     model_type="yolo",
-        ...     duration=60.0,
+        ...     yolo_weights="weights/yolo11l_football/best.pt",
+        ...     pitch_weights="weights/keypoints/best.pt",
         ... )
-        >>> print(f"Saved to: {output}")
     """
-    # Set default model paths
-    if model_path is None:
-        if model_type == "yolo":
-            model_path = "yolo11n.pt"
-        elif model_type == "fcnn":
-            model_path = "models/player/fcnn/fcnn_player_tracker.pth"
-        elif model_type == "rtdetr":
-            model_path = "models/player/rtdetr/rtdetr_player_tracker.pth"
-
     if device:
         dev = torch.device(device)
     elif torch.cuda.is_available():
@@ -1161,114 +609,83 @@ def run_analysis(
         dev = torch.device("cpu")
     print(f"Device: {dev}")
 
-    # Load models
-    detector, pitch_kp_detector, reid_embedder, body_pose_detector = load_models(
-        dev,
-        model_path,
-        model_type,
-        reid_weights=reid_weights,
-        pitch_weights=pitch_weights,
-        pitch_detector_type=pitch_detector_type,
-        conf_threshold=conf_threshold,
-        enable_pose=enable_pose,
-        pose_weights=pose_weights,
-    )
+    # Load YOLO detector
+    from ultralytics import YOLO
+    detector = YOLO(yolo_weights)
+    detector.to(dev)
 
-    # Zero-shot SigLIP team embedder — used when no ReID weights are provided
+    # Load pitch keypoint detector (YOLO-pose)
+    pitch_kp_detector = None
+    if pitch_weights is not None:
+        from torchkick.models.pitch import YOLOPoseKeypointDetector
+        yolo_device = str(dev) if str(dev) not in ("mps", "mps:0") else "cpu"
+        pitch_kp_detector = YOLOPoseKeypointDetector(weights_path=pitch_weights, device=yolo_device)
+        print(f"Pitch keypoint detector loaded: {pitch_weights}")
+
+    # Load ReID embedder
+    reid_embedder = None
+    if reid_weights is not None:
+        try:
+            from torchkick.models.reid import DINOv2ReIDEmbedder
+            reid_embedder = DINOv2ReIDEmbedder(weights_path=reid_weights, device=str(dev))
+            print(f"ReID embedder loaded: {reid_weights}")
+        except Exception as e:
+            print(f"[warn] Could not load ReID embedder: {e}")
+
+    # Zero-shot SigLIP fallback
     siglip_embedder = None
     if reid_embedder is None:
         try:
             from torchkick.models.reid import SigLIPTeamEmbedder
-
             siglip_embedder = SigLIPTeamEmbedder(device=str(dev))
-            print("SigLIP zero-shot team embedder loaded (no --reid-weights provided)")
+            print("SigLIP zero-shot team embedder loaded")
         except Exception as e:
-            print(f"[info] SigLIP unavailable: {e}. Team classification disabled.")
+            print(f"[warn] SigLIP unavailable: {e}")
 
-    # Calibrate team centroids from first 2 mins (used by goalkeeper detection)
+    # Pass 0: Calibrate team centroids
     team_centroids = None
     _calib_embedder = reid_embedder or siglip_embedder
-    if _calib_embedder is not None and model_type == "yolo":
+    if _calib_embedder is not None:
         try:
             team_centroids = calibrate_team_centroids(
-                video_path,
-                detector,
-                _calib_embedder,
-                calibration_duration=120.0,
+                video_path, detector, _calib_embedder, conf=conf
             )
         except Exception as e:
-            print(f"[warn] Centroid calibration failed: {e}. Continuing without calibration.")
+            print(f"[warn] Centroid calibration failed: {e}")
 
-    # Pass 1: Detection and projection
+    # Pass 1: Detection + tracking + projection
     store = detect_and_project(
         video_path,
         detector,
         pitch_kp_detector,
-        model_type,
         max_duration=duration,
         homography_interval=homography_interval,
-        device=dev,
+        siglip_embedder=siglip_embedder,
         reid_embedder=reid_embedder,
         reid_interval=reid_interval,
-        siglip_embedder=siglip_embedder,
-        body_pose_detector=body_pose_detector,
-        enable_pose=enable_pose,
+        conf=conf,
     )
 
-    # Pass 1.5: Re-link fragmented tracks via ReID similarity
+    # Pass 1.5: Re-link fragmented tracks
     relink_tracks(store)
 
     # Pass 2: Smooth trajectories
     smooth_trajectories(store)
 
     # Pass 3: Identity assignment
-    assignments, slot_manager = assign_identities(
+    assignments = assign_identities(
         store,
         reid_embedder=reid_embedder,
         siglip_embedder=siglip_embedder,
         team_centroids=team_centroids,
     )
 
-    # Pass 4: Visualization
+    # Pass 4: Render
     output_path = render_visualization(
-        video_path,
-        store,
-        assignments,
-        slot_manager,
-        max_duration=duration,
-        draw_overlay=draw_overlay,
-        draw_dominance=draw_dominance,
-        enable_pose=enable_pose,
+        video_path, store, assignments, max_duration=duration, draw_overlay=draw_overlay
     )
 
     print("\n" + "=" * 60)
-    print("ANALYSIS COMPLETE")
+    print(f"ANALYSIS COMPLETE  →  {output_path}")
     print("=" * 60)
-    print(f"Output: {output_path}")
-
     return output_path
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Run match analysis")
-    parser.add_argument("--video", type=str, required=True, help="Input video path")
-    parser.add_argument("--model", type=str, default=None, help="Detection model path")
-    parser.add_argument("--model-type", type=str, default="yolo", choices=["yolo", "fcnn"])
-    parser.add_argument("--duration", type=float, default=None, help="Max duration in seconds")
-    parser.add_argument("--homography-interval", type=int, default=1)
-    parser.add_argument("--overlay", action="store_true")
-    parser.add_argument("--dominance", action="store_true")
-
-    args = parser.parse_args()
-
-    run_analysis(
-        video_path=args.video,
-        model_path=args.model,
-        model_type=args.model_type,
-        duration=args.duration,
-        homography_interval=args.homography_interval,
-        draw_overlay=args.overlay,
-        draw_dominance=args.dominance,
-    )
