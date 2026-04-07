@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 import numpy as np
 
 from torchkick.tracking.models import (
-    PENALTY_AREA_X,
     PlayerSlot,
     TrackData,
 )
@@ -98,9 +97,7 @@ class IdentityAssigner:
             return {}
 
         # Find special roles by position
-        goalie_candidates = self._find_goalie_candidates(
-            track_stats, store=store, team_centroids=self.team_centroids
-        )
+        goalie_candidates = self._find_goalie_candidates(track_stats, store=store, team_centroids=self.team_centroids)
         linesman_candidates = self._find_linesman_candidates(track_stats, exclude=goalie_candidates)
         remaining_ids = [
             tid for tid in track_stats.keys() if tid not in goalie_candidates and tid not in linesman_candidates
@@ -195,11 +192,7 @@ class IdentityAssigner:
         candidates: Set[int] = set()
 
         # Only stable, long tracks
-        stable = {
-            tid: s
-            for tid, s in track_stats.items()
-            if s["std_x"] < 12 and s["n_samples"] > 50
-        }
+        stable = {tid: s for tid, s in track_stats.items() if s["std_x"] < 12 and s["n_samples"] > 50}
         if len(stable) < 3:
             return candidates
 

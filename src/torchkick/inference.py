@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import random
 from collections import defaultdict
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -288,7 +287,7 @@ def relink_tracks(
 
     for i, tid_a in enumerate(tids_sorted):
         first_a, last_a, embed_a, _, last_pos_a = track_info[tid_a]
-        for tid_b in tids_sorted[i + 1:]:
+        for tid_b in tids_sorted[i + 1 :]:
             first_b, _, embed_b, first_pos_b, _ = track_info[tid_b]
             gap = first_b - last_a
             if gap < 0 or gap > max_gap_frames:
@@ -388,11 +387,11 @@ def assign_identities(
 # ---------------------------------------------------------------------------
 
 _TEAM_COLORS = {
-    0: (0, 0, 255),    # team 0 — red
+    0: (0, 0, 255),  # team 0 — red
     1: (255, 50, 50),  # team 1 — blue
-    -1: (0, 255, 0),   # unknown — green
+    -1: (0, 255, 0),  # unknown — green
 }
-_REF_COLOR = (50, 50, 50)     # dark grey
+_REF_COLOR = (50, 50, 50)  # dark grey
 _GK_COLOR_T0 = (0, 255, 255)  # cyan
 _GK_COLOR_T1 = (255, 255, 0)  # yellow
 
@@ -431,13 +430,15 @@ def render_visualization(
     for track_id, track in store.tracks.items():
         info = assignments.get(track_id, {"role": "unknown", "team": -1})
         for obs in track.observations:
-            frame_obs[obs.frame_idx].append({
-                "box": obs.box,
-                "pitch_pos": obs.pitch_pos,
-                "role": info.get("role", "unknown"),
-                "team": info.get("team", -1),
-                "track_id": track_id,
-            })
+            frame_obs[obs.frame_idx].append(
+                {
+                    "box": obs.box,
+                    "pitch_pos": obs.pitch_pos,
+                    "role": info.get("role", "unknown"),
+                    "team": info.get("team", -1),
+                    "track_id": track_id,
+                }
+            )
 
     output_path = generate_output_path(video_path, prefix="torchkick_analysis", duration=max_duration)
     current_H_inv = None
@@ -608,6 +609,7 @@ def run_analysis(
 
     # Load YOLO detector
     from ultralytics import YOLO
+
     detector = YOLO(yolo_weights)
     detector.to(dev)
 
@@ -615,6 +617,7 @@ def run_analysis(
     pitch_kp_detector = None
     if pitch_weights is not None:
         from torchkick.models.pitch import YOLOPoseKeypointDetector
+
         yolo_device = str(dev) if str(dev) not in ("mps", "mps:0") else "cpu"
         pitch_kp_detector = YOLOPoseKeypointDetector(weights_path=pitch_weights, device=yolo_device)
         print(f"Pitch keypoint detector loaded: {pitch_weights}")
@@ -624,6 +627,7 @@ def run_analysis(
     if reid_weights is not None:
         try:
             from torchkick.models.reid import DINOv2ReIDEmbedder
+
             reid_embedder = DINOv2ReIDEmbedder(weights_path=reid_weights, device=str(dev))
             print(f"ReID embedder loaded: {reid_weights}")
         except Exception as e:
@@ -634,6 +638,7 @@ def run_analysis(
     if reid_embedder is None:
         try:
             from torchkick.models.reid import SigLIPTeamEmbedder
+
             siglip_embedder = SigLIPTeamEmbedder(device=str(dev))
             print("SigLIP zero-shot team embedder loaded")
         except Exception as e:
@@ -644,9 +649,7 @@ def run_analysis(
     _calib_embedder = reid_embedder or siglip_embedder
     if _calib_embedder is not None:
         try:
-            team_centroids = calibrate_team_centroids(
-                video_path, detector, _calib_embedder, conf=conf
-            )
+            team_centroids = calibrate_team_centroids(video_path, detector, _calib_embedder, conf=conf)
         except Exception as e:
             print(f"[warn] Centroid calibration failed: {e}")
 
@@ -678,9 +681,7 @@ def run_analysis(
     )
 
     # Pass 4: Render
-    output_path = render_visualization(
-        video_path, store, assignments, max_duration=duration, draw_overlay=draw_overlay
-    )
+    output_path = render_visualization(video_path, store, assignments, max_duration=duration, draw_overlay=draw_overlay)
 
     print("\n" + "=" * 60)
     print(f"ANALYSIS COMPLETE  →  {output_path}")

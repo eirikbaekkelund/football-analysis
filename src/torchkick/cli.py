@@ -34,8 +34,12 @@ def main() -> None:
 @main.command()
 @click.option("--video", "-v", type=click.Path(exists=True), required=True, help="Input video.")
 @click.option("--yolo-weights", type=click.Path(exists=True), required=True, help="YOLO player detection weights.")
-@click.option("--pitch-weights", type=click.Path(), default=None, help="YOLO-pose pitch keypoint weights (2D projection).")
-@click.option("--reid-weights", type=click.Path(), default=None, help="ReID checkpoint. If omitted, SigLIP zero-shot is used.")
+@click.option(
+    "--pitch-weights", type=click.Path(), default=None, help="YOLO-pose pitch keypoint weights (2D projection)."
+)
+@click.option(
+    "--reid-weights", type=click.Path(), default=None, help="ReID checkpoint. If omitted, SigLIP zero-shot is used."
+)
 @click.option("--duration", "-d", type=float, default=None, help="Max seconds to process.")
 @click.option("--homography-interval", type=int, default=1, help="Frames between homography updates.")
 @click.option("--reid-interval", type=int, default=5, help="Frames between embedding updates.")
@@ -95,7 +99,8 @@ def analyze(
 
 @main.command()
 @click.option(
-    "--dataset", "-d",
+    "--dataset",
+    "-d",
     type=click.Choice(["tracking", "calibration", "all", "roboflow-players", "roboflow-field", "roboflow"]),
     required=True,
 )
@@ -141,11 +146,13 @@ def dataset(
 
     elif dataset == "roboflow-players":
         from torchkick.soccernet import download_roboflow_players
+
         path = download_roboflow_players(output_dir, api_key=api_key)
         click.echo(f"Downloaded to {path}")
 
     elif dataset == "roboflow-field":
         from torchkick.soccernet import download_roboflow_field_keypoints
+
         path = download_roboflow_field_keypoints(output_dir, api_key=api_key)
         click.echo(f"Downloaded to {path}")
 
@@ -153,9 +160,14 @@ def dataset(
         if not workspace or not project:
             raise click.UsageError("--workspace and --project required for Roboflow downloads.")
         from torchkick.soccernet import download_roboflow_dataset
+
         path = download_roboflow_dataset(
-            workspace=workspace, project=project, version=version,
-            output_dir=output_dir, fmt=fmt, api_key=api_key,
+            workspace=workspace,
+            project=project,
+            version=version,
+            output_dir=output_dir,
+            fmt=fmt,
+            api_key=api_key,
         )
         click.echo(f"Downloaded to {path}")
 
@@ -180,6 +192,7 @@ def train() -> None:
 
 
 # ---- YOLO player detection --------------------------------------------------
+
 
 @train.command("yolo")
 @click.option("--data", "-d", type=click.Path(), default=None, help="SoccerNet zip or YOLO dataset directory.")
@@ -223,10 +236,15 @@ def train_yolo_cmd(
 
 # ---- YOLO-pose pitch keypoints ----------------------------------------------
 
+
 @train.command("yolo-keypoints")
 @click.option("--data", "-d", type=click.Path(exists=True), default=None, help="Pre-built YOLO-pose dataset YAML.")
-@click.option("--soccernet-calibration-dir", type=click.Path(exists=True), default=None,
-              help="SoccerNet calibration dir (train.zip / valid.zip). Auto-converts to 32-keypoint YOLO-pose format.")
+@click.option(
+    "--soccernet-calibration-dir",
+    type=click.Path(exists=True),
+    default=None,
+    help="SoccerNet calibration dir (train.zip / valid.zip). Auto-converts to 32-keypoint YOLO-pose format.",
+)
 @click.option("--epochs", "-e", type=int, default=300)
 @click.option("--imgsz", type=int, default=320)
 @click.option("--base-model", type=str, default="yolo11n-pose.pt")
@@ -270,8 +288,15 @@ def train_yolo_keypoints_cmd(
 
 # ---- DINOv2 ReID (labelled crops) ------------------------------------------
 
+
 @train.command("reid")
-@click.option("--data-dir", "-d", type=click.Path(exists=True), required=True, help="Crop sub-folders by class (0/1/2) or track ID.")
+@click.option(
+    "--data-dir",
+    "-d",
+    type=click.Path(exists=True),
+    required=True,
+    help="Crop sub-folders by class (0/1/2) or track ID.",
+)
 @click.option("--stage", type=click.Choice(["supervised", "ssl"]), default="supervised")
 @click.option("--epochs", "-e", type=int, default=30)
 @click.option("--batch-size", "-b", type=int, default=64)
@@ -282,9 +307,16 @@ def train_yolo_keypoints_cmd(
 @click.option("--no-compile", is_flag=True)
 @click.option("--wandb-project", type=str, default=None)
 def train_reid_cmd(
-    data_dir: str, stage: str, epochs: int, batch_size: int,
-    lr: float, lora_rank: int, num_classes: int, save_dir: str,
-    no_compile: bool, wandb_project: str | None,
+    data_dir: str,
+    stage: str,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    lora_rank: int,
+    num_classes: int,
+    save_dir: str,
+    no_compile: bool,
+    wandb_project: str | None,
 ) -> None:
     """
     Train DINOv2+LoRA+ArcFace ReID (supervised ArcFace or BYOL SSL).
@@ -297,14 +329,22 @@ def train_reid_cmd(
 
     click.echo(f"Training ReID ({stage})")
     weights = train_reid(
-        data_dir=data_dir, stage=stage, num_classes=num_classes, lora_rank=lora_rank,
-        epochs=epochs, batch_size=batch_size, learning_rate=lr,
-        compile_model=not no_compile, save_dir=save_dir, wandb_project=wandb_project,
+        data_dir=data_dir,
+        stage=stage,
+        num_classes=num_classes,
+        lora_rank=lora_rank,
+        epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=lr,
+        compile_model=not no_compile,
+        save_dir=save_dir,
+        wandb_project=wandb_project,
     )
     click.echo(f"Done → {weights}")
 
 
 # ---- ReID from raw video (auto-labels via SigLIP clustering) ---------------
+
 
 @train.command("reid-video")
 @click.option("--video", "-v", type=click.Path(exists=True), required=True)
@@ -317,8 +357,15 @@ def train_reid_cmd(
 @click.option("--lora-rank", type=int, default=16)
 @click.option("--keep-tmp", is_flag=True, help="Keep temporary pseudo-labeled crops.")
 def train_reid_video_cmd(
-    video: str, yolo_weights: str, save_dir: str, calibration_duration: float,
-    n_sample_frames: int, epochs: int, batch_size: int, lora_rank: int, keep_tmp: bool,
+    video: str,
+    yolo_weights: str,
+    save_dir: str,
+    calibration_duration: float,
+    n_sample_frames: int,
+    epochs: int,
+    batch_size: int,
+    lora_rank: int,
+    keep_tmp: bool,
 ) -> None:
     """
     Auto-label player crops from a video and train DINOv2+ArcFace ReID.
@@ -332,14 +379,21 @@ def train_reid_video_cmd(
 
     click.echo(f"Training ReID from video: {video}")
     weights = train_reid_from_video(
-        video_path=video, yolo_weights=yolo_weights, save_dir=save_dir,
-        calibration_duration=calibration_duration, n_sample_frames=n_sample_frames,
-        epochs=epochs, batch_size=batch_size, lora_rank=lora_rank, keep_tmp=keep_tmp,
+        video_path=video,
+        yolo_weights=yolo_weights,
+        save_dir=save_dir,
+        calibration_duration=calibration_duration,
+        n_sample_frames=n_sample_frames,
+        epochs=epochs,
+        batch_size=batch_size,
+        lora_rank=lora_rank,
+        keep_tmp=keep_tmp,
     )
     click.echo(f"Done → {weights}")
 
 
 # ---- FIFA / future models (stubs) ------------------------------------------
+
 
 @train.command("detection")
 @click.argument("args", nargs=-1)

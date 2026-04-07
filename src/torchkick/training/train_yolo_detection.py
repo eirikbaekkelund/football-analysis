@@ -441,41 +441,81 @@ def train_yolo(
 # Missing RF indices: 8, 10, 11, 18, 19, 21 (penalty spots + inner box intersections)
 _SOCCERNET_TO_RF_VERTEX: dict = {
     # Pitch corners / boundary lines
-    ("Side line top",    0): 0,  ("Side line top",    1): 24,
-    ("Side line bottom", 0): 5,  ("Side line bottom", 1): 29,
-    ("Side line left",   0): 0,  ("Side line left",   1): 5,
-    ("Side line right",  0): 24, ("Side line right",  1): 29,
+    ("Side line top", 0): 0,
+    ("Side line top", 1): 24,
+    ("Side line bottom", 0): 5,
+    ("Side line bottom", 1): 29,
+    ("Side line left", 0): 0,
+    ("Side line left", 1): 5,
+    ("Side line right", 0): 24,
+    ("Side line right", 1): 29,
     # Halfway line
-    ("Middle line", 0): 13, ("Middle line", 1): 16,
+    ("Middle line", 0): 13,
+    ("Middle line", 1): 16,
     # Left penalty area
-    ("Big rect. left top",    0): 1,  ("Big rect. left top",    1): 9,
-    ("Big rect. left bottom", 0): 4,  ("Big rect. left bottom", 1): 12,
-    ("Big rect. left main",   0): 9,  ("Big rect. left main",   1): 12,
+    ("Big rect. left top", 0): 1,
+    ("Big rect. left top", 1): 9,
+    ("Big rect. left bottom", 0): 4,
+    ("Big rect. left bottom", 1): 12,
+    ("Big rect. left main", 0): 9,
+    ("Big rect. left main", 1): 12,
     # Left goal area
-    ("Small rect. left top",    0): 2, ("Small rect. left top",    1): 6,
-    ("Small rect. left bottom", 0): 3, ("Small rect. left bottom", 1): 7,
-    ("Small rect. left main",   0): 6, ("Small rect. left main",   1): 7,
+    ("Small rect. left top", 0): 2,
+    ("Small rect. left top", 1): 6,
+    ("Small rect. left bottom", 0): 3,
+    ("Small rect. left bottom", 1): 7,
+    ("Small rect. left main", 0): 6,
+    ("Small rect. left main", 1): 7,
     # Right penalty area (sorted by x: front end first, goal line end second)
-    ("Big rect. right top",    0): 17, ("Big rect. right top",    1): 25,
-    ("Big rect. right bottom", 0): 20, ("Big rect. right bottom", 1): 28,
-    ("Big rect. right main",   0): 17, ("Big rect. right main",   1): 20,
+    ("Big rect. right top", 0): 17,
+    ("Big rect. right top", 1): 25,
+    ("Big rect. right bottom", 0): 20,
+    ("Big rect. right bottom", 1): 28,
+    ("Big rect. right main", 0): 17,
+    ("Big rect. right main", 1): 20,
     # Right goal area
-    ("Small rect. right top",    0): 22, ("Small rect. right top",    1): 26,
-    ("Small rect. right bottom", 0): 23, ("Small rect. right bottom", 1): 27,
-    ("Small rect. right main",   0): 22, ("Small rect. right main",   1): 23,
+    ("Small rect. right top", 0): 22,
+    ("Small rect. right top", 1): 26,
+    ("Small rect. right bottom", 0): 23,
+    ("Small rect. right bottom", 1): 27,
+    ("Small rect. right main", 0): 22,
+    ("Small rect. right main", 1): 23,
 }
 
 # Symmetric flip pairs for horizontal augmentation (YOLO-pose flip_idx field)
 _RF_FLIP_IDX: list = [
-    24, 25, 26, 27, 28, 29,  # 0-5 → 24-29
-    22, 23, 21,               # 6-8 → 22, 23, 21
-    17, 18, 19, 20,           # 9-12 → 17-20
-    13, 14, 15, 16,           # 13-16 self (halfway + circle top/bottom)
-    9, 10, 11, 12,            # 17-20 → 9-12
-    8,                        # 21 → 8
-    6, 7,                     # 22-23 → 6-7
-    0, 1, 2, 3, 4, 5,         # 24-29 → 0-5
-    31, 30,                   # 30-31 → 31, 30 (circle left ↔ right)
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,  # 0-5 → 24-29
+    22,
+    23,
+    21,  # 6-8 → 22, 23, 21
+    17,
+    18,
+    19,
+    20,  # 9-12 → 17-20
+    13,
+    14,
+    15,
+    16,  # 13-16 self (halfway + circle top/bottom)
+    9,
+    10,
+    11,
+    12,  # 17-20 → 9-12
+    8,  # 21 → 8
+    6,
+    7,  # 22-23 → 6-7
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,  # 24-29 → 0-5
+    31,
+    30,  # 30-31 → 31, 30 (circle left ↔ right)
 ]
 
 
@@ -588,8 +628,8 @@ def convert_soccernet_calibration_to_yolo_pose(
             for rf_idx, coords in accum.items():
                 xs = [c[0] for c in coords]
                 ys = [c[1] for c in coords]
-                kp[rf_idx, 0] = float(np.mean(xs))
-                kp[rf_idx, 1] = float(np.mean(ys))
+                kp[rf_idx, 0] = float(np.clip(np.mean(xs), 0.0, 1.0))
+                kp[rf_idx, 1] = float(np.clip(np.mean(ys), 0.0, 1.0))
                 kp[rf_idx, 2] = 2.0  # labeled and visible
 
             # YOLO-pose row: class cx cy w h  kp0x kp0y kp0v ... kp31x kp31y kp31v
