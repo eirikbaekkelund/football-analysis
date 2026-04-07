@@ -269,6 +269,7 @@ def train_yolo_cmd(
 @click.option("--imgsz", type=int, default=560, help="Input image size (must be multiple of 14).")
 @click.option("--save-dir", type=str, default="weights/pitch_heatmap/")
 @click.option("--wandb-project", type=str, default=None)
+@click.option("--num-workers", type=int, default=8, help="DataLoader worker processes.")
 @click.option("--no-compile", is_flag=True, help="Disable torch.compile.")
 def train_pitch_heatmap_cmd(
     data: str | None,
@@ -281,6 +282,7 @@ def train_pitch_heatmap_cmd(
     imgsz: int,
     save_dir: str,
     wandb_project: str | None,
+    num_workers: int,
     no_compile: bool,
 ) -> None:
     """
@@ -321,6 +323,7 @@ def train_pitch_heatmap_cmd(
         compile_model=not no_compile,
         save_dir=save_dir,
         wandb_project=wandb_project,
+        num_workers=num_workers,
     )
     click.echo(f"Done → {best}")
 

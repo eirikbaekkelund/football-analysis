@@ -171,7 +171,7 @@ def train_pitch_heatmap(
     save_dir: str = "weights/pitch_heatmap/",
     device: Optional[str] = None,
     wandb_project: Optional[str] = None,
-    num_workers: int = 4,
+    num_workers: int = 8,
 ) -> str:
     """
     Train DINOv2+heatmap pitch keypoint detector.
