@@ -264,7 +264,9 @@ def convert_dir_to_yolo_format(
         (output_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
 
     root = Path(soccernet_dir)
-    sequences = sorted([d for d in root.iterdir() if d.is_dir() and (d / "gt" / "gt.txt").exists()])
+    # Recursive search mirrors _load_soccernet_dir_source — handles nested layouts
+    gt_files = sorted(root.glob("**/gt/gt.txt"))
+    sequences = [gt.parent.parent for gt in gt_files]
 
     rng = random.Random(seed)
     rng.shuffle(sequences)
@@ -391,7 +393,8 @@ def train_yolo(
     # Load and train model
     model = YOLO(base_model)
 
-    project_name = f"{project}_yolo11n"
+    model_tag = Path(base_model).stem  # e.g. "yolo11l"
+    project_name = f"{project}_{model_tag}"
     if use_colors:
         project_name += "_colors"
 
@@ -407,7 +410,7 @@ def train_yolo(
         batch=batch_size,
         device=device,
         project=project_name,
-        name="yolo11n_football",
+        name=f"{model_tag}_football",
         exist_ok=True,
         plots=True,
     )
