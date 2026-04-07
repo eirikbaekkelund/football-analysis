@@ -346,8 +346,10 @@ def train_pitch_heatmap(
         # ---- train ----
         model.train()
         train_loss = 0.0
+        n_batches = len(train_loader)
+        log_interval = max(1, n_batches // 10)  # ~10 updates per epoch
 
-        for imgs, hm_targets, vis, pitch_labels in train_loader:
+        for batch_idx, (imgs, hm_targets, vis, pitch_labels) in enumerate(train_loader):
             imgs = imgs.to(dev)
             hm_targets = hm_targets.to(dev)
             vis = vis.to(dev)
@@ -368,6 +370,14 @@ def train_pitch_heatmap(
             scaler.update()
 
             train_loss += loss_hm.item()
+
+            if (batch_idx + 1) % log_interval == 0:
+                avg = train_loss / (batch_idx + 1)
+                print(
+                    f"  Ep {epoch+1:3d} [{batch_idx+1:4d}/{n_batches}] "
+                    f"loss={avg:.5f}",
+                    flush=True,
+                )
 
         train_loss /= max(len(train_loader), 1)
 
