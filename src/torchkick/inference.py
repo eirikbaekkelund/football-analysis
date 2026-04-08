@@ -120,6 +120,106 @@ def calibrate_team_centroids(
 
 
 # ---------------------------------------------------------------------------
+# Pre-pass: crop collection for GameTeamEmbedder training
+# ---------------------------------------------------------------------------
+
+
+def collect_embedding_crops(
+    video_path: str,
+    detector,
+    max_duration: float = 300.0,
+    sample_interval: int = 5,
+    min_track_duration_s: float = 3.0,
+    max_crops_per_track: int = 40,
+    conf: float = 0.6,
+) -> Dict[int, List[np.ndarray]]:
+    """
+    Fast pre-pass to collect jersey crops from long-lived tracks for
+    ``GameTeamEmbedder.fit()``.
+
+    Runs YOLO+BotSORT through the first ``max_duration`` seconds, collects
+    crops every ``sample_interval`` frames, and returns only tracks that
+    survived at least ``min_track_duration_s`` seconds.  The tracker state
+    is reset afterward so Pass 1 gets fresh track IDs.
+
+    Args:
+        video_path: Input video path.
+        detector: ``ultralytics.YOLO`` model.
+        max_duration: Seconds to sample from (default 300).
+        sample_interval: Collect a crop every N frames.
+        min_track_duration_s: Minimum track lifespan to be included.
+        max_crops_per_track: Maximum crops stored per track.
+        conf: Detection confidence threshold.
+
+    Returns:
+        Dict mapping track_id → list of BGR crop arrays for long-lived tracks.
+    """
+    print(f"Pre-pass: collecting team crops from first {max_duration:.0f}s …", flush=True)
+    crops: Dict[int, List[np.ndarray]] = defaultdict(list)
+    track_start: Dict[int, int] = {}
+    track_end: Dict[int, int] = {}
+    fps_ref = 30.0
+
+    with VideoReader(video_path, max_duration=max_duration) as reader:
+        fps_ref = reader.metadata.fps
+        progress = ProgressTracker(reader.max_frames, log_interval=500)
+
+        for frame_idx, frame_bgr in enumerate(reader):
+            results = detector.track(
+                frame_bgr,
+                persist=True,
+                tracker="botsort.yaml",
+                verbose=False,
+                classes=[0],
+                conf=conf,
+            )
+            if results[0].boxes.id is None:
+                progress.update()
+                continue
+
+            boxes = results[0].boxes.xyxy.cpu().numpy()
+            confs_arr = results[0].boxes.conf.cpu().numpy()
+            track_ids = results[0].boxes.id.int().cpu().tolist()
+            keep = confs_arr >= conf
+            boxes = boxes[keep]
+            track_ids = [t for t, k in zip(track_ids, keep) if k]
+
+            for box, tid in zip(boxes, track_ids):
+                if tid not in track_start:
+                    track_start[tid] = frame_idx
+                track_end[tid] = frame_idx
+                if frame_idx % sample_interval == 0 and len(crops[tid]) < max_crops_per_track:
+                    crop = _crop_box(frame_bgr, box.tolist())
+                    if crop is not None and crop.size > 0:
+                        crops[tid].append(crop)
+
+            progress.update()
+            if progress.should_log():
+                print(f"  Pre-pass: {progress.status()}", flush=True)
+
+    # Reset tracker so Pass 1 gets fresh IDs
+    try:
+        if hasattr(detector, "predictor") and detector.predictor is not None:
+            for tracker in detector.predictor.trackers:
+                tracker.reset()
+    except Exception:
+        pass
+
+    min_frames = int(min_track_duration_s * fps_ref)
+    result = {
+        tid: crop_list
+        for tid, crop_list in crops.items()
+        if (track_end.get(tid, 0) - track_start.get(tid, 0)) >= min_frames and len(crop_list) >= 4
+    }
+    print(
+        f"Pre-pass complete: {len(result)} long-lived tracks "
+        f"(≥{min_track_duration_s:.0f}s) from {len(crops)} total",
+        flush=True,
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Pass 1: Detection, tracking, projection
 # ---------------------------------------------------------------------------
 
@@ -168,13 +268,14 @@ def detect_and_project(
 
     homography = HomographyEstimator(
         min_correspondences=6,
-        confidence_threshold=0.3,
-        visibility_threshold=0.3,
+        confidence_threshold=0.4,
+        visibility_threshold=0.4,
         use_kalman=False,
     )
     kp_tracker = KeypointTracker()
     _embedder = reid_embedder or siglip_embedder
-    _MAX_CROPS_PER_TRACK = 20
+    _MAX_CROPS_PER_TRACK = 40
+    _CROP_INTERVAL = 5  # sample every 5th frame → 40 crops covers ~6.7s at 30fps
     crops_by_track: Dict[int, List[np.ndarray]] = defaultdict(list)
 
     with VideoReader(video_path, max_duration=max_duration) as reader:
@@ -217,12 +318,13 @@ def detect_and_project(
             confs = confs[keep]
             track_ids = [tid for tid, k in zip(track_ids, keep) if k]
 
-            # Collect jersey crops for GameTeamEmbedder (BGR, max 20 per track)
-            for box, track_id in zip(boxes, track_ids):
-                if len(crops_by_track[track_id]) < _MAX_CROPS_PER_TRACK:
-                    crop = _crop_box(frame_bgr, box.tolist())
-                    if crop is not None and crop.size > 0:
-                        crops_by_track[track_id].append(crop)
+            # Collect jersey crops for GameTeamEmbedder (every 5th frame, max 40 per track)
+            if frame_idx % _CROP_INTERVAL == 0:
+                for box, track_id in zip(boxes, track_ids):
+                    if len(crops_by_track[track_id]) < _MAX_CROPS_PER_TRACK:
+                        crop = _crop_box(frame_bgr, box.tolist())
+                        if crop is not None and crop.size > 0:
+                            crops_by_track[track_id].append(crop)
 
             # Store observations
             for box, track_id, box_conf in zip(boxes, track_ids, confs):
@@ -471,14 +573,38 @@ def render_visualization(
             )
 
     _KP_NAMES = [
-        "TL-corner", "L-pen-top", "L-goal-top", "L-goal-bot", "L-pen-bot", "BL-corner",
-        "L-goal-front-top", "L-goal-front-bot", "L-pen-spot",
-        "L-pen-front-top", "L-pen-inner-top", "L-pen-inner-bot", "L-pen-front-bot",
-        "HW-top", "CC-top", "CC-bot", "HW-bot",
-        "R-pen-front-top", "R-pen-inner-top", "R-pen-inner-bot", "R-pen-front-bot",
-        "R-pen-spot", "R-goal-front-top", "R-goal-front-bot",
-        "TR-corner", "R-pen-top", "R-goal-top", "R-goal-bot", "R-pen-bot", "BR-corner",
-        "CC-left", "CC-right",
+        "TL-corner",
+        "L-pen-top",
+        "L-goal-top",
+        "L-goal-bot",
+        "L-pen-bot",
+        "BL-corner",
+        "L-goal-front-top",
+        "L-goal-front-bot",
+        "L-pen-spot",
+        "L-pen-front-top",
+        "L-pen-inner-top",
+        "L-pen-inner-bot",
+        "L-pen-front-bot",
+        "HW-top",
+        "CC-top",
+        "CC-bot",
+        "HW-bot",
+        "R-pen-front-top",
+        "R-pen-inner-top",
+        "R-pen-inner-bot",
+        "R-pen-front-bot",
+        "R-pen-spot",
+        "R-goal-front-top",
+        "R-goal-front-bot",
+        "TR-corner",
+        "R-pen-top",
+        "R-goal-top",
+        "R-goal-bot",
+        "R-pen-bot",
+        "BR-corner",
+        "CC-left",
+        "CC-right",
     ]
 
     output_path = generate_output_path(video_path, prefix="torchkick_analysis", duration=max_duration)
@@ -524,6 +650,13 @@ def render_visualization(
                         cv2.putText(frame_bgr, label, (x + 8, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
                         cv2.putText(frame_bgr, label, (x + 8, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
+                # Cap at 22 players per frame (keep highest-confidence)
+                player_obs = [o for o in obs_list if o["role"] not in ("referee", "linesman")]
+                other_obs = [o for o in obs_list if o["role"] in ("referee", "linesman")]
+                if len(player_obs) > 22:
+                    player_obs = sorted(player_obs, key=lambda o: o.get("conf") or 0.0, reverse=True)[:22]
+                obs_list = player_obs + other_obs
+
                 # Draw bounding boxes
                 for obs in obs_list:
                     box = obs["box"]
@@ -545,7 +678,9 @@ def render_visualization(
                     cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, 2)
                     cv2.putText(frame_bgr, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
-                # Build pitch minimap via PitchVisualizer (margin-correct positioning)
+                # Build pitch minimap — active observations + ghost tracks
+                _ghost_window = int(meta.fps * 1.5)  # keep last position for 1.5s
+                active_tids = {obs["track_id"] for obs in obs_list}
                 minimap_entries = []
                 for obs in obs_list:
                     pos = obs.get("pitch_pos")
@@ -554,15 +689,31 @@ def render_visualization(
                     role = obs["role"]
                     team = obs["team"]
                     if role == "goalie":
-                        # Encode GK as team offset 10 — handled below
-                        minimap_entries.append((pos[0], pos[1], obs["track_id"], team + 10))
+                        minimap_entries.append((pos[0], pos[1], obs["track_id"], team + 10, False))
                     elif role in ("referee", "linesman"):
-                        minimap_entries.append((pos[0], pos[1], obs["track_id"], 2))
+                        minimap_entries.append((pos[0], pos[1], obs["track_id"], 2, False))
                     else:
-                        minimap_entries.append((pos[0], pos[1], obs["track_id"], team))
+                        minimap_entries.append((pos[0], pos[1], obs["track_id"], team, False))
+
+                # Ghost tracks: tracks not present this frame but seen within ghost_window
+                for track_id, track in store.tracks.items():
+                    if track_id in active_tids:
+                        continue
+                    info = assignments.get(track_id, {"role": "unknown", "team": -1})
+                    if info.get("role") in ("referee", "linesman"):
+                        continue
+                    for obs in reversed(track.observations):
+                        if obs.frame_idx > frame_idx:
+                            continue
+                        if obs.frame_idx < frame_idx - _ghost_window:
+                            break
+                        if obs.pitch_pos is not None:
+                            team = info.get("team", -1)
+                            minimap_entries.append((obs.pitch_pos[0], obs.pitch_pos[1], track_id, team, True))
+                            break
 
                 pitch_img = pitch_viz.base_pitch.copy()
-                for x, y, tid, team_code in minimap_entries:
+                for x, y, tid, team_code, is_ghost in minimap_entries:
                     if abs(x) > HALF_LENGTH + 5 or abs(y) > HALF_WIDTH + 5:
                         continue
                     px_dot, py_dot = pitch_viz._pitch_to_pixel(x, y)  # margin-aware
@@ -572,8 +723,10 @@ def render_visualization(
                         dot_color = _REF_COLOR
                     else:
                         dot_color = _TEAM_COLORS.get(team_code, _TEAM_COLORS[-1])
-                    cv2.circle(pitch_img, (px_dot, py_dot), 5, dot_color, -1)
-                    cv2.circle(pitch_img, (px_dot, py_dot), 5, (0, 0, 0), 1)
+                    radius = 3 if is_ghost else 5
+                    cv2.circle(pitch_img, (px_dot, py_dot), radius, dot_color, -1 if not is_ghost else 1)
+                    if not is_ghost:
+                        cv2.circle(pitch_img, (px_dot, py_dot), radius, (0, 0, 0), 1)
 
                 pitch_scaled = cv2.resize(pitch_img, (int(pitch_w * scale), meta.height))
 
@@ -748,11 +901,15 @@ def run_analysis(
     smooth_trajectories(store)
 
     # Per-game self-supervised team embedding (GameTeamEmbedder)
+    # Pre-pass collects crops from long-lived tracks (≥3s) over first 300s,
+    # which are used to train the projection head.  Pass 1 crops are used
+    # for the final per-track cluster assignment.
     team_labels: Optional[Dict[int, int]] = None
     if pitch_kp_detector is not None and pitch_kp_detector.backbone is not None:
         try:
+            pretrain_crops = collect_embedding_crops(video_path, detector, max_duration=300.0, conf=conf)
             team_embedder = GameTeamEmbedder(pitch_kp_detector.backbone, dev)
-            team_embedder.fit(crops_by_track)
+            team_embedder.fit(pretrain_crops)
             team_labels = team_embedder.assign_teams(crops_by_track)
         except Exception as e:
             print(f"[warn] GameTeamEmbedder failed: {e}")

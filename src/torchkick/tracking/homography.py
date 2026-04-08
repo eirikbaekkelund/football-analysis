@@ -341,6 +341,80 @@ class CameraPoseKalmanFilter:
 HomographyKalmanFilter = CameraPoseKalmanFilter
 
 
+# Geometric consistency constraint pairs for the 32-keypoint Roboflow pitch schema.
+# Each entry (a, b) asserts that keypoint[a] should be to the LEFT of keypoint[b]
+# in image x-coordinates for a standard broadcast view.
+_HORIZ_PAIRS: List[Tuple[int, int]] = [
+    (0, 24),  # TL-corner.x < TR-corner.x
+    (5, 29),  # BL-corner.x < BR-corner.x
+    (1, 25),  # L-pen-top.x < R-pen-top.x
+    (4, 28),  # L-pen-bot.x < R-pen-bot.x
+    (30, 31),  # CC-left.x < CC-right.x
+    (0, 13),  # TL.x < HW-top.x (left corner left of halfway)
+    (13, 24),  # HW-top.x < TR.x (halfway left of right corner)
+    (5, 16),  # BL.x < HW-bot.x
+    (16, 29),  # HW-bot.x < BR.x
+]
+# Each entry (a, b) asserts that keypoint[a] should be ABOVE keypoint[b]
+# in image y-coordinates (smaller y = higher in frame).
+_VERT_PAIRS: List[Tuple[int, int]] = [
+    (0, 5),  # TL.y < BL.y
+    (24, 29),  # TR.y < BR.y
+    (1, 4),  # L-pen-top.y < L-pen-bot.y
+    (25, 28),  # R-pen-top.y < R-pen-bot.y
+    (13, 16),  # HW-top.y < HW-bot.y
+    (14, 15),  # CC-top.y < CC-bot.y
+    (2, 3),  # L-goal-top.y < L-goal-bot.y
+    (26, 27),  # R-goal-top.y < R-goal-bot.y
+]
+
+
+def _filter_geometric_consistency(
+    positions: np.ndarray,
+    confidence: np.ndarray,
+) -> np.ndarray:
+    """
+    Zero out keypoints that violate expected geometric ordering.
+
+    For each constraint pair (a, b) where both keypoints are active,
+    checks that the positional ordering holds.  When violated, the
+    lower-confidence keypoint in the pair is suppressed.
+
+    Args:
+        positions:  [N, 2] EMA-smoothed pixel positions.
+        confidence: [N]    effective confidence scores.
+
+    Returns:
+        Filtered confidence array with inconsistent keypoints zeroed out.
+    """
+    conf = confidence.copy()
+    n = len(conf)
+
+    for a, b in _HORIZ_PAIRS:
+        if a >= n or b >= n:
+            continue
+        if conf[a] <= 0.0 or conf[b] <= 0.0:
+            continue
+        if positions[a, 0] >= positions[b, 0]:  # violation: a should be left of b
+            if conf[a] < conf[b]:
+                conf[a] = 0.0
+            else:
+                conf[b] = 0.0
+
+    for a, b in _VERT_PAIRS:
+        if a >= n or b >= n:
+            continue
+        if conf[a] <= 0.0 or conf[b] <= 0.0:
+            continue
+        if positions[a, 1] >= positions[b, 1]:  # violation: a should be above b
+            if conf[a] < conf[b]:
+                conf[a] = 0.0
+            else:
+                conf[b] = 0.0
+
+    return conf
+
+
 class KeypointTracker:
     """
     Per-keypoint temporal tracker for pitch landmark stabilization.
@@ -432,7 +506,7 @@ class KeypointTracker:
                 self._ema_var[k] = 0.0
             else:
                 # Measure residual from current EMA before updating it
-                self._ema_var[k] = (1.0 - self.var_alpha) * self._ema_var[k] + self.var_alpha * dist ** 2
+                self._ema_var[k] = (1.0 - self.var_alpha) * self._ema_var[k] + self.var_alpha * dist**2
                 self._positions[k] = self.ema_alpha * keypoints[k] + (1.0 - self.ema_alpha) * self._positions[k]
                 self._age[k] += 1
 
@@ -442,6 +516,11 @@ class KeypointTracker:
             std = float(np.sqrt(self._ema_var[k]))
             stability = 1.0 / (1.0 + std / self.stability_scale)
             effective_conf[k] = confidence[k] * (0.5 + 0.5 * age_factor) * stability
+
+        # Geometric consistency: zero out keypoints that violate expected
+        # relative positions (e.g. left-side kp should have smaller x than right-side).
+        # Only applied when both keypoints in a pair are active.
+        effective_conf = _filter_geometric_consistency(self._positions, effective_conf)
 
         return self._positions.copy(), effective_conf
 
