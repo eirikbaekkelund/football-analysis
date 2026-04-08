@@ -342,30 +342,77 @@ HomographyKalmanFilter = CameraPoseKalmanFilter
 
 
 # Geometric consistency constraint pairs for the 32-keypoint Roboflow pitch schema.
-# Each entry (a, b) asserts that keypoint[a] should be to the LEFT of keypoint[b]
-# in image x-coordinates for a standard broadcast view.
+#
+# Keypoint index reference:
+#  0=TL-corner  1=L-pen-top   2=L-goal-top   3=L-goal-bot   4=L-pen-bot
+#  5=BL-corner  6=L-goal-front-top  7=L-goal-front-bot  8=L-pen-spot
+#  9=L-pen-front-top  10=L-pen-inner-top  11=L-pen-inner-bot  12=L-pen-front-bot
+#  13=HW-top  14=CC-top  15=CC-bot  16=HW-bot
+#  17=R-pen-front-top  18=R-pen-inner-top  19=R-pen-inner-bot  20=R-pen-front-bot
+#  21=R-pen-spot  22=R-goal-front-top  23=R-goal-front-bot
+#  24=TR-corner  25=R-pen-top  26=R-goal-top  27=R-goal-bot  28=R-pen-bot
+#  29=BR-corner  30=CC-left  31=CC-right
+#
+# Each entry (a, b) asserts that keypoint[a].x < keypoint[b].x (a is left of b).
 _HORIZ_PAIRS: List[Tuple[int, int]] = [
-    (0, 24),  # TL-corner.x < TR-corner.x
-    (5, 29),  # BL-corner.x < BR-corner.x
-    (1, 25),  # L-pen-top.x < R-pen-top.x
-    (4, 28),  # L-pen-bot.x < R-pen-bot.x
-    (30, 31),  # CC-left.x < CC-right.x
-    (0, 13),  # TL.x < HW-top.x (left corner left of halfway)
-    (13, 24),  # HW-top.x < TR.x (halfway left of right corner)
-    (5, 16),  # BL.x < HW-bot.x
-    (16, 29),  # HW-bot.x < BR.x
+    # Corners & halfway line
+    (0, 24),  # TL < TR
+    (5, 29),  # BL < BR
+    (0, 13),  # TL < HW-top
+    (13, 24),  # HW-top < TR
+    (5, 16),  # BL < HW-bot
+    (16, 29),  # HW-bot < BR
+    # Penalty box tops/bots
+    (1, 25),  # L-pen-top < R-pen-top
+    (4, 28),  # L-pen-bot < R-pen-bot
+    (1, 13),  # L-pen-top < HW-top
+    (13, 25),  # HW-top < R-pen-top
+    (4, 16),  # L-pen-bot < HW-bot
+    (16, 28),  # HW-bot < R-pen-bot
+    # Goal tops/bots
+    (2, 26),  # L-goal-top < R-goal-top
+    (3, 27),  # L-goal-bot < R-goal-bot
+    (2, 13),  # L-goal-top < HW-top
+    (13, 26),  # HW-top < R-goal-top
+    # Goal front
+    (6, 22),  # L-goal-front-top < R-goal-front-top
+    (7, 23),  # L-goal-front-bot < R-goal-front-bot
+    # Penalty front/inner
+    (9, 17),  # L-pen-front-top < R-pen-front-top
+    (12, 20),  # L-pen-front-bot < R-pen-front-bot
+    (10, 18),  # L-pen-inner-top < R-pen-inner-top
+    (11, 19),  # L-pen-inner-bot < R-pen-inner-bot
+    # Penalty spots & centre circle
+    (8, 21),  # L-pen-spot < R-pen-spot
+    (30, 31),  # CC-left < CC-right
+    (8, 13),  # L-pen-spot < HW (spot is in left half)
+    (13, 21),  # HW < R-pen-spot
 ]
-# Each entry (a, b) asserts that keypoint[a] should be ABOVE keypoint[b]
-# in image y-coordinates (smaller y = higher in frame).
+
+# Each entry (a, b) asserts that keypoint[a].y < keypoint[b].y (a is above b in frame).
 _VERT_PAIRS: List[Tuple[int, int]] = [
-    (0, 5),  # TL.y < BL.y
-    (24, 29),  # TR.y < BR.y
-    (1, 4),  # L-pen-top.y < L-pen-bot.y
-    (25, 28),  # R-pen-top.y < R-pen-bot.y
-    (13, 16),  # HW-top.y < HW-bot.y
-    (14, 15),  # CC-top.y < CC-bot.y
-    (2, 3),  # L-goal-top.y < L-goal-bot.y
-    (26, 27),  # R-goal-top.y < R-goal-bot.y
+    # Corners
+    (0, 5),  # TL above BL
+    (24, 29),  # TR above BR
+    # Halfway line
+    (13, 16),  # HW-top above HW-bot
+    # Centre circle
+    (14, 15),  # CC-top above CC-bot
+    # Penalty box tops/bots
+    (1, 4),  # L-pen-top above L-pen-bot
+    (25, 28),  # R-pen-top above R-pen-bot
+    # Goal tops/bots
+    (2, 3),  # L-goal-top above L-goal-bot
+    (26, 27),  # R-goal-top above R-goal-bot
+    # Goal front top/bot
+    (6, 7),  # L-goal-front-top above L-goal-front-bot
+    (22, 23),  # R-goal-front-top above R-goal-front-bot
+    # Penalty front top/bot
+    (9, 12),  # L-pen-front-top above L-pen-front-bot
+    (17, 20),  # R-pen-front-top above R-pen-front-bot
+    # Penalty inner top/bot
+    (10, 11),  # L-pen-inner-top above L-pen-inner-bot
+    (18, 19),  # R-pen-inner-top above R-pen-inner-bot
 ]
 
 
@@ -435,7 +482,9 @@ class KeypointTracker:
 
     Args:
         num_keypoints:   Number of tracked keypoints (default 32).
-        ema_alpha:       EMA weight for the new observation (0 = frozen, 1 = no smoothing).
+        ema_alpha:       EMA weight for the new observation (0 = frozen, 1 = raw, no smoothing).
+                         Default 1.0 — raw positions passed to RANSAC so homography tracks
+                         camera movement without lag.
         var_alpha:       EMA weight for variance update (slower than position).
         max_gap_frames:  Frames without a detection before a track is considered lost.
         age_saturation:  Track age at which the age boost saturates (frames).
@@ -448,7 +497,7 @@ class KeypointTracker:
     def __init__(
         self,
         num_keypoints: int = 32,
-        ema_alpha: float = 0.3,
+        ema_alpha: float = 1.0,
         var_alpha: float = 0.1,
         max_gap_frames: int = 10,
         age_saturation: int = 30,

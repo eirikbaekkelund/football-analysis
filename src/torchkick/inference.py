@@ -860,24 +860,21 @@ def run_analysis(
         except Exception as e:
             print(f"[warn] Could not load ReID embedder: {e}")
 
-    # Zero-shot SigLIP fallback — only when no pitch detector (GameTeamEmbedder handles team
-    # assignment when pitch_weights is provided, so SigLIP is redundant in that case)
+    # SigLIP — always loaded for team assignment via GameTeamEmbedder
     siglip_embedder = None
-    if reid_embedder is None and pitch_kp_detector is None:
-        try:
-            from torchkick.models.reid import SigLIPTeamEmbedder
+    try:
+        from torchkick.models.reid import SigLIPTeamEmbedder
 
-            siglip_embedder = SigLIPTeamEmbedder(device=str(dev))
-            print("SigLIP zero-shot team embedder loaded")
-        except Exception as e:
-            print(f"[warn] SigLIP unavailable: {e}")
+        siglip_embedder = SigLIPTeamEmbedder(device=str(dev))
+        print("SigLIP team embedder loaded")
+    except Exception as e:
+        print(f"[warn] SigLIP unavailable: {e}")
 
-    # Pass 0: Calibrate team centroids (SigLIP / ReID path only)
+    # Pass 0: Calibrate team centroids (ReID path only — GameTeamEmbedder replaces SigLIP k-means)
     team_centroids = None
-    _calib_embedder = reid_embedder or siglip_embedder
-    if _calib_embedder is not None:
+    if reid_embedder is not None:
         try:
-            team_centroids = calibrate_team_centroids(video_path, detector, _calib_embedder, conf=conf)
+            team_centroids = calibrate_team_centroids(video_path, detector, reid_embedder, conf=conf)
         except Exception as e:
             print(f"[warn] Centroid calibration failed: {e}")
 
@@ -900,16 +897,11 @@ def run_analysis(
     # Pass 2: Smooth trajectories
     smooth_trajectories(store)
 
-    # Per-game self-supervised team embedding (GameTeamEmbedder)
-    # Pre-pass collects crops from long-lived tracks (≥3s) over first 300s,
-    # which are used to train the projection head.  Pass 1 crops are used
-    # for the final per-track cluster assignment.
+    # Per-game team assignment: SigLIP → UMAP(3D) → KMeans k=3
     team_labels: Optional[Dict[int, int]] = None
-    if pitch_kp_detector is not None and pitch_kp_detector.backbone is not None:
+    if siglip_embedder is not None:
         try:
-            pretrain_crops = collect_embedding_crops(video_path, detector, max_duration=300.0, conf=conf)
-            team_embedder = GameTeamEmbedder(pitch_kp_detector.backbone, dev)
-            team_embedder.fit(pretrain_crops)
+            team_embedder = GameTeamEmbedder(siglip_embedder)
             team_labels = team_embedder.assign_teams(crops_by_track)
         except Exception as e:
             print(f"[warn] GameTeamEmbedder failed: {e}")
