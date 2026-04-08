@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import random
 from collections import defaultdict
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -31,6 +32,7 @@ from torchkick.tracking import (
     IdentityAssigner,
     HomographyEstimator,
     KeypointTracker,
+    GameTeamEmbedder,
     PitchVisualizer,
     PITCH_LINE_COORDINATES,
     HALF_LENGTH,
@@ -51,7 +53,7 @@ def calibrate_team_centroids(
     embedder,
     calibration_duration: float = 120.0,
     n_sample_frames: int = 40,
-    conf: float = 0.5,
+    conf: float = 0.6,
 ) -> Optional[np.ndarray]:
     """
     Fit k=3 team centroids from randomly sampled frames in the first
@@ -132,8 +134,8 @@ def detect_and_project(
     siglip_embedder=None,
     reid_embedder=None,
     reid_interval: int = 5,
-    conf: float = 0.5,
-) -> TrajectoryStore:
+    conf: float = 0.6,
+) -> Tuple[TrajectoryStore, Dict[int, List[np.ndarray]]]:
     """
     Pass 1: YOLO detection + BotSORT tracking + 2D pitch projection.
 
@@ -154,7 +156,9 @@ def detect_and_project(
         conf: Detection confidence threshold.
 
     Returns:
-        ``TrajectoryStore`` with all observations.
+        Tuple of ``(TrajectoryStore, crops_by_track)`` where
+        ``crops_by_track`` maps track_id → list of BGR crop arrays
+        (up to 20 per track) for use with ``GameTeamEmbedder``.
     """
     print("=" * 60)
     print("PASS 1: Detection + Tracking + Projection")
@@ -168,11 +172,57 @@ def detect_and_project(
     )
     kp_tracker = KeypointTracker()
     _embedder = reid_embedder or siglip_embedder
+    _MAX_CROPS_PER_TRACK = 20
+    crops_by_track: Dict[int, List[np.ndarray]] = defaultdict(list)
+
+    # Keypoint names for debug video overlay
+    _KP_NAMES = [
+        "TL-corner",
+        "L-pen-top",
+        "L-goal-top",
+        "L-goal-bot",
+        "L-pen-bot",
+        "BL-corner",
+        "L-goal-front-top",
+        "L-goal-front-bot",
+        "L-pen-spot",
+        "L-pen-front-top",
+        "L-pen-inner-top",
+        "L-pen-inner-bot",
+        "L-pen-front-bot",
+        "HW-top",
+        "CC-top",
+        "CC-bot",
+        "HW-bot",
+        "R-pen-front-top",
+        "R-pen-inner-top",
+        "R-pen-inner-bot",
+        "R-pen-front-bot",
+        "R-pen-spot",
+        "R-goal-front-top",
+        "R-goal-front-bot",
+        "TR-corner",
+        "R-pen-top",
+        "R-goal-top",
+        "R-goal-bot",
+        "R-pen-bot",
+        "BR-corner",
+        "CC-left",
+        "CC-right",
+    ]
 
     with VideoReader(video_path, max_duration=max_duration) as reader:
         meta = reader.metadata
         store = TrajectoryStore(fps=meta.fps)
         progress = ProgressTracker(reader.max_frames, log_interval=100)
+
+        _debug_kp_path = str(Path(video_path).with_stem(Path(video_path).stem + "_kp_debug").with_suffix(".mp4"))
+        _debug_writer = VideoWriter(_debug_kp_path, meta.fps, (meta.width, meta.height))
+        _debug_writer.__enter__()
+        _last_kps = None
+        _last_eff = None
+        _last_ok = False
+        _last_inliers = 0
 
         for frame_idx, frame_bgr in enumerate(reader):
             # Homography update
@@ -180,8 +230,34 @@ def detect_and_project(
                 kps, conf_kps = pitch_kp_detector.detect(frame_bgr)
                 kps_smooth, eff_conf = kp_tracker.update(kps, conf_kps)
                 ok = homography.estimate(kps_smooth, eff_conf, eff_conf, frame_bgr.shape[:2])
+                _last_kps, _last_eff, _last_ok, _last_inliers = kps_smooth, eff_conf, ok, homography.num_inliers
                 if ok and homography.H_inv is not None:
                     store.frame_homographies[frame_idx] = homography.H_inv.copy()
+
+            # Draw keypoints on debug video
+            dbg = frame_bgr.copy()
+            cv2.putText(
+                dbg,
+                f"f{frame_idx:04d}  hom={'OK inliers='+str(_last_inliers) if _last_ok else 'FAIL'}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2,
+            )
+            if _last_kps is not None and _last_eff is not None:
+                for k in range(len(_last_kps)):
+                    c = float(_last_eff[k])
+                    if c < 0.05:
+                        continue
+                    x, y = int(_last_kps[k, 0]), int(_last_kps[k, 1])
+                    color = (0, int(255 * c), int(255 * (1 - c)))  # green=high, red=low
+                    cv2.circle(dbg, (x, y), 7, (0, 0, 0), -1)  # dark outline
+                    cv2.circle(dbg, (x, y), 5, color, -1)
+                    label = f"{_KP_NAMES[k]} {c:.2f}"
+                    cv2.putText(dbg, label, (x + 8, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+                    cv2.putText(dbg, label, (x + 8, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            _debug_writer.write(dbg)
 
             # Detection + tracking
             results = detector.track(
@@ -198,15 +274,31 @@ def detect_and_project(
                 continue
 
             boxes = results[0].boxes.xyxy.cpu().numpy()
+            confs = results[0].boxes.conf.cpu().numpy()
             track_ids = results[0].boxes.id.int().cpu().tolist()
 
-            # Store observations
+            # Explicitly filter below threshold — tracker persist=True can return
+            # predicted positions for lost tracks with stale/low confidence
+            keep = confs >= conf
+            boxes = boxes[keep]
+            confs = confs[keep]
+            track_ids = [tid for tid, k in zip(track_ids, keep) if k]
+
+            # Collect jersey crops for GameTeamEmbedder (BGR, max 20 per track)
             for box, track_id in zip(boxes, track_ids):
+                if len(crops_by_track[track_id]) < _MAX_CROPS_PER_TRACK:
+                    crop = _crop_box(frame_bgr, box.tolist())
+                    if crop is not None and crop.size > 0:
+                        crops_by_track[track_id].append(crop)
+
+            # Store observations
+            for box, track_id, box_conf in zip(boxes, track_ids, confs):
                 pitch_pos = homography.project_player_to_pitch(box.tolist())
                 store.add_observation(
                     track_id=track_id,
                     frame_idx=frame_idx,
                     box=box,
+                    conf=float(box_conf),
                     pitch_pos=pitch_pos,
                 )
 
@@ -230,12 +322,15 @@ def detect_and_project(
 
             progress.update()
             if progress.should_log():
-                print(progress.status())
+                print(progress.status(), flush=True)
 
         store.total_frames = frame_idx + 1
 
+    _debug_writer.__exit__(None, None, None)
+    print(f"Keypoint debug video → {_debug_kp_path}")
+
     print(f"Complete: {len(store.tracks)} tracks over {store.total_frames} frames")
-    return store
+    return store, dict(crops_by_track)
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +446,7 @@ def assign_identities(
     reid_embedder=None,
     siglip_embedder=None,
     team_centroids: Optional[np.ndarray] = None,
+    team_labels: Optional[Dict[int, int]] = None,
 ) -> Dict:
     """
     Pass 3: Team classification and goalkeeper detection.
@@ -380,7 +476,7 @@ def assign_identities(
         team_centroids=team_centroids,
         debug=True,
     )
-    assignments = assigner.assign_roles(store)
+    assignments = assigner.assign_roles(store, team_labels=team_labels)
     print(f"Complete: {len(assignments)} identities assigned")
     return assignments
 
@@ -436,6 +532,7 @@ def render_visualization(
             frame_obs[obs.frame_idx].append(
                 {
                     "box": obs.box,
+                    "conf": obs.conf,
                     "pitch_pos": obs.pitch_pos,
                     "role": info.get("role", "unknown"),
                     "team": info.get("team", -1),
@@ -473,15 +570,16 @@ def render_visualization(
                     team = obs["team"]
                     x1, y1, x2, y2 = map(int, box)
 
+                    conf_str = f" {obs['conf']:.2f}" if obs.get("conf") is not None else ""
                     if role == "goalie":
                         color = _GK_COLOR_T0 if team == 0 else _GK_COLOR_T1
-                        label = f"GK{obs['track_id']}"
+                        label = f"GK{obs['track_id']}{conf_str}"
                     elif role in ("referee", "linesman"):
                         color = _REF_COLOR
-                        label = "REF"
+                        label = f"REF{conf_str}"
                     else:
                         color = _TEAM_COLORS.get(team, _TEAM_COLORS[-1])
-                        label = str(obs["track_id"])
+                        label = f"{obs['track_id']}{conf_str}"
 
                     cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, 2)
                     cv2.putText(frame_bgr, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
@@ -517,11 +615,24 @@ def render_visualization(
                     cv2.circle(pitch_img, (px_dot, py_dot), 5, (0, 0, 0), 1)
 
                 pitch_scaled = cv2.resize(pitch_img, (int(pitch_w * scale), meta.height))
+
+                # Frame counter + homography status overlay
+                total_frames = reader.max_frames
+                cv2.putText(
+                    frame_bgr,
+                    f"{frame_idx}/{total_frames}",
+                    (10, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (255, 255, 255),
+                    2,
+                )
+
                 writer.write(np.hstack([frame_bgr, pitch_scaled]))
 
                 progress.update()
                 if progress.should_log():
-                    print(f"Pass 4: {progress.status()}")
+                    print(f"Pass 4: {progress.status()}", flush=True)
 
     print(f"Complete: {output_path}")
     return output_path
@@ -561,7 +672,7 @@ def run_analysis(
     duration: Optional[float] = None,
     homography_interval: int = 1,
     reid_interval: int = 5,
-    conf: float = 0.5,
+    conf: float = 0.6,
     draw_overlay: bool = True,
     device: Optional[str] = None,
 ) -> str:
@@ -635,9 +746,10 @@ def run_analysis(
         except Exception as e:
             print(f"[warn] Could not load ReID embedder: {e}")
 
-    # Zero-shot SigLIP fallback
+    # Zero-shot SigLIP fallback — only when no pitch detector (GameTeamEmbedder handles team
+    # assignment when pitch_weights is provided, so SigLIP is redundant in that case)
     siglip_embedder = None
-    if reid_embedder is None:
+    if reid_embedder is None and pitch_kp_detector is None:
         try:
             from torchkick.models.reid import SigLIPTeamEmbedder
 
@@ -646,7 +758,7 @@ def run_analysis(
         except Exception as e:
             print(f"[warn] SigLIP unavailable: {e}")
 
-    # Pass 0: Calibrate team centroids
+    # Pass 0: Calibrate team centroids (SigLIP / ReID path only)
     team_centroids = None
     _calib_embedder = reid_embedder or siglip_embedder
     if _calib_embedder is not None:
@@ -656,7 +768,7 @@ def run_analysis(
             print(f"[warn] Centroid calibration failed: {e}")
 
     # Pass 1: Detection + tracking + projection
-    store = detect_and_project(
+    store, crops_by_track = detect_and_project(
         video_path,
         detector,
         pitch_kp_detector,
@@ -674,12 +786,23 @@ def run_analysis(
     # Pass 2: Smooth trajectories
     smooth_trajectories(store)
 
+    # Per-game self-supervised team embedding (GameTeamEmbedder)
+    team_labels: Optional[Dict[int, int]] = None
+    if pitch_kp_detector is not None and pitch_kp_detector.backbone is not None:
+        try:
+            team_embedder = GameTeamEmbedder(pitch_kp_detector.backbone, dev)
+            team_embedder.fit(crops_by_track)
+            team_labels = team_embedder.assign_teams(crops_by_track)
+        except Exception as e:
+            print(f"[warn] GameTeamEmbedder failed: {e}")
+
     # Pass 3: Identity assignment
     assignments = assign_identities(
         store,
         reid_embedder=reid_embedder,
         siglip_embedder=siglip_embedder,
         team_centroids=team_centroids,
+        team_labels=team_labels,
     )
 
     # Pass 4: Render

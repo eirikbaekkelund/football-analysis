@@ -47,6 +47,7 @@ class TrackObservation(BaseModel):
 
     frame_idx: int
     box: np.ndarray
+    conf: Optional[float] = None
     pitch_pos: Optional[Tuple[float, float]] = None
     # Representative mask for this observation (optional, stored every N frames)
     rep_mask: Optional[np.ndarray] = None

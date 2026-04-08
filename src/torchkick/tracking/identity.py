@@ -71,12 +71,16 @@ class IdentityAssigner:
     def assign_roles(
         self,
         store: TrajectoryStore,
+        team_labels: Optional[Dict[int, int]] = None,
     ) -> Dict[int, Dict]:
         """
         Assign roles and teams to all tracks.
 
         Args:
-            store: TrajectoryStore with accumulated observations.
+            store:       TrajectoryStore with accumulated observations.
+            team_labels: Optional pre-computed team labels from GameTeamEmbedder.
+                         When provided, bypasses internal embedding clustering.
+                         Labels: 0=team0, 1=team1, 2=ref, -1=noise (→ team 0).
 
         Returns:
             Dict mapping track_id to {'role', 'team', 'player_id'}.
@@ -103,19 +107,33 @@ class IdentityAssigner:
             tid for tid in track_stats.keys() if tid not in goalie_candidates and tid not in linesman_candidates
         ]
 
-        # Cluster: prefer team_probs/ReID embeddings; without them team classification is
-        # not possible — provide --reid-weights to enable it.
-        has_reid = self._has_reid_embeddings(store, remaining_ids)
-        if has_reid:
-            team_assignments, referee_id = self._cluster_by_reid(store, remaining_ids)
-        else:
+        # Cluster: use pre-computed labels if provided, else fall back to ReID/embedding clustering.
+        if team_labels is not None:
             if self.debug:
-                print(
-                    "[IdentityAssigner] No ReID embeddings — team classification unavailable. "
-                    "Run with --reid-weights to enable. Defaulting all to team 0."
-                )
-            team_assignments = {tid: 0 for tid in remaining_ids}
+                print("[IdentityAssigner] Using pre-computed team labels from GameTeamEmbedder")
             referee_id = None
+            team_assignments = {}
+            for tid in remaining_ids:
+                label = team_labels.get(tid, 0)
+                if label == 2:
+                    # Mark as referee — pick the first one as representative
+                    team_assignments[tid] = 2
+                    if referee_id is None:
+                        referee_id = tid
+                else:
+                    team_assignments[tid] = max(label, 0)  # -1 noise → 0
+        else:
+            has_reid = self._has_reid_embeddings(store, remaining_ids)
+            if has_reid:
+                team_assignments, referee_id = self._cluster_by_reid(store, remaining_ids)
+            else:
+                if self.debug:
+                    print(
+                        "[IdentityAssigner] No ReID embeddings — team classification unavailable. "
+                        "Run with --reid-weights to enable. Defaulting all to team 0."
+                    )
+                team_assignments = {tid: 0 for tid in remaining_ids}
+                referee_id = None
 
         # Assign goalies to teams
         goalie_teams = self._assign_goalie_teams(goalie_candidates, track_stats, team_assignments)

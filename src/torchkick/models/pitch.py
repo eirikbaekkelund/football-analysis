@@ -156,6 +156,11 @@ class HeatmapPitchDetector:
         self._model: Optional[DINOv2PitchModel] = None
         self._load_model(str(weights_path))
 
+    @property
+    def backbone(self):
+        """DINOv2 backbone for reuse by other components (e.g. GameTeamEmbedder)."""
+        return self._model.backbone if self._model is not None else None
+
     def _load_model(self, weights_path: str) -> None:
         ckpt = torch.load(weights_path, map_location=self.device, weights_only=False)
         cfg = ckpt.get("config", {})

@@ -62,6 +62,7 @@ class TrajectoryStore:
         track_id: int,
         frame_idx: int,
         box: np.ndarray,
+        conf: Optional[float] = None,
         pitch_pos: Optional[Tuple[float, float]] = None,
         rep_mask: Optional[np.ndarray] = None,
         pose_2d: Optional[np.ndarray] = None,
@@ -87,6 +88,7 @@ class TrajectoryStore:
         obs = TrackObservation(
             frame_idx=frame_idx,
             box=box,
+            conf=conf,
             pitch_pos=pitch_pos,
             rep_mask=rep_mask,
             pose_2d=pose_2d,

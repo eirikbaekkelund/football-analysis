@@ -407,19 +407,13 @@ class KeypointTracker:
                 continue
 
             cold_start = self._gap[k] > self.max_gap
-            jump = (
-                not cold_start
-                and np.linalg.norm(keypoints[k] - self._positions[k]) > self.jump_threshold
-            )
+            jump = not cold_start and np.linalg.norm(keypoints[k] - self._positions[k]) > self.jump_threshold
 
             if cold_start or jump:
                 self._positions[k] = keypoints[k].copy()
                 self._age[k] = 1
             else:
-                self._positions[k] = (
-                    self.ema_alpha * keypoints[k]
-                    + (1.0 - self.ema_alpha) * self._positions[k]
-                )
+                self._positions[k] = self.ema_alpha * keypoints[k] + (1.0 - self.ema_alpha) * self._positions[k]
                 self._age[k] += 1
 
             self._gap[k] = 0

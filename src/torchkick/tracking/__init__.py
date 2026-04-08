@@ -87,6 +87,9 @@ from torchkick.tracking.lifting import (
     PoseLift3D,
 )
 
+# Per-game self-supervised team embedder
+from torchkick.tracking.team_embedder import GameTeamEmbedder
+
 # Visualization
 from torchkick.tracking.pitch_viz import (
     COLOR_TEAM_1,
@@ -136,6 +139,8 @@ __all__ = [
     "CameraModel",
     "build_camera_model",
     "PoseLift3D",
+    # Team embedding
+    "GameTeamEmbedder",
     # Visualization
     "PitchVisualizer",
 ]

@@ -374,8 +374,7 @@ def train_pitch_heatmap(
             if (batch_idx + 1) % log_interval == 0:
                 avg = train_loss / (batch_idx + 1)
                 print(
-                    f"  Ep {epoch+1:3d} [{batch_idx+1:4d}/{n_batches}] "
-                    f"loss={avg:.5f}",
+                    f"  Ep {epoch+1:3d} [{batch_idx+1:4d}/{n_batches}] " f"loss={avg:.5f}",
                     flush=True,
                 )
 

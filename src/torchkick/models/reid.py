@@ -5,7 +5,7 @@ Architecture:
     DINOv2 ViT-L/14 (frozen backbone)
         → LoRA adapter layers (rank 16-32, injected into attention)
         → Multi-scale feature aggregation (CLS token + mean patch tokens)
-        → ArcFace head (s=64, m=0.5) — 3-class: home, away, referee
+        → ArcFace head (s=64, m=0.5) — 3-class: team0, team1, other (gk, ref)
         → SpectralEmbedding — for unsupervised team clustering
 
 At training time: use ViT-L/14 (1024-dim) with LoRA + ArcFace.

@@ -713,11 +713,12 @@ def build_soccernet_keypoint_dataset(
     # Files are moved (not copied) so there is zero leakage.
     if "valid" not in yaml_splits and "val" not in yaml_splits and "train" in yaml_splits:
         import random as _random
+
         _random.seed(42)
         train_img_dir = out / "images" / "train"
         train_lbl_dir = out / "labels" / "train"
-        val_img_dir   = out / "images" / "valid"
-        val_lbl_dir   = out / "labels" / "valid"
+        val_img_dir = out / "images" / "valid"
+        val_lbl_dir = out / "labels" / "valid"
         val_img_dir.mkdir(parents=True, exist_ok=True)
         val_lbl_dir.mkdir(parents=True, exist_ok=True)
 
@@ -737,7 +738,7 @@ def build_soccernet_keypoint_dataset(
     # Write dataset.yaml
     yaml_path = out / "dataset.yaml"
     train_key = yaml_splits.get("train", next(iter(yaml_splits.values())))
-    val_key   = yaml_splits.get("valid", yaml_splits.get("val", train_key))
+    val_key = yaml_splits.get("valid", yaml_splits.get("val", train_key))
 
     yaml_lines = [
         f"path: {out.resolve()}",
