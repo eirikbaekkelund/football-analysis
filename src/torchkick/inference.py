@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import random
 from collections import defaultdict
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -135,7 +134,6 @@ def detect_and_project(
     reid_embedder=None,
     reid_interval: int = 5,
     conf: float = 0.6,
-    debug_video: bool = False,
 ) -> Tuple[TrajectoryStore, Dict[int, List[np.ndarray]]]:
     """
     Pass 1: YOLO detection + BotSORT tracking + 2D pitch projection.
@@ -144,10 +142,13 @@ def detect_and_project(
     player crops are embedded with ``siglip_embedder`` (or ``reid_embedder``
     if provided) and stored in observations for later team clustering.
 
+    Keypoints and homographies are stored in ``store.frame_keypoints`` /
+    ``store.frame_homographies`` for use in Pass 4 visualization.
+
     Args:
         video_path: Input video path.
         detector: ``ultralytics.YOLO`` model.
-        pitch_kp_detector: Pitch keypoint detector (YOLO-pose) for homography.
+        pitch_kp_detector: Pitch keypoint detector for homography.
             Pass None to skip homography estimation.
         max_duration: Maximum duration in seconds.
         homography_interval: Frames between homography updates.
@@ -176,91 +177,20 @@ def detect_and_project(
     _MAX_CROPS_PER_TRACK = 20
     crops_by_track: Dict[int, List[np.ndarray]] = defaultdict(list)
 
-    # Keypoint names for debug video overlay
-    _KP_NAMES = [
-        "TL-corner",
-        "L-pen-top",
-        "L-goal-top",
-        "L-goal-bot",
-        "L-pen-bot",
-        "BL-corner",
-        "L-goal-front-top",
-        "L-goal-front-bot",
-        "L-pen-spot",
-        "L-pen-front-top",
-        "L-pen-inner-top",
-        "L-pen-inner-bot",
-        "L-pen-front-bot",
-        "HW-top",
-        "CC-top",
-        "CC-bot",
-        "HW-bot",
-        "R-pen-front-top",
-        "R-pen-inner-top",
-        "R-pen-inner-bot",
-        "R-pen-front-bot",
-        "R-pen-spot",
-        "R-goal-front-top",
-        "R-goal-front-bot",
-        "TR-corner",
-        "R-pen-top",
-        "R-goal-top",
-        "R-goal-bot",
-        "R-pen-bot",
-        "BR-corner",
-        "CC-left",
-        "CC-right",
-    ]
-
     with VideoReader(video_path, max_duration=max_duration) as reader:
         meta = reader.metadata
         store = TrajectoryStore(fps=meta.fps)
         progress = ProgressTracker(reader.max_frames, log_interval=100)
 
-        _last_kps = None
-        _last_eff = None
-        _last_ok = False
-        _last_inliers = 0
-
-        if debug_video:
-            _debug_kp_path = str(Path(video_path).with_stem(Path(video_path).stem + "_kp_debug").with_suffix(".mp4"))
-            _debug_writer = VideoWriter(_debug_kp_path, meta.fps, (meta.width, meta.height))
-            _debug_writer.__enter__()
-
         for frame_idx, frame_bgr in enumerate(reader):
-            # Homography update
+            # Homography + keypoint update
             if frame_idx % homography_interval == 0 and pitch_kp_detector is not None:
                 kps, conf_kps = pitch_kp_detector.detect(frame_bgr)
                 kps_smooth, eff_conf = kp_tracker.update(kps, conf_kps)
                 ok = homography.estimate(kps_smooth, eff_conf, eff_conf, frame_bgr.shape[:2])
-                _last_kps, _last_eff, _last_ok, _last_inliers = kps_smooth, eff_conf, ok, homography.num_inliers
+                store.frame_keypoints[frame_idx] = (kps_smooth.copy(), eff_conf.copy())
                 if ok and homography.H_inv is not None:
                     store.frame_homographies[frame_idx] = homography.H_inv.copy()
-
-            if debug_video:
-                dbg = frame_bgr.copy()
-                cv2.putText(
-                    dbg,
-                    f"f{frame_idx:04d}  hom={'OK inliers='+str(_last_inliers) if _last_ok else 'FAIL'}",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 255),
-                    2,
-                )
-                if _last_kps is not None and _last_eff is not None:
-                    for k in range(len(_last_kps)):
-                        c = float(_last_eff[k])
-                        if c < 0.05:
-                            continue
-                        x, y = int(_last_kps[k, 0]), int(_last_kps[k, 1])
-                        color = (0, int(255 * c), int(255 * (1 - c)))  # green=high, red=low
-                        cv2.circle(dbg, (x, y), 7, (0, 0, 0), -1)  # dark outline
-                        cv2.circle(dbg, (x, y), 5, color, -1)
-                        label = f"{_KP_NAMES[k]} {c:.2f}"
-                        cv2.putText(dbg, label, (x + 8, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-                        cv2.putText(dbg, label, (x + 8, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-                _debug_writer.write(dbg)
 
             # Detection + tracking
             results = detector.track(
@@ -328,10 +258,6 @@ def detect_and_project(
                 print(progress.status(), flush=True)
 
         store.total_frames = frame_idx + 1
-
-    if debug_video:
-        _debug_writer.__exit__(None, None, None)
-        print(f"Keypoint debug video → {_debug_kp_path}")
 
     print(f"Complete: {len(store.tracks)} tracks over {store.total_frames} frames")
     return store, dict(crops_by_track)
@@ -544,8 +470,20 @@ def render_visualization(
                 }
             )
 
+    _KP_NAMES = [
+        "TL-corner", "L-pen-top", "L-goal-top", "L-goal-bot", "L-pen-bot", "BL-corner",
+        "L-goal-front-top", "L-goal-front-bot", "L-pen-spot",
+        "L-pen-front-top", "L-pen-inner-top", "L-pen-inner-bot", "L-pen-front-bot",
+        "HW-top", "CC-top", "CC-bot", "HW-bot",
+        "R-pen-front-top", "R-pen-inner-top", "R-pen-inner-bot", "R-pen-front-bot",
+        "R-pen-spot", "R-goal-front-top", "R-goal-front-bot",
+        "TR-corner", "R-pen-top", "R-goal-top", "R-goal-bot", "R-pen-bot", "BR-corner",
+        "CC-left", "CC-right",
+    ]
+
     output_path = generate_output_path(video_path, prefix="torchkick_analysis", duration=max_duration)
     current_H_inv = None
+    current_kps: Optional[Tuple[np.ndarray, np.ndarray]] = None
 
     with VideoReader(video_path, max_duration=max_duration) as reader:
         meta = reader.metadata
@@ -558,14 +496,33 @@ def render_visualization(
             for frame_idx, frame_bgr in enumerate(reader):
                 obs_list = frame_obs.get(frame_idx, [])
 
-                # Update homography for overlay
-                if draw_overlay:
-                    for check_idx in range(frame_idx, -1, -1):
-                        if check_idx in store.frame_homographies:
-                            current_H_inv = store.frame_homographies[check_idx]
-                            break
-                    if current_H_inv is not None:
-                        frame_bgr = _draw_pitch_overlay(frame_bgr, current_H_inv)
+                # Update homography and keypoints (walk back to last stored frame)
+                for check_idx in range(frame_idx, -1, -1):
+                    if check_idx in store.frame_homographies:
+                        current_H_inv = store.frame_homographies[check_idx]
+                        break
+                for check_idx in range(frame_idx, -1, -1):
+                    if check_idx in store.frame_keypoints:
+                        current_kps = store.frame_keypoints[check_idx]
+                        break
+
+                if draw_overlay and current_H_inv is not None:
+                    frame_bgr = _draw_pitch_overlay(frame_bgr, current_H_inv)
+
+                # Draw keypoint overlay
+                if current_kps is not None:
+                    kps, eff_conf = current_kps
+                    for k in range(len(kps)):
+                        c = float(eff_conf[k])
+                        if c < 0.05:
+                            continue
+                        x, y = int(kps[k, 0]), int(kps[k, 1])
+                        color = (0, int(255 * min(c, 1.0)), int(255 * (1.0 - min(c, 1.0))))
+                        cv2.circle(frame_bgr, (x, y), 7, (0, 0, 0), -1)
+                        cv2.circle(frame_bgr, (x, y), 5, color, -1)
+                        label = f"{_KP_NAMES[k]} {c:.2f}"
+                        cv2.putText(frame_bgr, label, (x + 8, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+                        cv2.putText(frame_bgr, label, (x + 8, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
                 # Draw bounding boxes
                 for obs in obs_list:
@@ -678,7 +635,6 @@ def run_analysis(
     reid_interval: int = 5,
     conf: float = 0.6,
     draw_overlay: bool = True,
-    debug_video: bool = False,
     device: Optional[str] = None,
 ) -> str:
     """
@@ -783,7 +739,6 @@ def run_analysis(
         reid_embedder=reid_embedder,
         reid_interval=reid_interval,
         conf=conf,
-        debug_video=debug_video,
     )
 
     # Pass 1.5: Re-link fragmented tracks

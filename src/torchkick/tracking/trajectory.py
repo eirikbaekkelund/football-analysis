@@ -56,6 +56,7 @@ class TrajectoryStore:
         self.tracks: Dict[int, TrackData] = {}
         self.total_frames = 0
         self.frame_homographies: Dict[int, np.ndarray] = {}
+        self.frame_keypoints: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}  # frame → (kps [32,2], eff_conf [32])
 
     def add_observation(
         self,
