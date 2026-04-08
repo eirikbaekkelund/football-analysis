@@ -271,7 +271,7 @@ def detect_and_project(
         min_inliers=4,
         confidence_threshold=0.4,
         visibility_threshold=0.4,
-        max_correspondences=6,
+        max_correspondences=12,
         use_kalman=False,
     )
     kp_tracker = KeypointTracker()

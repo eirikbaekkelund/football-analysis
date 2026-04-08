@@ -419,7 +419,7 @@ _VERT_PAIRS: List[Tuple[int, int]] = [
 # Priority-ordered keypoint indices for homography estimation (Roboflow 32-keypoint schema).
 # Ordered by geometric spread value: corners first (maximum spread), then halfway,
 # then penalty spots, then centre circle, then penalty box corners.
-# When max_correspondences=6, top-6 by effective confidence are selected from this list.
+# Used to fill remaining slots after zone-guaranteed selection.
 _KP_PRIORITY: List[int] = [
     0,
     5,
@@ -454,6 +454,16 @@ _KP_PRIORITY: List[int] = [
     18,
     19,  # penalty inner (L/R top/bot)
 ]
+
+# Coverage zones — each list contains keypoint indices that represent a spatial region.
+# Zone-guaranteed selection ensures at least one point from each zone before filling
+# remaining slots via _KP_PRIORITY, preventing all points clustering on one side.
+_ZONE_LEFT: List[int] = [0, 5, 1, 4, 2, 3, 8, 6, 7, 9, 10, 11, 12]
+_ZONE_RIGHT: List[int] = [24, 29, 25, 28, 26, 27, 21, 22, 23, 17, 18, 19, 20]
+_ZONE_CENTER: List[int] = [14, 15, 30, 31, 13, 16]  # centre circle + halfway tops/bots
+_ZONE_TOP: List[int] = [0, 24, 13, 1, 25, 2, 26, 6, 22, 14, 30, 31]
+_ZONE_BOTTOM: List[int] = [5, 29, 16, 4, 28, 3, 27, 7, 23, 15]
+_COVERAGE_ZONES: List[List[int]] = [_ZONE_LEFT, _ZONE_RIGHT, _ZONE_CENTER, _ZONE_TOP, _ZONE_BOTTOM]
 
 
 def _filter_geometric_consistency(
@@ -648,7 +658,7 @@ class HomographyEstimator:
         ransac_reproj_threshold: float = 3.0,
         confidence_threshold: float = 0.5,
         visibility_threshold: float = 0.5,
-        max_correspondences: int = 6,
+        max_correspondences: int = 12,
         smoothing_alpha: float = 0.15,
         use_kalman: bool = True,
         reproject_interval: int = 5,
@@ -768,25 +778,43 @@ class HomographyEstimator:
             use_roboflow = len(keypoints) <= len(ROBOFLOW_VERTICES)
 
             if use_roboflow:
-                # Select up to max_correspondences points using priority ordering:
-                # iterate indices in priority order, pick those above threshold,
-                # stop once we have enough. This keeps the most geometrically
-                # spread and stable keypoints and discards noisy extras.
+                # Zone-guaranteed selection: first pick the highest-confidence
+                # candidate from each coverage zone (left, right, centre, top, bottom)
+                # to ensure spatial spread, then fill remaining slots up to
+                # max_correspondences using _KP_PRIORITY ordering.
                 n = len(keypoints)
-                selected = []
-                for i in _KP_PRIORITY:
-                    if i >= n:
-                        continue
+
+                # Step 1: build candidate dict {idx: (conf, img_x, img_y)}
+                candidates: Dict[int, Tuple[float, float, float]] = {}
+                for i in range(min(n, len(ROBOFLOW_VERTICES))):
                     if confidence[i] < self.confidence_threshold:
                         continue
                     img_x, img_y = keypoints[i]
                     if img_x < 0 or img_x > w or img_y < 0 or img_y > h:
                         continue
-                    selected.append((confidence[i], i, img_x, img_y))
-                # Sort within priority bucket by confidence descending,
-                # then cap at max_correspondences.
-                selected.sort(key=lambda t: -t[0])
-                for _, i, img_x, img_y in selected[: self.max_correspondences]:
+                    candidates[i] = (float(confidence[i]), float(img_x), float(img_y))
+
+                # Step 2: zone-guaranteed selection — best (highest conf) from each zone
+                selected_indices: set = set()
+                for zone in _COVERAGE_ZONES:
+                    best = max(
+                        ((idx, candidates[idx][0]) for idx in zone if idx in candidates and idx not in selected_indices),
+                        key=lambda t: t[1],
+                        default=None,
+                    )
+                    if best is not None:
+                        selected_indices.add(best[0])
+
+                # Step 3: fill remaining slots from priority list
+                for i in _KP_PRIORITY:
+                    if len(selected_indices) >= self.max_correspondences:
+                        break
+                    if i in candidates and i not in selected_indices:
+                        selected_indices.add(i)
+
+                # Step 4: build src/dst arrays
+                for i in selected_indices:
+                    _conf, img_x, img_y = candidates[i]
                     px, py = ROBOFLOW_VERTICES[i]
                     src_points.append([img_x, img_y])
                     dst_points.append([px, py])

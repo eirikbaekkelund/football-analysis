@@ -56,10 +56,12 @@ class GameTeamEmbedder:
         siglip_embedder,
         umap_components: int = 3,
         n_clusters: int = 3,
+        max_ref_tracks: int = 5,
     ) -> None:
         self.siglip = siglip_embedder
         self.umap_components = umap_components
         self.n_clusters = n_clusters
+        self.max_ref_tracks = max_ref_tracks
 
     def fit(self, crops_by_track: Dict[int, List[np.ndarray]]) -> None:
         """No-op — SigLIP is pretrained, no fine-tuning required."""
@@ -84,7 +86,7 @@ class GameTeamEmbedder:
             raise ImportError("umap-learn is required for GameTeamEmbedder. " "Install with: pip install umap-learn")
         from sklearn.cluster import KMeans
 
-        valid = {tid: crops for tid, crops in crops_by_track.items() if crops}
+        valid = {tid: crops for tid, crops in crops_by_track.items() if len(crops) >= 3}
         if not valid:
             return {}
 
@@ -119,18 +121,19 @@ class GameTeamEmbedder:
         raw_labels = km.fit_predict(reduced)
 
         # Map cluster indices → team labels: largest→0, second→1, smallest→2 (ref)
+        # The smallest cluster is only designated ref if it has ≤ max_ref_tracks tracks;
+        # an oversized "ref" cluster means K-Means mislabelled players as refs.
         unique_clusters = sorted(
             [(cl, int((raw_labels == cl).sum())) for cl in range(self.n_clusters)],
             key=lambda x: -x[1],
         )
         label_map: Dict[int, int] = {}
-        for rank, (cl, _) in enumerate(unique_clusters):
-            if rank == 0:
-                label_map[cl] = 0
-            elif rank == 1:
-                label_map[cl] = 1
+        for rank, (cl, count) in enumerate(unique_clusters):
+            if rank < 2:
+                label_map[cl] = rank  # team0, team1
             else:
-                label_map[cl] = 2  # smallest cluster → ref
+                # Only treat this cluster as ref if it's small enough
+                label_map[cl] = 2 if count <= self.max_ref_tracks else 0
 
         result: Dict[int, int] = {tid: label_map[int(raw)] for tid, raw in zip(track_ids, raw_labels)}
 
