@@ -45,6 +45,7 @@ def main() -> None:
 @click.option("--reid-interval", type=int, default=5, help="Frames between embedding updates.")
 @click.option("--conf", type=float, default=0.25, help="Detection confidence threshold.")
 @click.option("--no-overlay", is_flag=True, help="Disable pitch line wireframe overlay.")
+@click.option("--debug-anchors", is_flag=True, help="Draw white dot on standing-still anchor players (camera-motion debug).")
 def analyze(
     video: str,
     yolo_weights: str,
@@ -55,6 +56,7 @@ def analyze(
     reid_interval: int,
     conf: float,
     no_overlay: bool,
+    debug_anchors: bool,
 ) -> None:
     """
     Run match analysis: YOLO detection, team assignment, 2D pitch projection.
@@ -88,6 +90,7 @@ def analyze(
         reid_interval=reid_interval,
         conf=conf,
         draw_overlay=not no_overlay,
+        debug_anchors=debug_anchors,
     )
     click.echo(f"Done → {output}")
 

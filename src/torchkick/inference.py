@@ -272,7 +272,7 @@ def detect_and_project(
         confidence_threshold=0.4,
         visibility_threshold=0.4,
         max_correspondences=12,
-        use_kalman=False,
+        use_kalman=True,
     )
     kp_tracker = KeypointTracker()
     _embedder = reid_embedder or siglip_embedder
@@ -280,18 +280,50 @@ def detect_and_project(
     _CROP_INTERVAL = 5  # sample every 5th frame → 40 crops covers ~6.7s at 30fps
     crops_by_track: Dict[int, List[np.ndarray]] = defaultdict(list)
 
+    # Delta-gating state
+    _prev_image_centroid: Dict[int, np.ndarray] = {}  # track_id → image centroid [cx, cy] last frame
+    _prev_pitch_by_track: Dict[int, np.ndarray] = {}  # track_id → pitch [x, y] last frame
+    _force_h_update: bool = False
+    _prev_h_num_inliers: int = 0
+    _prev_h_reproj_error: float = float("inf")
+    _STANDING_PX_THRESH = 8.0   # pixel/frame — below this → anchor player
+    _ANCHOR_SHIFT_M = 0.8       # metres — anchor pitch drift above this → camera moved
+
     with VideoReader(video_path, max_duration=max_duration) as reader:
         meta = reader.metadata
         store = TrajectoryStore(fps=meta.fps)
         progress = ProgressTracker(reader.max_frames, log_interval=100)
 
         for frame_idx, frame_bgr in enumerate(reader):
-            # Homography + keypoint update
-            if frame_idx % homography_interval == 0 and pitch_kp_detector is not None:
+            # Gated homography update: every homography_interval OR when anchors signal camera moved
+            _should_update_h = (frame_idx % homography_interval == 0) or _force_h_update
+            if _should_update_h and pitch_kp_detector is not None:
                 kps, conf_kps = pitch_kp_detector.detect(frame_bgr)
                 kps_smooth, eff_conf = kp_tracker.update(kps, conf_kps)
                 ok = homography.estimate(kps_smooth, eff_conf, eff_conf, frame_bgr.shape[:2])
-                store.frame_keypoints[frame_idx] = (kps_smooth.copy(), eff_conf.copy())
+
+                # Accept new H only if: camera moved (force) OR quality improved
+                quality_improved = (
+                    homography.num_inliers > _prev_h_num_inliers
+                    or homography.mean_reprojection_error < _prev_h_reproj_error * 0.85
+                )
+                if not _force_h_update and not quality_improved and _prev_h_num_inliers >= homography.min_inliers:
+                    # Revert to last accepted H — camera stable and new estimate is no better
+                    if homography.last_valid_H is not None:
+                        homography.H = homography.last_valid_H.copy()
+                        homography.H_smoothed = homography.last_valid_H.copy()
+                        try:
+                            homography.H_inv = np.linalg.inv(homography.last_valid_H)
+                        except np.linalg.LinAlgError:
+                            pass
+                        homography.num_inliers = _prev_h_num_inliers
+                        homography.mean_reprojection_error = _prev_h_reproj_error
+                else:
+                    _prev_h_num_inliers = homography.num_inliers
+                    _prev_h_reproj_error = homography.mean_reprojection_error
+
+                _force_h_update = False
+                store.frame_keypoints[frame_idx] = (kps_smooth.copy(), conf_kps.copy(), eff_conf.copy(), homography.selected_indices)
                 if ok and homography.H_inv is not None:
                     store.frame_homographies[frame_idx] = homography.H_inv.copy()
 
@@ -328,7 +360,9 @@ def detect_and_project(
                         if crop is not None and crop.size > 0:
                             crops_by_track[track_id].append(crop)
 
-            # Store observations
+            # Store observations + build centroid/pitch dicts for this frame
+            current_image_centroids: Dict[int, np.ndarray] = {}
+            current_pitch_positions: Dict[int, np.ndarray] = {}
             for box, track_id, box_conf in zip(boxes, track_ids, confs):
                 pitch_pos = homography.project_player_to_pitch(box.tolist())
                 store.add_observation(
@@ -338,6 +372,43 @@ def detect_and_project(
                     conf=float(box_conf),
                     pitch_pos=pitch_pos,
                 )
+                cx = (box[0] + box[2]) / 2.0
+                cy = (box[1] + box[3]) / 2.0
+                current_image_centroids[track_id] = np.array([cx, cy], dtype=np.float64)
+                if pitch_pos is not None:
+                    current_pitch_positions[track_id] = np.array(pitch_pos, dtype=np.float64)
+
+            # Anchor-based camera-motion detection
+            # Players standing still in image space are anchors; if their pitch
+            # positions drift collectively, the camera (and thus H) has changed.
+            if homography.H_smoothed is not None and _prev_image_centroid:
+                anchor_deltas = []
+                anchor_tids = []
+                for tid, centroid in current_image_centroids.items():
+                    if tid not in _prev_image_centroid or tid not in current_pitch_positions:
+                        continue
+                    if tid not in _prev_pitch_by_track:
+                        continue
+                    px_speed = float(np.linalg.norm(centroid - _prev_image_centroid[tid]))
+                    if px_speed < _STANDING_PX_THRESH:
+                        anchor_tids.append(tid)
+                        anchor_deltas.append(current_pitch_positions[tid] - _prev_pitch_by_track[tid])
+                store.frame_anchors[frame_idx] = frozenset(anchor_tids)
+                if len(anchor_deltas) >= 2:
+                    collective_shift_m = float(np.linalg.norm(np.median(anchor_deltas, axis=0)))
+                    if collective_shift_m > _ANCHOR_SHIFT_M:
+                        _force_h_update = True
+            else:
+                store.frame_anchors[frame_idx] = frozenset(
+                    tid for tid, c in current_image_centroids.items()
+                    if tid not in _prev_image_centroid
+                    or float(np.linalg.norm(c - _prev_image_centroid.get(tid, c))) < _STANDING_PX_THRESH
+                )
+
+            _prev_image_centroid = current_image_centroids
+            _prev_pitch_by_track = {
+                tid: pos for tid, pos in current_pitch_positions.items()
+            }
 
             # ReID embeddings every reid_interval frames
             if _embedder is not None and frame_idx % reid_interval == 0 and len(boxes) > 0:
@@ -535,6 +606,7 @@ def render_visualization(
     assignments: Dict,
     max_duration: Optional[float] = None,
     draw_overlay: bool = True,
+    debug_anchors: bool = False,
 ) -> str:
     """
     Pass 4: Render annotated video with 2D pitch minimap.
@@ -547,7 +619,9 @@ def render_visualization(
         store: TrajectoryStore with all data.
         assignments: ``track_id → {'role', 'team'}`` from ``assign_identities()``.
         max_duration: Maximum duration in seconds.
-        draw_overlay: Draw pitch line overlay on video frame.
+        draw_overlay: Draw pitch line wireframe on video frame.
+        debug_anchors: Draw white dot at the foot of anchor players (those
+            classified as standing still and used for camera-motion detection).
 
     Returns:
         Path to output video.
@@ -637,20 +711,40 @@ def render_visualization(
                 if draw_overlay and current_H_inv is not None:
                     frame_bgr = _draw_pitch_overlay(frame_bgr, current_H_inv)
 
-                # Draw keypoint overlay
+                # Draw keypoint overlay — all detected keypoints, color-coded by usage:
+                #   GREEN  : used for homography estimation (selected_indices)
+                #   YELLOW : above eff_conf threshold but not selected (usable, not picked)
+                #   RED    : raw conf detected but suppressed by geometric consistency filter
+                #   GREY   : barely detected (raw_conf too low to be useful)
                 if current_kps is not None:
-                    kps, eff_conf = current_kps
+                    kps, raw_conf, eff_conf, kp_selected = current_kps
+                    _CONF_THRESHOLD = 0.4
                     for k in range(len(kps)):
-                        c = float(eff_conf[k])
-                        if c < 0.05:
-                            continue
+                        rc = float(raw_conf[k])
+                        ec = float(eff_conf[k])
+                        if rc < 0.05:
+                            continue  # not detected at all
                         x, y = int(kps[k, 0]), int(kps[k, 1])
-                        color = (0, int(255 * min(c, 1.0)), int(255 * (1.0 - min(c, 1.0))))
-                        cv2.circle(frame_bgr, (x, y), 7, (0, 0, 0), -1)
-                        cv2.circle(frame_bgr, (x, y), 5, color, -1)
-                        label = f"{_KP_NAMES[k]} {c:.2f}"
-                        cv2.putText(frame_bgr, label, (x + 8, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-                        cv2.putText(frame_bgr, label, (x + 8, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                        if x < 0 or x >= frame_bgr.shape[1] or y < 0 or y >= frame_bgr.shape[0]:
+                            continue
+                        if k in kp_selected:
+                            color = (0, 220, 0)   # GREEN — used for homography
+                            radius, thickness = 7, -1
+                        elif ec >= _CONF_THRESHOLD:
+                            color = (0, 200, 255)  # YELLOW — usable, not selected
+                            radius, thickness = 5, -1
+                        elif rc >= 0.2:
+                            color = (0, 60, 220)   # RED — suppressed by consistency filter
+                            radius, thickness = 4, 2
+                        else:
+                            color = (100, 100, 100)  # GREY — weak detection
+                            radius, thickness = 3, 1
+                        cv2.circle(frame_bgr, (x, y), radius + 2, (0, 0, 0), -1)
+                        cv2.circle(frame_bgr, (x, y), radius, color, thickness)
+                        if rc >= 0.2:  # only label meaningful detections
+                            label = f"{_KP_NAMES[k]} {ec:.2f}"
+                            cv2.putText(frame_bgr, label, (x + 8, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3)
+                            cv2.putText(frame_bgr, label, (x + 8, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
                 # Cap at 22 players per frame (keep highest-confidence)
                 player_obs = [o for o in obs_list if o["role"] not in ("referee", "linesman")]
@@ -679,6 +773,17 @@ def render_visualization(
 
                     cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, 2)
                     cv2.putText(frame_bgr, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+
+                # Anchor debug overlay — white dot at foot of standing-still players
+                if debug_anchors:
+                    anchor_tids = store.frame_anchors.get(frame_idx, frozenset())
+                    for obs in obs_list:
+                        if obs["track_id"] in anchor_tids:
+                            bx1, by1, bx2, by2 = map(int, obs["box"])
+                            foot_x = (bx1 + bx2) // 2
+                            foot_y = by2
+                            cv2.circle(frame_bgr, (foot_x, foot_y), 9, (0, 0, 0), -1)
+                            cv2.circle(frame_bgr, (foot_x, foot_y), 7, (255, 255, 255), -1)
 
                 # Build pitch minimap — active observations + ghost tracks
                 _ghost_window = int(meta.fps * 1.5)  # keep last position for 1.5s
@@ -790,6 +895,7 @@ def run_analysis(
     reid_interval: int = 5,
     conf: float = 0.6,
     draw_overlay: bool = True,
+    debug_anchors: bool = False,
     device: Optional[str] = None,
 ) -> str:
     """
@@ -918,7 +1024,7 @@ def run_analysis(
     )
 
     # Pass 4: Render
-    output_path = render_visualization(video_path, store, assignments, max_duration=duration, draw_overlay=draw_overlay)
+    output_path = render_visualization(video_path, store, assignments, max_duration=duration, draw_overlay=draw_overlay, debug_anchors=debug_anchors)
 
     print("\n" + "=" * 60)
     print(f"ANALYSIS COMPLETE  →  {output_path}")

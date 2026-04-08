@@ -619,7 +619,11 @@ class KeypointTracker:
         # Geometric consistency: zero out keypoints that violate expected
         # relative positions (e.g. left-side kp should have smaller x than right-side).
         # Only applied when both keypoints in a pair are active.
+        active_before = int((effective_conf > 0).sum())
         effective_conf = _filter_geometric_consistency(self._positions, effective_conf)
+        suppressed = active_before - int((effective_conf > 0).sum())
+        if suppressed > 0:
+            print(f"[KPTracker] geometric consistency suppressed {suppressed} keypoints", flush=True)
 
         return self._positions.copy(), effective_conf
 
@@ -677,6 +681,8 @@ class HomographyEstimator:
         self.H_smoothed: Optional[np.ndarray] = None
         self.inliers: Optional[np.ndarray] = None
         self.num_inliers: int = 0
+        self.selected_indices: frozenset = frozenset()  # keypoint indices used in last successful estimate
+        self.mean_reprojection_error: float = float("inf")  # RANSAC inlier reprojection error (pitch metres)
 
         # Temporal fallback — extended to 30 frames so Kalman prediction covers ~1 s at 30fps
         self.frames_since_valid: int = 0
@@ -813,6 +819,7 @@ class HomographyEstimator:
                         selected_indices.add(i)
 
                 # Step 4: build src/dst arrays
+                self.selected_indices = frozenset(selected_indices)
                 for i in selected_indices:
                     _conf, img_x, img_y = candidates[i]
                     px, py = ROBOFLOW_VERTICES[i]
@@ -891,6 +898,13 @@ class HomographyEstimator:
             self.num_inliers = inliers1
             self._matched_src = src_points[self.inliers]
             self._matched_dst = dst_points[self.inliers]
+
+        # Compute mean reprojection error on inliers (pitch metres)
+        if self.H is not None and self._matched_src is not None and len(self._matched_src) > 0:
+            proj = cv2.perspectiveTransform(self._matched_src.reshape(-1, 1, 2), self.H).reshape(-1, 2)
+            self.mean_reprojection_error = float(np.mean(np.linalg.norm(proj - self._matched_dst, axis=1)))
+        else:
+            self.mean_reprojection_error = float("inf")
 
         if self.H is None or self.num_inliers < self.min_inliers:
             self.frames_since_valid += 1

@@ -8,6 +8,7 @@ Architecture:
         → ArcFace head (s=64, m=0.5) — 3-class: team0, team1, other (gk, ref)
         → SpectralEmbedding — for unsupervised team clustering
 
+        
 At training time: use ViT-L/14 (1024-dim) with LoRA + ArcFace.
 At inference time: use distilled ViT-S/8 (384-dim) via DINOv2ReIDEmbedder.
 
