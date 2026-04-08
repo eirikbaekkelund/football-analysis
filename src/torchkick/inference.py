@@ -135,6 +135,7 @@ def detect_and_project(
     reid_embedder=None,
     reid_interval: int = 5,
     conf: float = 0.6,
+    debug_video: bool = False,
 ) -> Tuple[TrajectoryStore, Dict[int, List[np.ndarray]]]:
     """
     Pass 1: YOLO detection + BotSORT tracking + 2D pitch projection.
@@ -216,13 +217,15 @@ def detect_and_project(
         store = TrajectoryStore(fps=meta.fps)
         progress = ProgressTracker(reader.max_frames, log_interval=100)
 
-        _debug_kp_path = str(Path(video_path).with_stem(Path(video_path).stem + "_kp_debug").with_suffix(".mp4"))
-        _debug_writer = VideoWriter(_debug_kp_path, meta.fps, (meta.width, meta.height))
-        _debug_writer.__enter__()
         _last_kps = None
         _last_eff = None
         _last_ok = False
         _last_inliers = 0
+
+        if debug_video:
+            _debug_kp_path = str(Path(video_path).with_stem(Path(video_path).stem + "_kp_debug").with_suffix(".mp4"))
+            _debug_writer = VideoWriter(_debug_kp_path, meta.fps, (meta.width, meta.height))
+            _debug_writer.__enter__()
 
         for frame_idx, frame_bgr in enumerate(reader):
             # Homography update
@@ -234,30 +237,30 @@ def detect_and_project(
                 if ok and homography.H_inv is not None:
                     store.frame_homographies[frame_idx] = homography.H_inv.copy()
 
-            # Draw keypoints on debug video
-            dbg = frame_bgr.copy()
-            cv2.putText(
-                dbg,
-                f"f{frame_idx:04d}  hom={'OK inliers='+str(_last_inliers) if _last_ok else 'FAIL'}",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 255),
-                2,
-            )
-            if _last_kps is not None and _last_eff is not None:
-                for k in range(len(_last_kps)):
-                    c = float(_last_eff[k])
-                    if c < 0.05:
-                        continue
-                    x, y = int(_last_kps[k, 0]), int(_last_kps[k, 1])
-                    color = (0, int(255 * c), int(255 * (1 - c)))  # green=high, red=low
-                    cv2.circle(dbg, (x, y), 7, (0, 0, 0), -1)  # dark outline
-                    cv2.circle(dbg, (x, y), 5, color, -1)
-                    label = f"{_KP_NAMES[k]} {c:.2f}"
-                    cv2.putText(dbg, label, (x + 8, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-                    cv2.putText(dbg, label, (x + 8, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-            _debug_writer.write(dbg)
+            if debug_video:
+                dbg = frame_bgr.copy()
+                cv2.putText(
+                    dbg,
+                    f"f{frame_idx:04d}  hom={'OK inliers='+str(_last_inliers) if _last_ok else 'FAIL'}",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 255),
+                    2,
+                )
+                if _last_kps is not None and _last_eff is not None:
+                    for k in range(len(_last_kps)):
+                        c = float(_last_eff[k])
+                        if c < 0.05:
+                            continue
+                        x, y = int(_last_kps[k, 0]), int(_last_kps[k, 1])
+                        color = (0, int(255 * c), int(255 * (1 - c)))  # green=high, red=low
+                        cv2.circle(dbg, (x, y), 7, (0, 0, 0), -1)  # dark outline
+                        cv2.circle(dbg, (x, y), 5, color, -1)
+                        label = f"{_KP_NAMES[k]} {c:.2f}"
+                        cv2.putText(dbg, label, (x + 8, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+                        cv2.putText(dbg, label, (x + 8, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                _debug_writer.write(dbg)
 
             # Detection + tracking
             results = detector.track(
@@ -326,8 +329,9 @@ def detect_and_project(
 
         store.total_frames = frame_idx + 1
 
-    _debug_writer.__exit__(None, None, None)
-    print(f"Keypoint debug video → {_debug_kp_path}")
+    if debug_video:
+        _debug_writer.__exit__(None, None, None)
+        print(f"Keypoint debug video → {_debug_kp_path}")
 
     print(f"Complete: {len(store.tracks)} tracks over {store.total_frames} frames")
     return store, dict(crops_by_track)
@@ -674,6 +678,7 @@ def run_analysis(
     reid_interval: int = 5,
     conf: float = 0.6,
     draw_overlay: bool = True,
+    debug_video: bool = False,
     device: Optional[str] = None,
 ) -> str:
     """
@@ -778,6 +783,7 @@ def run_analysis(
         reid_embedder=reid_embedder,
         reid_interval=reid_interval,
         conf=conf,
+        debug_video=debug_video,
     )
 
     # Pass 1.5: Re-link fragmented tracks
