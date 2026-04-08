@@ -416,6 +416,46 @@ _VERT_PAIRS: List[Tuple[int, int]] = [
 ]
 
 
+# Priority-ordered keypoint indices for homography estimation (Roboflow 32-keypoint schema).
+# Ordered by geometric spread value: corners first (maximum spread), then halfway,
+# then penalty spots, then centre circle, then penalty box corners.
+# When max_correspondences=6, top-6 by effective confidence are selected from this list.
+_KP_PRIORITY: List[int] = [
+    0,
+    5,
+    24,
+    29,  # corners (TL, BL, TR, BR) — max spread, most stable
+    13,
+    16,  # halfway top/bot — constrains L/R orientation
+    8,
+    21,  # penalty spots (L, R) — single-pixel landmarks
+    14,
+    15,
+    30,
+    31,  # centre circle (top, bot, left, right)
+    1,
+    4,
+    25,
+    28,  # penalty box corners (L-pen-top/bot, R-pen-top/bot)
+    2,
+    3,
+    26,
+    27,  # goal box corners (L-goal-top/bot, R-goal-top/bot)
+    6,
+    7,
+    22,
+    23,  # goal front (L/R top/bot)
+    9,
+    12,
+    17,
+    20,  # penalty front (L/R top/bot)
+    10,
+    11,
+    18,
+    19,  # penalty inner (L/R top/bot)
+]
+
+
 def _filter_geometric_consistency(
     positions: np.ndarray,
     confidence: np.ndarray,
@@ -608,6 +648,7 @@ class HomographyEstimator:
         ransac_reproj_threshold: float = 3.0,
         confidence_threshold: float = 0.5,
         visibility_threshold: float = 0.5,
+        max_correspondences: int = 6,
         smoothing_alpha: float = 0.15,
         use_kalman: bool = True,
         reproject_interval: int = 5,
@@ -617,6 +658,7 @@ class HomographyEstimator:
         self.ransac_reproj_threshold = ransac_reproj_threshold
         self.confidence_threshold = confidence_threshold
         self.visibility_threshold = visibility_threshold
+        self.max_correspondences = max_correspondences
         self.smoothing_alpha = smoothing_alpha
         self.reproject_interval = reproject_interval
 
@@ -725,28 +767,44 @@ class HomographyEstimator:
             # Fall back to SoccerNet LINE_CLASSES mapping only when N > 32.
             use_roboflow = len(keypoints) <= len(ROBOFLOW_VERTICES)
 
-            for i, (conf, (img_x, img_y)) in enumerate(zip(confidence, keypoints)):
-                if conf < self.confidence_threshold:
-                    continue
-                if img_x < 0 or img_x > w or img_y < 0 or img_y > h:
-                    continue
-
-                if use_roboflow:
+            if use_roboflow:
+                # Select up to max_correspondences points using priority ordering:
+                # iterate indices in priority order, pick those above threshold,
+                # stop once we have enough. This keeps the most geometrically
+                # spread and stable keypoints and discards noisy extras.
+                n = len(keypoints)
+                selected = []
+                for i in _KP_PRIORITY:
+                    if i >= n:
+                        continue
+                    if confidence[i] < self.confidence_threshold:
+                        continue
+                    img_x, img_y = keypoints[i]
+                    if img_x < 0 or img_x > w or img_y < 0 or img_y > h:
+                        continue
+                    selected.append((confidence[i], i, img_x, img_y))
+                # Sort within priority bucket by confidence descending,
+                # then cap at max_correspondences.
+                selected.sort(key=lambda t: -t[0])
+                for _, i, img_x, img_y in selected[: self.max_correspondences]:
                     px, py = ROBOFLOW_VERTICES[i]
                     src_points.append([img_x, img_y])
                     dst_points.append([px, py])
-                    continue
-
-                # SoccerNet LINE_CLASSES mapping
-                if i < len(self.line_classes):
-                    class_name = self.line_classes[i]
-                    if class_name in PITCH_LINE_COORDINATES:
-                        pitch_pts = PITCH_LINE_COORDINATES[class_name]
-                        if pitch_pts:
-                            # Use first point of the line class as representative
-                            _, pitch_point = pitch_pts[0]
-                            src_points.append([img_x, img_y])
-                            dst_points.append(pitch_point.to_array())
+            else:
+                for i, (conf, (img_x, img_y)) in enumerate(zip(confidence, keypoints)):
+                    if conf < self.confidence_threshold:
+                        continue
+                    if img_x < 0 or img_x > w or img_y < 0 or img_y > h:
+                        continue
+                    # SoccerNet LINE_CLASSES mapping
+                    if i < len(self.line_classes):
+                        class_name = self.line_classes[i]
+                        if class_name in PITCH_LINE_COORDINATES:
+                            pitch_pts = PITCH_LINE_COORDINATES[class_name]
+                            if pitch_pts:
+                                _, pitch_point = pitch_pts[0]
+                                src_points.append([img_x, img_y])
+                                dst_points.append(pitch_point.to_array())
         else:
             # HRNet format: [num_classes, max_pts, 2] normalized
             for class_idx, class_name in enumerate(self.line_classes):

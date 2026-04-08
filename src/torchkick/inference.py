@@ -267,9 +267,11 @@ def detect_and_project(
     print("=" * 60)
 
     homography = HomographyEstimator(
-        min_correspondences=6,
+        min_correspondences=4,
+        min_inliers=4,
         confidence_threshold=0.4,
         visibility_threshold=0.4,
+        max_correspondences=6,
         use_kalman=False,
     )
     kp_tracker = KeypointTracker()
