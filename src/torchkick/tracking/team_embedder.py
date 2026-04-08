@@ -3,7 +3,7 @@ Per-game team embedder.
 
 Uses SigLIPTeamEmbedder to extract pose/occlusion/lighting-invariant
 768-dim embeddings from player jersey crops, mean-pools per track,
-reduces to 3D with UMAP, then applies K-Means k=3 to discover the
+reduces to 10D with UMAP, then applies K-Means k=3 to discover the
 two teams and referee group — no fine-tuning or labels required.
 
 Example:
@@ -33,16 +33,16 @@ def _jersey_crop(crop_bgr: np.ndarray) -> np.ndarray:
 
 class GameTeamEmbedder:
     """
-    Per-game team embedder using SigLIP + UMAP(3D) + KMeans.
+    Per-game team embedder using SigLIP + UMAP(10D) + KMeans.
 
     Workflow:
         1. assign_teams(crops_by_track) — embeds jersey crops via SigLIP,
-           mean-pools per track, UMAP 768→3, KMeans k=3 → team labels
+           mean-pools per track, UMAP 768→10, KMeans k=3 → team labels
 
     Args:
         siglip_embedder:  ``SigLIPTeamEmbedder`` instance with ``embed()``
                           method returning ``[N, 768]`` L2-normalised embeddings.
-        umap_components:  UMAP output dimensionality (default 3).
+        umap_components:  UMAP output dimensionality (default 10).
         n_clusters:       Number of KMeans clusters (default 3: team0, team1, ref).
 
     Example:
@@ -54,7 +54,7 @@ class GameTeamEmbedder:
     def __init__(
         self,
         siglip_embedder,
-        umap_components: int = 3,
+        umap_components: int = 10,
         n_clusters: int = 3,
         max_ref_tracks: int = 5,
     ) -> None:
@@ -86,7 +86,7 @@ class GameTeamEmbedder:
             raise ImportError("umap-learn is required for GameTeamEmbedder. " "Install with: pip install umap-learn")
         from sklearn.cluster import KMeans
 
-        valid = {tid: crops for tid, crops in crops_by_track.items() if len(crops) >= 3}
+        valid = {tid: crops for tid, crops in crops_by_track.items() if crops}
         if not valid:
             return {}
 

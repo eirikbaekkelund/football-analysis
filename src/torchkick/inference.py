@@ -124,101 +124,6 @@ def calibrate_team_centroids(
 # ---------------------------------------------------------------------------
 
 
-def collect_embedding_crops(
-    video_path: str,
-    detector,
-    max_duration: float = 300.0,
-    sample_interval: int = 5,
-    min_track_duration_s: float = 3.0,
-    max_crops_per_track: int = 40,
-    conf: float = 0.6,
-) -> Dict[int, List[np.ndarray]]:
-    """
-    Fast pre-pass to collect jersey crops from long-lived tracks for
-    ``GameTeamEmbedder.fit()``.
-
-    Runs YOLO+BotSORT through the first ``max_duration`` seconds, collects
-    crops every ``sample_interval`` frames, and returns only tracks that
-    survived at least ``min_track_duration_s`` seconds.  The tracker state
-    is reset afterward so Pass 1 gets fresh track IDs.
-
-    Args:
-        video_path: Input video path.
-        detector: ``ultralytics.YOLO`` model.
-        max_duration: Seconds to sample from (default 300).
-        sample_interval: Collect a crop every N frames.
-        min_track_duration_s: Minimum track lifespan to be included.
-        max_crops_per_track: Maximum crops stored per track.
-        conf: Detection confidence threshold.
-
-    Returns:
-        Dict mapping track_id → list of BGR crop arrays for long-lived tracks.
-    """
-    print(f"Pre-pass: collecting team crops from first {max_duration:.0f}s …", flush=True)
-    crops: Dict[int, List[np.ndarray]] = defaultdict(list)
-    track_start: Dict[int, int] = {}
-    track_end: Dict[int, int] = {}
-    fps_ref = 30.0
-
-    with VideoReader(video_path, max_duration=max_duration) as reader:
-        fps_ref = reader.metadata.fps
-        progress = ProgressTracker(reader.max_frames, log_interval=500)
-
-        for frame_idx, frame_bgr in enumerate(reader):
-            results = detector.track(
-                frame_bgr,
-                persist=True,
-                tracker="botsort.yaml",
-                verbose=False,
-                classes=[0],
-                conf=conf,
-            )
-            if results[0].boxes.id is None:
-                progress.update()
-                continue
-
-            boxes = results[0].boxes.xyxy.cpu().numpy()
-            confs_arr = results[0].boxes.conf.cpu().numpy()
-            track_ids = results[0].boxes.id.int().cpu().tolist()
-            keep = confs_arr >= conf
-            boxes = boxes[keep]
-            track_ids = [t for t, k in zip(track_ids, keep) if k]
-
-            for box, tid in zip(boxes, track_ids):
-                if tid not in track_start:
-                    track_start[tid] = frame_idx
-                track_end[tid] = frame_idx
-                if frame_idx % sample_interval == 0 and len(crops[tid]) < max_crops_per_track:
-                    crop = _crop_box(frame_bgr, box.tolist())
-                    if crop is not None and crop.size > 0:
-                        crops[tid].append(crop)
-
-            progress.update()
-            if progress.should_log():
-                print(f"  Pre-pass: {progress.status()}", flush=True)
-
-    # Reset tracker so Pass 1 gets fresh IDs
-    try:
-        if hasattr(detector, "predictor") and detector.predictor is not None:
-            for tracker in detector.predictor.trackers:
-                tracker.reset()
-    except Exception:
-        pass
-
-    min_frames = int(min_track_duration_s * fps_ref)
-    result = {
-        tid: crop_list
-        for tid, crop_list in crops.items()
-        if (track_end.get(tid, 0) - track_start.get(tid, 0)) >= min_frames and len(crop_list) >= 4
-    }
-    print(
-        f"Pre-pass complete: {len(result)} long-lived tracks "
-        f"(≥{min_track_duration_s:.0f}s) from {len(crops)} total",
-        flush=True,
-    )
-    return result
-
-
 # ---------------------------------------------------------------------------
 # Pass 1: Detection, tracking, projection
 # ---------------------------------------------------------------------------
@@ -260,7 +165,7 @@ def detect_and_project(
     Returns:
         Tuple of ``(TrajectoryStore, crops_by_track)`` where
         ``crops_by_track`` maps track_id → list of BGR crop arrays
-        (up to 20 per track) for use with ``GameTeamEmbedder``.
+        (all detected frames) for use with ``GameTeamEmbedder``.
     """
     print("=" * 60)
     print("PASS 1: Detection + Tracking + Projection")
@@ -271,13 +176,10 @@ def detect_and_project(
         min_inliers=4,
         confidence_threshold=0.4,
         visibility_threshold=0.4,
-        max_correspondences=12,
         use_kalman=True,
     )
     kp_tracker = KeypointTracker()
     _embedder = reid_embedder or siglip_embedder
-    _MAX_CROPS_PER_TRACK = 40
-    _CROP_INTERVAL = 5  # sample every 5th frame → 40 crops covers ~6.7s at 30fps
     crops_by_track: Dict[int, List[np.ndarray]] = defaultdict(list)
 
     # Delta-gating state
@@ -352,13 +254,12 @@ def detect_and_project(
             confs = confs[keep]
             track_ids = [tid for tid, k in zip(track_ids, keep) if k]
 
-            # Collect jersey crops for GameTeamEmbedder (every 5th frame, max 40 per track)
-            if frame_idx % _CROP_INTERVAL == 0:
-                for box, track_id in zip(boxes, track_ids):
-                    if len(crops_by_track[track_id]) < _MAX_CROPS_PER_TRACK:
-                        crop = _crop_box(frame_bgr, box.tolist())
-                        if crop is not None and crop.size > 0:
-                            crops_by_track[track_id].append(crop)
+            # Collect jersey crops for GameTeamEmbedder — every detected frame,
+            # same conf threshold as the rest of the pipeline
+            for box, track_id in zip(boxes, track_ids):
+                crop = _crop_box(frame_bgr, box.tolist())
+                if crop is not None and crop.size > 0:
+                    crops_by_track[track_id].append(crop)
 
             # Store observations + build centroid/pitch dicts for this frame
             current_image_centroids: Dict[int, np.ndarray] = {}

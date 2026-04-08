@@ -255,8 +255,6 @@ class HeatmapPitchDetector:
 
 
 __all__ = [
-    "ViTPoseKeypointDetector",
-    "YOLOPoseKeypointDetector",
     "DINOv2PitchModel",
     "HeatmapPitchDetector",
 ]

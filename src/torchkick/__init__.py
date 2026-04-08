@@ -1,46 +1,26 @@
 """
 torchkick: Computer vision toolkit for football/soccer video analysis.
 
-A comprehensive library for analyzing football match videos, including:
-- Player and ball detection/tracking
-- Pitch line detection and camera calibration  
-- Homography estimation and pitch projection
-- Team identification and jersey color analysis
-- Annotation pipeline integration (CVAT)
-- SoccerNet dataset utilities
-
 Quick Start:
     >>> import torchkick
-    >>> 
-    >>> # Read video frames
-    >>> with torchkick.VideoReader("match.mp4") as video:
-    ...     for frame in video:
-    ...         # Process frame
-    ...         pass
-    >>>
-    >>> # Track players
-    >>> from torchkick.tracking import HomographyEstimator
-    >>> homography = HomographyEstimator()
-    >>>
-    >>> # Detect pitch keypoints for homography
-    >>> from torchkick.models import YOLOPoseKeypointDetector
-    >>> detector = YOLOPoseKeypointDetector("weights/yolo_pitch_pose.pt")
+    >>> output = torchkick.run_analysis(
+    ...     video_path="match.mp4",
+    ...     yolo_weights="weights/best.pt",
+    ...     pitch_weights="weights/pitch/best.pt",
+    ... )
 
 Submodules:
     utils: Video I/O, timing, visualization utilities
     soccernet: SoccerNet dataset integration
-    annotation: CVAT annotation pipeline
-    tracking: Player/ball tracking and pitch projection
+    tracking: Player tracking and pitch projection
     models: Neural network model wrappers
-    training: Model training scripts (YOLO, FCNN, RT-DETR, lines)
+    training: Model training scripts
     inference: Match analysis pipeline
-
-For more examples, see the documentation at https://github.com/torchkick
 """
 
 from torchkick._version import __version__
 
-# Core utilities (available at package root for convenience)
+# Core utilities
 from torchkick.utils import (
     VideoReader,
     VideoWriter,
@@ -55,19 +35,10 @@ from torchkick.utils import (
     reset_timing_stats,
 )
 
-# Tracking components commonly used at top level
+# Tracking components
 from torchkick.tracking import (
-    SoccerTracker,
-    ByteTracker,
     HomographyEstimator,
     PitchVisualizer,
-    BallTracker,
-)
-
-# Model wrappers
-from torchkick.models import (
-    PlayerDetector,
-    Detection,
 )
 
 # Inference pipeline
@@ -91,14 +62,8 @@ __all__ = [
     "print_timing_stats",
     "reset_timing_stats",
     # Tracking
-    "SoccerTracker",
-    "ByteTracker",
     "HomographyEstimator",
     "PitchVisualizer",
-    "BallTracker",
-    # Models
-    "PlayerDetector",
-    "Detection",
     # Inference
     "run_analysis",
 ]

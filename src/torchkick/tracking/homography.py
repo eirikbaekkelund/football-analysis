@@ -471,19 +471,24 @@ def _filter_geometric_consistency(
     confidence: np.ndarray,
 ) -> np.ndarray:
     """
-    Zero out keypoints that violate expected geometric ordering.
+    Penalise keypoints that violate expected geometric ordering.
 
     For each constraint pair (a, b) where both keypoints are active,
     checks that the positional ordering holds.  When violated, the
-    lower-confidence keypoint in the pair is suppressed.
+    lower-confidence keypoint in the pair is multiplied by 0.3 (soft
+    suppression rather than hard zero, to avoid over-killing valid
+    detections at foreshortened broadcast angles).
 
     Args:
         positions:  [N, 2] EMA-smoothed pixel positions.
         confidence: [N]    effective confidence scores.
 
     Returns:
-        Filtered confidence array with inconsistent keypoints zeroed out.
+        Filtered confidence array — violated keypoints are penalised by 0.3×
+        rather than zeroed, to avoid over-suppression at broadcast angles where
+        perspective foreshortening can legitimately violate strict ordering.
     """
+    _PENALTY = 0.3
     conf = confidence.copy()
     n = len(conf)
 
@@ -494,9 +499,9 @@ def _filter_geometric_consistency(
             continue
         if positions[a, 0] >= positions[b, 0]:  # violation: a should be left of b
             if conf[a] < conf[b]:
-                conf[a] = 0.0
+                conf[a] *= _PENALTY
             else:
-                conf[b] = 0.0
+                conf[b] *= _PENALTY
 
     for a, b in _VERT_PAIRS:
         if a >= n or b >= n:
@@ -505,9 +510,9 @@ def _filter_geometric_consistency(
             continue
         if positions[a, 1] >= positions[b, 1]:  # violation: a should be above b
             if conf[a] < conf[b]:
-                conf[a] = 0.0
+                conf[a] *= _PENALTY
             else:
-                conf[b] = 0.0
+                conf[b] *= _PENALTY
 
     return conf
 
@@ -619,11 +624,7 @@ class KeypointTracker:
         # Geometric consistency: zero out keypoints that violate expected
         # relative positions (e.g. left-side kp should have smaller x than right-side).
         # Only applied when both keypoints in a pair are active.
-        active_before = int((effective_conf > 0).sum())
         effective_conf = _filter_geometric_consistency(self._positions, effective_conf)
-        suppressed = active_before - int((effective_conf > 0).sum())
-        if suppressed > 0:
-            print(f"[KPTracker] geometric consistency suppressed {suppressed} keypoints", flush=True)
 
         return self._positions.copy(), effective_conf
 
@@ -784,47 +785,23 @@ class HomographyEstimator:
             use_roboflow = len(keypoints) <= len(ROBOFLOW_VERTICES)
 
             if use_roboflow:
-                # Zone-guaranteed selection: first pick the highest-confidence
-                # candidate from each coverage zone (left, right, centre, top, bottom)
-                # to ensure spatial spread, then fill remaining slots up to
-                # max_correspondences using _KP_PRIORITY ordering.
+                # Use all keypoints above confidence threshold — RANSAC handles
+                # outlier rejection, so more points = better constraints.
+                # No cap: letting RANSAC work on the full above-threshold set
+                # is strictly better than pre-selecting a subset.
                 n = len(keypoints)
-
-                # Step 1: build candidate dict {idx: (conf, img_x, img_y)}
-                candidates: Dict[int, Tuple[float, float, float]] = {}
+                selected_indices: set = set()
                 for i in range(min(n, len(ROBOFLOW_VERTICES))):
                     if confidence[i] < self.confidence_threshold:
                         continue
                     img_x, img_y = keypoints[i]
                     if img_x < 0 or img_x > w or img_y < 0 or img_y > h:
                         continue
-                    candidates[i] = (float(confidence[i]), float(img_x), float(img_y))
-
-                # Step 2: zone-guaranteed selection — best (highest conf) from each zone
-                selected_indices: set = set()
-                for zone in _COVERAGE_ZONES:
-                    best = max(
-                        ((idx, candidates[idx][0]) for idx in zone if idx in candidates and idx not in selected_indices),
-                        key=lambda t: t[1],
-                        default=None,
-                    )
-                    if best is not None:
-                        selected_indices.add(best[0])
-
-                # Step 3: fill remaining slots from priority list
-                for i in _KP_PRIORITY:
-                    if len(selected_indices) >= self.max_correspondences:
-                        break
-                    if i in candidates and i not in selected_indices:
-                        selected_indices.add(i)
-
-                # Step 4: build src/dst arrays
-                self.selected_indices = frozenset(selected_indices)
-                for i in selected_indices:
-                    _conf, img_x, img_y = candidates[i]
+                    selected_indices.add(i)
                     px, py = ROBOFLOW_VERTICES[i]
-                    src_points.append([img_x, img_y])
+                    src_points.append([float(img_x), float(img_y)])
                     dst_points.append([px, py])
+                self.selected_indices = frozenset(selected_indices)
             else:
                 for i, (conf, (img_x, img_y)) in enumerate(zip(confidence, keypoints)):
                     if conf < self.confidence_threshold:
@@ -1048,43 +1025,6 @@ class HomographyEstimator:
             float(np.clip(x, -MAX_X, MAX_X)),
             float(np.clip(y, -MAX_Y, MAX_Y)),
         )
-
-    def get_camera_model(
-        self,
-        image_size: Tuple[int, int],
-    ) -> Optional[object]:
-        """
-        Build a calibrated CameraModel from the current RANSAC inlier correspondences.
-
-        Uses the matched pitch 2D ↔ image pixel pairs stored after the most recent
-        successful estimate() call. The pitch 2D coords are treated as 3D points with
-        z=0 (all pitch landmarks lie on the ground plane) and solvePnP recovers the
-        full K[R|t] camera model.
-
-        Args:
-            image_size: (height, width) of the source frame.
-
-        Returns:
-            CameraModel or None if no valid correspondences exist.
-        """
-        if self._matched_src is None or self._matched_dst is None:
-            return None
-        if len(self._matched_src) < 4:
-            return None
-
-        from torchkick.tracking.lifting import build_camera_model
-
-        h, w = image_size
-        f = float(max(h, w))
-        approx_K = np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1]], dtype=np.float64)
-
-        return build_camera_model(
-            matched_src=self._matched_src,
-            matched_dst=self._matched_dst,
-            image_size=image_size,
-            approx_K=approx_K,
-        )
-
 
 class GeometricConstraintSolver:
     """

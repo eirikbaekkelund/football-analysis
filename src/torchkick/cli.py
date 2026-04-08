@@ -175,14 +175,6 @@ def dataset(
         click.echo(f"Downloaded to {path}")
 
 
-@main.command()
-@click.option("--weights", "-w", type=click.Choice(["player-detector", "pitch-lines", "all"]), required=True)
-@click.option("--output-dir", "-o", type=click.Path(), default=None)
-def download(weights: str, output_dir: str | None) -> None:
-    """Download pre-trained model weights (coming soon)."""
-    click.echo("Weight download not yet available. Train your own with `torchkick train`.")
-
-
 # =============================================================================
 # TRAIN
 # =============================================================================
@@ -437,42 +429,6 @@ def train_reid_video_cmd(
     click.echo(f"Done → {weights}")
 
 
-# ---- FIFA / future models (stubs) ------------------------------------------
-
-
-@train.command("detection")
-@click.argument("args", nargs=-1)
-def train_detection_cmd(args) -> None:
-    """[Not implemented] RT-DETR player detection training. Use `train yolo` instead."""
-    raise click.UsageError("RT-DETR training not active. Use `torchkick train yolo` for player detection.")
-
-
-@train.command("keypoints")
-@click.argument("args", nargs=-1)
-def train_keypoints_cmd(args) -> None:
-    """[Removed] Use `train pitch-heatmap` for DINOv2+heatmap pitch keypoint detection."""
-    raise click.UsageError("Use `torchkick train pitch-heatmap` for pitch keypoint detection.")
-
-
-@train.command("distill")
-@click.argument("args", nargs=-1)
-def train_distill_cmd(args) -> None:
-    """[Not implemented] Knowledge distillation ViT-L → ViT-S."""
-    raise click.UsageError("Distillation training not yet implemented.")
-
-
-@train.command("body-pose")
-@click.argument("args", nargs=-1)
-def train_body_pose_cmd(args) -> None:
-    """[Not implemented] ViTPose fine-tuning on FIFA body pose data."""
-    raise click.UsageError("Body pose training not yet implemented.")
-
-
-@train.command("pose-lifter")
-@click.argument("args", nargs=-1)
-def train_pose_lifter_cmd(args) -> None:
-    """[Not implemented] 2D→3D pose lifting MLP on FIFA paired data."""
-    raise click.UsageError("Pose lifter training not yet implemented.")
 
 
 if __name__ == "__main__":

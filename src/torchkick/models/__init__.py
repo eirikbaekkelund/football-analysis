@@ -2,59 +2,44 @@
 Neural network model wrappers for football analysis.
 
 Submodules:
-    pitch: Pitch keypoint detection (ViTPose / YOLO-pose).
-    player: Player detection (YOLO, FCNN, RT-DETR, RF-DETR).
-    ball: Ball detection (YOLOv11-nano, with optional tiled SAHI-style slicer).
-    reid: ReID embedding (DINOv2 + PEFT LoRA).
+    pitch: Pitch keypoint detection (DINOv2 heatmap).
+    player: Player detection (YOLO wrapper).
+    reid: ReID embedding (DINOv2 LoRA, SigLIP zero-shot).
 
 Example:
-    >>> from torchkick.models import (
-    ...     ViTPoseKeypointDetector,
-    ...     YOLOPoseKeypointDetector,
-    ...     PlayerDetector,
-    ...     RTDETRDetector,
-    ...     RFDETRDetector,
-    ... )
-    >>> pitch_det = YOLOPoseKeypointDetector("weights/yolo_pitch_pose.pt")
+    >>> from torchkick.models import HeatmapPitchDetector, SigLIPTeamEmbedder
+    >>> pitch_det = HeatmapPitchDetector("weights/pitch/best.pt")
     >>> kps, conf = pitch_det.detect(frame)
 """
 
 from __future__ import annotations
 
-# Ball detector (YOLOv11-nano)
-from torchkick.models.ball import BallDetector, BallDetection, BallInferenceSlicer
-
-# Pitch keypoint detectors
+# Pitch keypoint detector
 from torchkick.models.pitch import (
     DINOv2PitchModel,
     HeatmapPitchDetector,
 )
 
-# Player models
+# Player detection wrapper
 from torchkick.models.player import (
     Detection,
     PlayerDetector,
-    RTDETRDetector,
-    RFDETRDetector,
 )
 
-# Body pose estimation
-from torchkick.models.pose import BodyPoseDetector, PoseResult
+# ReID and team embedding
+from torchkick.models.reid import (
+    DINOv2ReIDEmbedder,
+    SigLIPTeamEmbedder,
+)
 
 __all__ = [
-    # Ball
-    "BallDetector",
-    "BallDetection",
-    "BallInferenceSlicer",
     # Pitch
     "DINOv2PitchModel",
     "HeatmapPitchDetector",
     # Player
     "Detection",
     "PlayerDetector",
-    "RTDETRDetector",
-    "RFDETRDetector",
-    # Body pose
-    "BodyPoseDetector",
-    "PoseResult",
+    # ReID
+    "DINOv2ReIDEmbedder",
+    "SigLIPTeamEmbedder",
 ]
