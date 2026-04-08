@@ -51,7 +51,7 @@ def calibrate_team_centroids(
     embedder,
     calibration_duration: float = 120.0,
     n_sample_frames: int = 40,
-    conf: float = 0.25,
+    conf: float = 0.5,
 ) -> Optional[np.ndarray]:
     """
     Fit k=3 team centroids from randomly sampled frames in the first
@@ -132,7 +132,7 @@ def detect_and_project(
     siglip_embedder=None,
     reid_embedder=None,
     reid_interval: int = 5,
-    conf: float = 0.25,
+    conf: float = 0.5,
 ) -> TrajectoryStore:
     """
     Pass 1: YOLO detection + BotSORT tracking + 2D pitch projection.
@@ -162,8 +162,8 @@ def detect_and_project(
 
     homography = HomographyEstimator(
         min_correspondences=6,
-        confidence_threshold=0.3,
-        visibility_threshold=0.3,
+        confidence_threshold=0.15,
+        visibility_threshold=0.15,
         use_kalman=False,
     )
     kp_tracker = KeypointTracker()
@@ -561,7 +561,7 @@ def run_analysis(
     duration: Optional[float] = None,
     homography_interval: int = 1,
     reid_interval: int = 5,
-    conf: float = 0.25,
+    conf: float = 0.5,
     draw_overlay: bool = True,
     device: Optional[str] = None,
 ) -> str:
