@@ -30,6 +30,7 @@ from torchkick.tracking import (
     TrajectorySmoother,
     IdentityAssigner,
     HomographyEstimator,
+    KeypointTracker,
     PitchVisualizer,
     PITCH_LINE_COORDINATES,
     HALF_LENGTH,
@@ -165,6 +166,7 @@ def detect_and_project(
         visibility_threshold=0.3,
         use_kalman=False,
     )
+    kp_tracker = KeypointTracker()
     _embedder = reid_embedder or siglip_embedder
 
     with VideoReader(video_path, max_duration=max_duration) as reader:
@@ -176,7 +178,8 @@ def detect_and_project(
             # Homography update
             if frame_idx % homography_interval == 0 and pitch_kp_detector is not None:
                 kps, conf_kps = pitch_kp_detector.detect(frame_bgr)
-                ok = homography.estimate(kps, conf_kps, conf_kps, frame_bgr.shape[:2])
+                kps_smooth, eff_conf = kp_tracker.update(kps, conf_kps)
+                ok = homography.estimate(kps_smooth, eff_conf, eff_conf, frame_bgr.shape[:2])
                 if ok and homography.H_inv is not None:
                     store.frame_homographies[frame_idx] = homography.H_inv.copy()
 

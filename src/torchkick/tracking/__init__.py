@@ -76,6 +76,7 @@ from torchkick.tracking.homography import (
     CameraPoseKalmanFilter,
     HomographyKalmanFilter,  # backward-compat alias
     HomographyEstimator,
+    KeypointTracker,
     GeometricConstraintSolver,
 )
 
@@ -129,6 +130,7 @@ __all__ = [
     "CameraPoseKalmanFilter",
     "HomographyKalmanFilter",
     "HomographyEstimator",
+    "KeypointTracker",
     "GeometricConstraintSolver",
     # 3D lifting
     "CameraModel",

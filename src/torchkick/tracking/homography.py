@@ -341,6 +341,100 @@ class CameraPoseKalmanFilter:
 HomographyKalmanFilter = CameraPoseKalmanFilter
 
 
+class KeypointTracker:
+    """
+    Per-keypoint temporal tracker for pitch landmark stabilization.
+
+    Maintains an EMA of each keypoint's pixel position and a track-age counter.
+    Keypoints that have been consistently detected over many frames receive
+    boosted effective confidence for RANSAC, reducing homography jitter.
+
+    Large position jumps (> jump_threshold px) trigger a track reset so that
+    hard camera cuts do not blend old and new positions.
+
+    Args:
+        num_keypoints:   Number of tracked keypoints (default 32).
+        ema_alpha:       EMA weight for the new observation (0 = frozen, 1 = no smoothing).
+        max_gap_frames:  Frames without a detection before a track is considered lost.
+        age_saturation:  Track age at which the age boost saturates (frames).
+        jump_threshold:  Pixel distance that triggers a track reset (hard cut).
+        conf_threshold:  Minimum raw confidence to accept a detection.
+    """
+
+    def __init__(
+        self,
+        num_keypoints: int = 32,
+        ema_alpha: float = 0.3,
+        max_gap_frames: int = 10,
+        age_saturation: int = 30,
+        jump_threshold: float = 80.0,
+        conf_threshold: float = 0.1,
+    ) -> None:
+        self.num_keypoints = num_keypoints
+        self.ema_alpha = ema_alpha
+        self.max_gap = max_gap_frames
+        self.age_saturation = age_saturation
+        self.jump_threshold = jump_threshold
+        self.conf_threshold = conf_threshold
+
+        self._positions = np.zeros((num_keypoints, 2), dtype=np.float32)
+        self._age = np.zeros(num_keypoints, dtype=np.int32)
+        self._gap = np.full(num_keypoints, max_gap_frames + 1, dtype=np.int32)
+
+    def update(
+        self,
+        keypoints: np.ndarray,
+        confidence: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Update tracks with new detector output and return stabilised keypoints.
+
+        Args:
+            keypoints:  [N, 2] pixel coordinates from the detector.
+            confidence: [N]    raw confidence scores in [0, 1].
+
+        Returns:
+            smoothed_kps:   [N, 2]  EMA-smoothed positions (only valid where effective_conf > 0).
+            effective_conf: [N]     confidence boosted by track age; 0 for undetected keypoints.
+        """
+        effective_conf = np.zeros(self.num_keypoints, dtype=np.float32)
+
+        for k in range(self.num_keypoints):
+            if confidence[k] <= self.conf_threshold:
+                self._gap[k] += 1
+                if self._gap[k] > self.max_gap:
+                    self._age[k] = 0
+                continue
+
+            cold_start = self._gap[k] > self.max_gap
+            jump = (
+                not cold_start
+                and np.linalg.norm(keypoints[k] - self._positions[k]) > self.jump_threshold
+            )
+
+            if cold_start or jump:
+                self._positions[k] = keypoints[k].copy()
+                self._age[k] = 1
+            else:
+                self._positions[k] = (
+                    self.ema_alpha * keypoints[k]
+                    + (1.0 - self.ema_alpha) * self._positions[k]
+                )
+                self._age[k] += 1
+
+            self._gap[k] = 0
+
+            age_factor = min(1.0, self._age[k] / self.age_saturation)
+            effective_conf[k] = confidence[k] * (0.5 + 0.5 * age_factor)
+
+        return self._positions.copy(), effective_conf
+
+    def reset(self) -> None:
+        """Reset all tracks (e.g. after a known scene cut)."""
+        self._age[:] = 0
+        self._gap[:] = self.max_gap + 1
+
+
 class HomographyEstimator:
     """
     Estimate homography from detected line keypoints.
