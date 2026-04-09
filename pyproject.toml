@@ -70,6 +70,11 @@ rfdetr = [
 roboflow = [
     "roboflow>=1.0.0",
 ]
+annotation = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+    "python-multipart>=0.0.9",
+]
 labeling = [
     "groundingdino-py>=0.4.0",
     "sam2>=1.0",
@@ -92,7 +97,7 @@ dev = [
     "ruff>=0.1.0",
 ]
 all = [
-    "torchkick[cvat,soccernet,tracking,reid,rfdetr,roboflow,labeling,training,dev]",
+    "torchkick[annotation,cvat,soccernet,tracking,reid,rfdetr,roboflow,labeling,training,dev]",
 ]
 
 [project.scripts]

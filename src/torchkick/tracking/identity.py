@@ -85,7 +85,7 @@ class IdentityAssigner:
         Returns:
             Dict mapping track_id to {'role', 'team', 'player_id'}.
         """
-        tracks = store.get_long_tracks(min_frames=30)
+        tracks = store.get_long_tracks(min_frames=5)
 
         if self.debug:
             print(f"[IdentityAssigner] Processing {len(tracks)} long tracks")

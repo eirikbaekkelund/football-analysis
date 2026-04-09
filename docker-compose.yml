@@ -1,0 +1,23 @@
+services:
+  annotator:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./uploads:/app/uploads      # uploaded videos persist across restarts
+      - ./weights:/app/weights      # mount pre-trained model weights here
+      - ./exports:/app/exports      # exported annotation zips land here
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - PLAYER_WEIGHTS=/app/weights/player.pt
+      - PITCH_WEIGHTS=/app/weights/pitch.pt
+      - DEVICE=cuda
+      - UPLOAD_DIR=/app/uploads
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped

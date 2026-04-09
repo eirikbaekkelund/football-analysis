@@ -900,8 +900,11 @@ def run_analysis(
         conf=conf,
     )
 
-    # Pass 1.5: Re-link fragmented tracks
-    relink_tracks(store)
+    # Pass 1.5: Re-link fragmented tracks (only when a proper ReID embedder is available;
+    # SigLIP is not calibrated as a person ReID model and its cosine similarities are
+    # typically below the 0.7 threshold, so relinking silently does nothing).
+    if reid_embedder is not None:
+        relink_tracks(store)
 
     # Pass 2: Smooth trajectories
     smooth_trajectories(store)
