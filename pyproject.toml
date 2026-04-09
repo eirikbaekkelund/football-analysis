@@ -44,10 +44,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cvat = [
-    "cvat-sdk>=2.0.0",
-    "ffmpeg-python>=0.2.0",
-]
 soccernet = [
     "SoccerNet>=0.1.0",
 ]
@@ -64,9 +60,6 @@ reid = [
     "einops>=0.7.0",
     "torchmetrics>=1.0.0",
 ]
-rfdetr = [
-    "rf-detr>=0.1.0",
-]
 roboflow = [
     "roboflow>=1.0.0",
 ]
@@ -82,7 +75,6 @@ labeling = [
 ]
 training = [
     "ultralytics>=8.0.0",
-    "deepspeed>=0.12.0",
     "transformers>=4.35.0",
     "torchmetrics>=1.0.0",
     "albumentations>=1.3.0",
@@ -97,7 +89,7 @@ dev = [
     "ruff>=0.1.0",
 ]
 all = [
-    "torchkick[annotation,cvat,soccernet,tracking,reid,rfdetr,roboflow,labeling,training,dev]",
+    "torchkick[annotation,soccernet,tracking,reid,roboflow,labeling,training,dev]",
 ]
 
 [project.scripts]
