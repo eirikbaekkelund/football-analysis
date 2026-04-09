@@ -126,12 +126,14 @@ class PlayerDetector:
                 bbox = boxes.xyxy[i].cpu().numpy()
                 conf = float(boxes.conf[i].cpu())
                 cls_id = int(boxes.cls[i].cpu())
-                detections.append(Detection(
-                    bbox=tuple(bbox),
-                    confidence=conf,
-                    class_id=cls_id,
-                    class_name=self.CLASS_NAMES.get(cls_id, "unknown"),
-                ))
+                detections.append(
+                    Detection(
+                        bbox=tuple(bbox),
+                        confidence=conf,
+                        class_id=cls_id,
+                        class_name=self.CLASS_NAMES.get(cls_id, "unknown"),
+                    )
+                )
         return detections
 
     def detect_with_tracking(
@@ -170,13 +172,15 @@ class PlayerDetector:
                 conf = float(boxes.conf[i].cpu())
                 cls_id = int(boxes.cls[i].cpu())
                 track_id = int(boxes.id[i].cpu()) if boxes.id is not None else None
-                detections.append(Detection(
-                    bbox=tuple(bbox),
-                    confidence=conf,
-                    class_id=cls_id,
-                    class_name=self.CLASS_NAMES.get(cls_id, "unknown"),
-                    track_id=track_id,
-                ))
+                detections.append(
+                    Detection(
+                        bbox=tuple(bbox),
+                        confidence=conf,
+                        class_id=cls_id,
+                        class_name=self.CLASS_NAMES.get(cls_id, "unknown"),
+                        track_id=track_id,
+                    )
+                )
         return detections
 
 

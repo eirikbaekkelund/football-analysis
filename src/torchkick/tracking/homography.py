@@ -1026,6 +1026,7 @@ class HomographyEstimator:
             float(np.clip(y, -MAX_Y, MAX_Y)),
         )
 
+
 class GeometricConstraintSolver:
     """
     Augment RANSAC correspondence points using geometric primitives.

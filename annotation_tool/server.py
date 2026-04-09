@@ -12,15 +12,14 @@ Environment variables:
 
 If PLAYER_WEIGHTS / PITCH_WEIGHTS are not set, the server searches for
 default paths relative to the working directory:
-    models/players/yolo11l_best.pt
-    models/keypoints/heatmap_best.pt
+    models/players/yolo11l.pt
+    models/keypoints/heatmap.pt
 """
 
 from __future__ import annotations
 
 import asyncio
 import io
-import json
 import os
 import uuid
 import zipfile
@@ -38,8 +37,8 @@ from pydantic import BaseModel
 # Config
 # ---------------------------------------------------------------------------
 
-_DEFAULT_PLAYER_WEIGHTS = "models/players/yolo11l_best.pt"
-_DEFAULT_PITCH_WEIGHTS  = "models/keypoints/heatmap_best.pt"
+_DEFAULT_PLAYER_WEIGHTS = "models/players/yolo11l.pt"
+_DEFAULT_PITCH_WEIGHTS = "models/keypoints/heatmap.pt"
 
 
 def _resolve_weights(env_var: str, default: str) -> Optional[str]:
@@ -57,7 +56,7 @@ def _default_device() -> str:
 
 
 PLAYER_WEIGHTS: Optional[str] = _resolve_weights("PLAYER_WEIGHTS", _DEFAULT_PLAYER_WEIGHTS)
-PITCH_WEIGHTS:  Optional[str] = _resolve_weights("PITCH_WEIGHTS",  _DEFAULT_PITCH_WEIGHTS)
+PITCH_WEIGHTS: Optional[str] = _resolve_weights("PITCH_WEIGHTS", _DEFAULT_PITCH_WEIGHTS)
 DEVICE: str = os.getenv("DEVICE", _default_device())
 UPLOAD_DIR: Path = Path(os.getenv("UPLOAD_DIR", "./uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -78,6 +77,7 @@ def _get_player_detector():
     global _player_detector
     if _player_detector is None and PLAYER_WEIGHTS and Path(PLAYER_WEIGHTS).exists():
         from torchkick.models.player import PlayerDetector
+
         _player_detector = PlayerDetector(PLAYER_WEIGHTS, device=DEVICE, conf_threshold=0.7)
     return _player_detector
 
@@ -86,6 +86,7 @@ def _get_pitch_detector():
     global _pitch_detector
     if _pitch_detector is None and PITCH_WEIGHTS and Path(PITCH_WEIGHTS).exists():
         from torchkick.models.pitch import HeatmapPitchDetector
+
         _pitch_detector = HeatmapPitchDetector(PITCH_WEIGHTS, device=DEVICE, conf_threshold=0.5)
     return _pitch_detector
 
@@ -94,10 +95,11 @@ def _get_pitch_detector():
 # Pydantic models
 # ---------------------------------------------------------------------------
 
+
 class KeypointAnno(BaseModel):
-    index: int          # 0-31 Roboflow schema
-    x: float            # pixel x in original frame
-    y: float            # pixel y in original frame
+    index: int  # 0-31 Roboflow schema
+    x: float  # pixel x in original frame
+    y: float  # pixel y in original frame
     visible: bool = True
     confidence: float = 0.0  # 0 = manually placed
 
@@ -107,7 +109,7 @@ class BboxAnno(BaseModel):
     y1: float
     x2: float
     y2: float
-    class_id: int        # 0=player 1=goalkeeper 2=referee 3=ball
+    class_id: int  # 0=player 1=goalkeeper 2=referee 3=ball
     confidence: float = 0.0
 
 
@@ -181,6 +183,7 @@ def _ensure_video_loaded(video_id: str) -> Optional[VideoMeta]:
                 pass
     return meta
 
+
 # ---------------------------------------------------------------------------
 # 32 Roboflow keypoint schema
 # ---------------------------------------------------------------------------
@@ -209,38 +212,38 @@ def _rf(x_raw: float, y_raw: float):
 
 
 _ROBOFLOW_VERTICES = [
-    _rf(0, 0),                                        # 0  top-left corner
-    _rf(0, (_RF_W - _RF_PBW) / 2),                   # 1  left penalty box top
-    _rf(0, (_RF_W - _RF_GBW) / 2),                   # 2  left goal box top
-    _rf(0, (_RF_W + _RF_GBW) / 2),                   # 3  left goal box bottom
-    _rf(0, (_RF_W + _RF_PBW) / 2),                   # 4  left penalty box bottom
-    _rf(0, _RF_W),                                    # 5  bottom-left corner
-    _rf(_RF_GBD, (_RF_W - _RF_GBW) / 2),             # 6  left goal box front top
-    _rf(_RF_GBD, (_RF_W + _RF_GBW) / 2),             # 7  left goal box front bottom
-    _rf(_RF_PS, _RF_HY),                              # 8  left penalty spot
-    _rf(_RF_PBD, (_RF_W - _RF_PBW) / 2),             # 9  left penalty box front top
-    _rf(_RF_PBD, (_RF_W - _RF_GBW) / 2),             # 10 left penalty box inner top
-    _rf(_RF_PBD, (_RF_W + _RF_GBW) / 2),             # 11 left penalty box inner bottom
-    _rf(_RF_PBD, (_RF_W + _RF_PBW) / 2),             # 12 left penalty box front bottom
-    _rf(_RF_HX, 0),                                   # 13 halfway line top
-    _rf(_RF_HX, _RF_HY - _RF_CCR),                   # 14 centre circle top
-    _rf(_RF_HX, _RF_HY + _RF_CCR),                   # 15 centre circle bottom
-    _rf(_RF_HX, _RF_W),                               # 16 halfway line bottom
-    _rf(_RF_L - _RF_PBD, (_RF_W - _RF_PBW) / 2),    # 17 right penalty box front top
-    _rf(_RF_L - _RF_PBD, (_RF_W - _RF_GBW) / 2),    # 18 right penalty box inner top
-    _rf(_RF_L - _RF_PBD, (_RF_W + _RF_GBW) / 2),    # 19 right penalty box inner bottom
-    _rf(_RF_L - _RF_PBD, (_RF_W + _RF_PBW) / 2),    # 20 right penalty box front bottom
-    _rf(_RF_L - _RF_PS, _RF_HY),                     # 21 right penalty spot
-    _rf(_RF_L - _RF_GBD, (_RF_W - _RF_GBW) / 2),    # 22 right goal box front top
-    _rf(_RF_L - _RF_GBD, (_RF_W + _RF_GBW) / 2),    # 23 right goal box front bottom
-    _rf(_RF_L, 0),                                    # 24 top-right corner
-    _rf(_RF_L, (_RF_W - _RF_PBW) / 2),               # 25 right penalty box top
-    _rf(_RF_L, (_RF_W - _RF_GBW) / 2),               # 26 right goal box top
-    _rf(_RF_L, (_RF_W + _RF_GBW) / 2),               # 27 right goal box bottom
-    _rf(_RF_L, (_RF_W + _RF_PBW) / 2),               # 28 right penalty box bottom
-    _rf(_RF_L, _RF_W),                                # 29 bottom-right corner
-    _rf(_RF_HX - _RF_CCR, _RF_HY),                   # 30 centre circle left
-    _rf(_RF_HX + _RF_CCR, _RF_HY),                   # 31 centre circle right
+    _rf(0, 0),  # 0  top-left corner
+    _rf(0, (_RF_W - _RF_PBW) / 2),  # 1  left penalty box top
+    _rf(0, (_RF_W - _RF_GBW) / 2),  # 2  left goal box top
+    _rf(0, (_RF_W + _RF_GBW) / 2),  # 3  left goal box bottom
+    _rf(0, (_RF_W + _RF_PBW) / 2),  # 4  left penalty box bottom
+    _rf(0, _RF_W),  # 5  bottom-left corner
+    _rf(_RF_GBD, (_RF_W - _RF_GBW) / 2),  # 6  left goal box front top
+    _rf(_RF_GBD, (_RF_W + _RF_GBW) / 2),  # 7  left goal box front bottom
+    _rf(_RF_PS, _RF_HY),  # 8  left penalty spot
+    _rf(_RF_PBD, (_RF_W - _RF_PBW) / 2),  # 9  left penalty box front top
+    _rf(_RF_PBD, (_RF_W - _RF_GBW) / 2),  # 10 left penalty box inner top
+    _rf(_RF_PBD, (_RF_W + _RF_GBW) / 2),  # 11 left penalty box inner bottom
+    _rf(_RF_PBD, (_RF_W + _RF_PBW) / 2),  # 12 left penalty box front bottom
+    _rf(_RF_HX, 0),  # 13 halfway line top
+    _rf(_RF_HX, _RF_HY - _RF_CCR),  # 14 centre circle top
+    _rf(_RF_HX, _RF_HY + _RF_CCR),  # 15 centre circle bottom
+    _rf(_RF_HX, _RF_W),  # 16 halfway line bottom
+    _rf(_RF_L - _RF_PBD, (_RF_W - _RF_PBW) / 2),  # 17 right penalty box front top
+    _rf(_RF_L - _RF_PBD, (_RF_W - _RF_GBW) / 2),  # 18 right penalty box inner top
+    _rf(_RF_L - _RF_PBD, (_RF_W + _RF_GBW) / 2),  # 19 right penalty box inner bottom
+    _rf(_RF_L - _RF_PBD, (_RF_W + _RF_PBW) / 2),  # 20 right penalty box front bottom
+    _rf(_RF_L - _RF_PS, _RF_HY),  # 21 right penalty spot
+    _rf(_RF_L - _RF_GBD, (_RF_W - _RF_GBW) / 2),  # 22 right goal box front top
+    _rf(_RF_L - _RF_GBD, (_RF_W + _RF_GBW) / 2),  # 23 right goal box front bottom
+    _rf(_RF_L, 0),  # 24 top-right corner
+    _rf(_RF_L, (_RF_W - _RF_PBW) / 2),  # 25 right penalty box top
+    _rf(_RF_L, (_RF_W - _RF_GBW) / 2),  # 26 right goal box top
+    _rf(_RF_L, (_RF_W + _RF_GBW) / 2),  # 27 right goal box bottom
+    _rf(_RF_L, (_RF_W + _RF_PBW) / 2),  # 28 right penalty box bottom
+    _rf(_RF_L, _RF_W),  # 29 bottom-right corner
+    _rf(_RF_HX - _RF_CCR, _RF_HY),  # 30 centre circle left
+    _rf(_RF_HX + _RF_CCR, _RF_HY),  # 31 centre circle right
 ]
 
 _KP_NAMES = [
@@ -324,6 +327,7 @@ app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
 @app.get("/")
 async def index():
     from fastapi.responses import FileResponse
+
     return FileResponse(str(_static_dir / "index.html"))
 
 
@@ -428,6 +432,7 @@ async def pitch_keypoints():
 @app.get("/pitch/image")
 async def pitch_image():
     from torchkick.tracking.pitch_viz import PitchVisualizer
+
     viz = PitchVisualizer(use_gpu=False)
     img = viz._draw_pitch()
     _, buf = cv2.imencode(".png", img)
@@ -443,20 +448,31 @@ def _run_annotation(video_id: str, idx: int, frame_bgr) -> FrameAnno:
     if player_det is not None:
         for d in player_det.detect(frame_bgr):
             x1, y1, x2, y2 = d.bbox
-            anno.bboxes.append(BboxAnno(
-                x1=float(x1), y1=float(y1), x2=float(x2), y2=float(y2),
-                class_id=int(d.class_id), confidence=float(d.confidence),
-            ))
+            anno.bboxes.append(
+                BboxAnno(
+                    x1=float(x1),
+                    y1=float(y1),
+                    x2=float(x2),
+                    y2=float(y2),
+                    class_id=int(d.class_id),
+                    confidence=float(d.confidence),
+                )
+            )
 
     pitch_det = _get_pitch_detector()
     if pitch_det is not None:
         kps, confs = pitch_det.detect(frame_bgr)
         for i, (xy, conf) in enumerate(zip(kps, confs)):
             if conf > 0 and i not in _PENALTY_BOX_INDICES:
-                anno.keypoints.append(KeypointAnno(
-                    index=i, x=float(xy[0]), y=float(xy[1]),
-                    visible=True, confidence=float(conf),
-                ))
+                anno.keypoints.append(
+                    KeypointAnno(
+                        index=i,
+                        x=float(xy[0]),
+                        y=float(xy[1]),
+                        visible=True,
+                        confidence=float(conf),
+                    )
+                )
 
     _annotations.setdefault(video_id, {})[idx] = anno
     _save_anno_to_disk(video_id, idx, anno)

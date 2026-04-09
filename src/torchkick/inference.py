@@ -188,8 +188,8 @@ def detect_and_project(
     _force_h_update: bool = False
     _prev_h_num_inliers: int = 0
     _prev_h_reproj_error: float = float("inf")
-    _STANDING_PX_THRESH = 8.0   # pixel/frame — below this → anchor player
-    _ANCHOR_SHIFT_M = 0.8       # metres — anchor pitch drift above this → camera moved
+    _STANDING_PX_THRESH = 8.0  # pixel/frame — below this → anchor player
+    _ANCHOR_SHIFT_M = 0.8  # metres — anchor pitch drift above this → camera moved
 
     with VideoReader(video_path, max_duration=max_duration) as reader:
         meta = reader.metadata
@@ -225,7 +225,12 @@ def detect_and_project(
                     _prev_h_reproj_error = homography.mean_reprojection_error
 
                 _force_h_update = False
-                store.frame_keypoints[frame_idx] = (kps_smooth.copy(), conf_kps.copy(), eff_conf.copy(), homography.selected_indices)
+                store.frame_keypoints[frame_idx] = (
+                    kps_smooth.copy(),
+                    conf_kps.copy(),
+                    eff_conf.copy(),
+                    homography.selected_indices,
+                )
                 if ok and homography.H_inv is not None:
                     store.frame_homographies[frame_idx] = homography.H_inv.copy()
 
@@ -301,15 +306,14 @@ def detect_and_project(
                         _force_h_update = True
             else:
                 store.frame_anchors[frame_idx] = frozenset(
-                    tid for tid, c in current_image_centroids.items()
+                    tid
+                    for tid, c in current_image_centroids.items()
                     if tid not in _prev_image_centroid
                     or float(np.linalg.norm(c - _prev_image_centroid.get(tid, c))) < _STANDING_PX_THRESH
                 )
 
             _prev_image_centroid = current_image_centroids
-            _prev_pitch_by_track = {
-                tid: pos for tid, pos in current_pitch_positions.items()
-            }
+            _prev_pitch_by_track = {tid: pos for tid, pos in current_pitch_positions.items()}
 
             # ReID embeddings every reid_interval frames
             if _embedder is not None and frame_idx % reid_interval == 0 and len(boxes) > 0:
@@ -629,13 +633,13 @@ def render_visualization(
                         if x < 0 or x >= frame_bgr.shape[1] or y < 0 or y >= frame_bgr.shape[0]:
                             continue
                         if k in kp_selected:
-                            color = (0, 220, 0)   # GREEN — used for homography
+                            color = (0, 220, 0)  # GREEN — used for homography
                             radius, thickness = 7, -1
                         elif ec >= _CONF_THRESHOLD:
                             color = (0, 200, 255)  # YELLOW — usable, not selected
                             radius, thickness = 5, -1
                         elif rc >= 0.2:
-                            color = (0, 60, 220)   # RED — suppressed by consistency filter
+                            color = (0, 60, 220)  # RED — suppressed by consistency filter
                             radius, thickness = 4, 2
                         else:
                             color = (100, 100, 100)  # GREY — weak detection
@@ -928,7 +932,9 @@ def run_analysis(
     )
 
     # Pass 4: Render
-    output_path = render_visualization(video_path, store, assignments, max_duration=duration, draw_overlay=draw_overlay, debug_anchors=debug_anchors)
+    output_path = render_visualization(
+        video_path, store, assignments, max_duration=duration, draw_overlay=draw_overlay, debug_anchors=debug_anchors
+    )
 
     print("\n" + "=" * 60)
     print(f"ANALYSIS COMPLETE  →  {output_path}")

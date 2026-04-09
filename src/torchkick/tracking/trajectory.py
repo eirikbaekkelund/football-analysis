@@ -56,7 +56,9 @@ class TrajectoryStore:
         self.tracks: Dict[int, TrackData] = {}
         self.total_frames = 0
         self.frame_homographies: Dict[int, np.ndarray] = {}
-        self.frame_keypoints: Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray, frozenset]] = {}  # frame → (kps [32,2], raw_conf [32], eff_conf [32], selected_indices)
+        self.frame_keypoints: Dict[
+            int, Tuple[np.ndarray, np.ndarray, np.ndarray, frozenset]
+        ] = {}  # frame → (kps [32,2], raw_conf [32], eff_conf [32], selected_indices)
         self.frame_anchors: Dict[int, frozenset] = {}  # frame → frozenset of anchor track IDs (standing-still players)
 
     def add_observation(

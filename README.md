@@ -1,64 +1,108 @@
 # torchkick
 
-A Computer vision toolkit for spatio-temporal video analysis in football. Detects players, tracks them across frames, and projects positions onto a 2D pitch map. Personal project that may or may not turn useful one day. As you can see below, there's still some refinement to do.
+Computer vision toolkit for spatio-temporal football video analysis. Detects players, tracks them across frames, estimates camera homography from pitch keypoints, and projects positions onto a 2D pitch map.
 
 ![Demo](examples/images/demo.gif)
 
 ## Install
 
 ```bash
-pip install -e .
+# CPU / MPS (Mac)
+uv pip install -e ".[annotation]"
+
+# CUDA 12.8
+uv pip install -e ".[annotation]" --extra-index-url https://download.pytorch.org/whl/cu128
 ```
 
-For CUDA 12.8 (recommended):
+Optional extras: `soccernet`, `tracking`, `reid`, `training`, `labeling`, `roboflow`, `dev`. Install all with `.[all]`.
+
+---
+
+## Inference
+
 ```bash
-uv pip install -e . --extra-index-url https://download.pytorch.org/whl/cu128
+torchkick analyze \
+    -v match.mp4 \
+    --yolo-weights models/players/yolo11l.pt \
+    --pitch-weights models/keypoints/heatmap.pt \
+    --reid-weights  models/reid/reid_student_best.pth
 ```
 
-## Usage
+When `--reid-weights` is omitted, SigLIP zero-shot clustering is used automatically (no training required).
 
-Analyze a match video (RF-DETR player detection, SigLIP zero-shot team clustering):
-```bash
-torchkick analyze -v match.mp4 --duration 60
-```
+Key flags:
 
-With pitch keypoints for accurate homography and trained ReID weights for team classification:
-```bash
-torchkick analyze -v match.mp4 \
-    --pitch-weights weights/keypoints/best.pt \
-    --reid-weights  weights/reid/reid_student_best.pth
-```
-
-Other detector backends:
-```bash
-torchkick analyze -v match.mp4 --model-type rtdetr   # RT-DETR-R101
-torchkick analyze -v match.mp4 --model-type yolo     # YOLO11-nano (fastest)
-```
+| Flag | Default | Description |
+|---|---|---|
+| `--yolo-weights` | required | YOLO player detection weights |
+| `--pitch-weights` | — | DINOv2 heatmap pitch keypoint weights |
+| `--reid-weights` | — | ReID checkpoint (omit → SigLIP zero-shot) |
+| `--duration` / `-d` | full video | Max seconds to process |
+| `--conf` | 0.25 | Player detection confidence threshold |
+| `--homography-interval` | 1 | Frames between homography updates |
+| `--reid-interval` | 5 | Frames between embedding updates |
+| `--no-overlay` | off | Disable pitch line wireframe overlay |
+| `--debug-anchors` | off | Draw anchor players used for camera motion |
 
 Python API:
+
 ```python
-from torchkick import run_analysis
+from torchkick.inference import run_analysis
 
 output = run_analysis(
-    "match.mp4",
-    model_type="rfdetr",        # default
-    pitch_weights="weights/keypoints/best.pt",
-    reid_weights="weights/reid/reid_student_best.pth",
+    video_path="match.mp4",
+    yolo_weights="models/players/yolo11l.pt",
+    pitch_weights="models/keypoints/heatmap.pt",
+    reid_weights="models/reid/reid_student_best.pth",
     duration=60.0,
 )
 ```
 
-I've yet to release model weights, but still actively refining approach on homography projection and player tracking, so this can heavily change from current structure (also, not so sure whether it will even make it to the public).
+---
 
-## What it does
+## Annotation tool
 
-1. Detects players with RF-DETR (DINOv2 backbone) or YOLO/RT-DETR
-2. Tracks them with BotSORT, optionally guided by DINOv2 ReID embeddings
-3. Estimates camera homography from YOLO-pose / ViTPose pitch keypoints (29 or 32 landmarks)
-4. Projects player feet positions onto pitch coordinates via Kalman-smoothed homography
-5. Classifies teams via DINOv2+ArcFace ReID or SigLIP zero-shot clustering (no training required, can be improved by training)
-6. Outputs a video with 2D pitch visualization and optional space-control heatmap
-7. TBD features given accuracy and 3D->2D projection is 'accurate enough'.
+Self-hostable web tool for semi-automated video annotation. Upload a video, pick a sampling interval, and auto-annotate every frame with player bboxes and 32-point pitch keypoints. Correct annotations in the browser, export YOLO-format labels.
+
+```bash
+# Local (MPS / CPU)
+uv pip install -e ".[annotation]"
+uvicorn annotation_tool.server:app --host 0.0.0.0 --port 8080 --workers 1
+```
+
+```bash
+# GPU server
+docker compose up --build
+```
+
+Open `http://localhost:8080`.
+
+Environment variables (all optional — server auto-detects weights under `models/`):
+
+| Variable | Default | Description |
+|---|---|---|
+| `PLAYER_WEIGHTS` | `models/players/yolo11l.pt` | YOLO player detection weights |
+| `PITCH_WEIGHTS` | `models/keypoints/heatmap.pt` | DINOv2 heatmap pitch keypoint weights |
+| `DEVICE` | auto (cuda → mps → cpu) | Inference device |
+| `UPLOAD_DIR` | `./uploads` | Directory for uploaded videos |
+
+**Features:**
+- Configurable sampling interval (1 / 5 / 10 / 20 / 30 / 60 s)
+- Background auto-annotation of all frames on upload with progress bar
+- Dual canvas: frame view (left) + 2D pitch minimap (right)
+- Select, drag, draw, delete annotations — zoom/pan for accuracy
+- Shift-click multi-select on the pitch minimap for batch delete
+- Pitch flip and undo/redo
+- Session persists across browser refreshes; annotations written to disk on every save
+
+**Export format** (`Export ZIP` button):
+```
+images/     {frame:06d}.jpg
+players/    {frame:06d}.txt   # YOLO detection: class_id cx cy w h
+keypoints/  {frame:06d}.txt   # YOLO-pose: 0 cx cy w h + 32×(x y vis)
+```
+
+---
 
 ## Training
 
@@ -66,301 +110,200 @@ I've yet to release model weights, but still actively refining approach on homog
 
 **SoccerNet** (tracking + pitch calibration — requires a free SoccerNet account):
 ```bash
-torchkick dataset -d tracking   -o data/soccernet/
+torchkick dataset -d tracking    -o data/soccernet/
 torchkick dataset -d calibration -o data/soccernet/
 ```
 
-**Roboflow Universe** (free API key required — sign up at roboflow.com):
+**Roboflow Universe** (free API key required):
 ```bash
-# Add to .env in the project root:
-# ROBOFLOW_API_KEY=your_key_here
+# Add ROBOFLOW_API_KEY to .env
 
-# 4-class player detection — football-players-detection-3zvbc v20
+# 4-class player detection (football-players-detection-3zvbc v20)
 torchkick dataset -d roboflow-players -o data/roboflow/players/
 
-# 32-keypoint pitch landmarks — football-field-detection-f07vi v15
+# 32-keypoint pitch landmarks (football-field-detection-f07vi v15)
 torchkick dataset -d roboflow-field -o data/roboflow/field/
 
-# Any other Roboflow Universe dataset by URL slug
-# (workspace and project visible at roboflow.com/<workspace>/<project>)
+# Any other Roboflow dataset
 torchkick dataset -d roboflow \
     --workspace <workspace> --project <project> --version <n> \
-    -o data/custom/
-
-# COCO JSON export (for torchkick train detection)
-torchkick dataset -d roboflow \
-    --workspace roboflow-jvuqo --project football-players-detection-3zvbc \
-    --version 20 --format coco -o data/roboflow/players_coco/
+    --format coco -o data/custom/
 ```
 
 ---
 
-### 2 — Player detection
-
-#### YOLO (fastest, good baseline — full CLI support)
+### 2 — Player detection (YOLO)
 
 ```bash
-# SoccerNet only
-torchkick train yolo --data data/soccernet/tracking/train.zip --epochs 50
+# SoccerNet zip
+torchkick train yolo --data data/soccernet/tracking/train.zip --epochs 100
 
-# Roboflow only (already in YOLO format, directory accepted directly)
-torchkick train yolo --data data/roboflow/players/ --epochs 50
+# Roboflow / custom YOLO directory
+torchkick train yolo --data data/roboflow/players/ --epochs 100
 
-# Custom CVAT export (export as YOLO 1.1 from CVAT, pass the output dir)
-torchkick train yolo --data data/custom/yolo_export/ --epochs 50
+# Pre-extracted SoccerNet directory (faster than zip)
+torchkick train yolo --soccernet-dir data/soccernet/tracking/ --epochs 100
 ```
 
-Combining multiple sources requires merging the YOLO dataset directories manually
-(copy `images/` and `labels/` from each into a shared directory, then update `dataset.yaml`).
+Key flags: `--base-model yolo11l.pt` (default), `--batch-size`, `--frame-stride` (thin the dataset), `--save-dir`.
 
-#### RT-DETR (higher accuracy — combines any sources with a single command)
+---
 
-`torchkick train detection` accepts any non-empty subset of SoccerNet, Roboflow, and CVAT.
-No manual dataset merging required — all sources are mixed at training time.
+### 3 — Pitch keypoint detection (DINOv2 heatmap)
 
-Export formats required:
-- **Roboflow** → Export dataset → **COCO JSON**
-- **CVAT** → Export dataset → **COCO 1.0**
+32-keypoint Roboflow schema. ViT-S/14 or ViT-B/14 backbone with CNN heatmap decoder.
 
 ```bash
-# SoccerNet only
-torchkick train detection \
-    --soccernet data/soccernet/tracking/train.zip
+# From annotation tool export (rename keypoints/ → labels/train/, images/ → images/train/)
+torchkick train pitch-heatmap --data data/my_annotations/ --epochs 100
 
-# Roboflow only
-torchkick train detection \
-    --roboflow-json data/roboflow/players/train/_annotations.coco.json \
-    --roboflow-images data/roboflow/players/train/
+# From SoccerNet calibration directory (auto-converts format)
+torchkick train pitch-heatmap \
+    --soccernet-calibration-dir data/soccernet/calibration/ \
+    --epochs 100 --batch-size 8
 
-# CVAT custom annotations only
-torchkick train detection \
-    --cvat-json data/custom/annotations.json \
-    --cvat-images data/custom/images/
+# Fine-tune from existing checkpoint
+torchkick train pitch-heatmap \
+    --data data/my_annotations/ \
+    --base-model models/keypoints/heatmap.pt \
+    --epochs 30 --batch-size 8
+```
 
-# SoccerNet + Roboflow
-torchkick train detection \
-    --soccernet data/soccernet/tracking/train.zip \
-    --roboflow-json data/roboflow/players/train/_annotations.coco.json \
-    --roboflow-images data/roboflow/players/train/
+Key flags: `--backbone dinov2_vits14|dinov2_vitb14`, `--min-keypoints` (filter close-ups), `--imgsz` (must be multiple of 14), `--wandb-project`.
 
-# SoccerNet + CVAT
-torchkick train detection \
-    --soccernet data/soccernet/tracking/train.zip \
-    --cvat-json data/custom/annotations.json \
-    --cvat-images data/custom/images/
-
-# Roboflow + CVAT
-torchkick train detection \
-    --roboflow-json data/roboflow/players/train/_annotations.coco.json \
-    --roboflow-images data/roboflow/players/train/ \
-    --cvat-json data/custom/annotations.json \
-    --cvat-images data/custom/images/
-
-# All three combined
-torchkick train detection \
-    --soccernet data/soccernet/tracking/train.zip \
-    --roboflow-json data/roboflow/players/train/_annotations.coco.json \
-    --roboflow-images data/roboflow/players/train/ \
-    --cvat-json data/custom/annotations.json \
-    --cvat-images data/custom/images/ \
-    --epochs 50
+Dataset layout expected by `--data`:
+```
+data_dir/
+  images/train/   *.jpg
+  images/valid/   *.jpg
+  labels/train/   *.txt   # YOLO-pose 32-keypoint format
+  labels/valid/   *.txt
 ```
 
 ---
 
-### 3 — Pitch keypoint detection
+### 4 — ReID (player re-identification)
 
-#### YOLO-pose (fast, ~3 ms/frame — recommended for real-time inference)
-
-The Roboflow field dataset downloads in YOLO-pose format and comes with a `data.yaml`:
+DINOv2+LoRA+ArcFace metric learning.
 
 ```bash
-# Roboflow field keypoints (32 kp) — data.yaml included in download
-torchkick train yolo-keypoints --data data/roboflow/field/data.yaml --epochs 100
-
-# Custom YOLO-pose dataset (any YOLO-pose YAML works)
-torchkick train yolo-keypoints --data data/custom/pitch_keypoints.yaml --imgsz 640 --epochs 100
-```
-
-`mosaic=0.0` is set automatically — omitting this degrades keypoint AP by shuffling spatial
-relationships between landmarks.
-
-The default model produces 29 keypoints (SoccerNet convention). For 32-keypoint models
-(Roboflow field dataset):
-
-```bash
-torchkick train yolo-keypoints \
-    --data data/roboflow/field/data.yaml \
-    --base-model yolo11n-pose.pt \
-    --epochs 100
-```
-
-Then load at inference with `num_keypoints=32`:
-
-```python
-from torchkick.models import YOLOPoseKeypointDetector
-detector = YOLOPoseKeypointDetector("weights/keypoints/best.pt", num_keypoints=32)
-```
-
-#### ViTPose-L (highest accuracy — annotation/offline pipelines)
-
-```bash
-# SoccerNet calibration zip only
-torchkick train keypoints --data data/soccernet/calibration/train.zip --epochs 100
-```
-
----
-
-### 4 — Player re-identification
-
-ReID requires player crop images. Extract them by running the analysis pipeline first,
-or use the `torchkick label grounded-sam` command to generate labeled crops from video.
-
-Expected directory structure for supervised training:
-```
-data/reid/
-  0/          # home team crops
-    frame_001_id_3.jpg
-    ...
-  1/          # away team crops
-    ...
-  2/          # referee crops
-    ...
-```
-
-For self-supervised (SSL) training, organise by track ID instead of team label:
-```
-data/reid_ssl/
-  track_007/
-    crop_0001.jpg
-    ...
-  track_012/
-    ...
-```
-
-```bash
-# Stage 1: supervised ArcFace metric learning
-torchkick train reid --stage supervised \
+# Supervised (labelled crops by team: 0/home, 1/away, 2/referee)
+torchkick train reid \
     --data-dir data/reid/ \
-    --epochs 30 \
-    --num-classes 3
+    --epochs 30 --num-classes 3
 
-# Stage 2: BYOL tracklet SSL (optional, improves generalisation)
-torchkick train reid --stage ssl \
-    --data-dir data/reid_ssl/ \
+# BYOL self-supervised (crops by track ID, no labels needed)
+torchkick train reid \
+    --stage ssl \
+    --data-dir data/tracklets/ \
     --epochs 20
 
-# Distil ViT-L teacher → ViT-S student for real-time inference (~3 ms/frame)
-torchkick train distill \
-    --teacher-weights weights/reid/reid_supervised_best.pth \
-    --data-dir data/reid/ \
-    --epochs 30
+# Auto-label from raw video (SigLIP zero-shot → pseudo-labels → ArcFace)
+torchkick train reid-video \
+    --video match.mp4 \
+    --yolo-weights models/players/yolo11l.pt \
+    --epochs 20
 ```
-
-The distilled student (`reid_student_best.pth`) is the file used with `--reid-weights`
-at inference time.
 
 ---
 
 ### Training recipe summary
 
-| Goal | Data source | Command |
-|---|---|---|
-| Player detector (fast) | SoccerNet | `torchkick train yolo --data soccernet/train.zip` |
-| Player detector (fast) | Roboflow | `torchkick train yolo --data data/roboflow/players/` |
-| Player detector (fast) | Custom CVAT (YOLO export) | `torchkick train yolo --data data/custom/` |
-| Player detector (accurate) | Any / combined | `torchkick train detection --soccernet ... --roboflow-json ... --cvat-json ...` |
-| Pitch keypoints (real-time) | Roboflow / custom YAML | `torchkick train yolo-keypoints --data pitch.yaml` |
-| Pitch keypoints (accurate) | SoccerNet calibration | `torchkick train keypoints --data calibration.zip` |
-| ReID embeddings | Labeled crops | `torchkick train reid --stage supervised --data-dir data/reid/` |
-| ReID student (inference) | Same crops | `torchkick train distill --teacher-weights ...` |
-
+| Goal | Command |
+|---|---|
+| Player detector | `torchkick train yolo --data <zip or dir>` |
+| Pitch keypoints (from annotation export) | `torchkick train pitch-heatmap --data <dir>` |
+| Pitch keypoints (from SoccerNet) | `torchkick train pitch-heatmap --soccernet-calibration-dir <dir>` |
+| ReID (labelled) | `torchkick train reid --data-dir data/reid/` |
+| ReID (no labels) | `torchkick train reid-video --video match.mp4 --yolo-weights best.pt` |
 
 ---
 
 ## Remote training on RunPod
 
-The fastest way to train all models is to spin up a GPU pod on RunPod, run
-the training script, and SCP the weights back.
+### 1 — Start a pod
 
-### 1 — Start a RunPod pod
+Recommended: **RunPod PyTorch 2.x**, at least **A10G** (24 GB).
 
-Recommended template: **RunPod PyTorch 2.x** with at least an **A10G** (24 GB).
-Note the pod IP and SSH port from the RunPod dashboard.
-
-### 2 — Copy your `.env` to the pod
-
-```bash
-# From your local machine
-scp -P <port> .env root@<runpod-ip>:/workspace/torchkick/.env
-```
-
-Or set the key directly in the pod's environment before running the script:
-
-```bash
-export ROBOFLOW_API_KEY=your_key_here
-```
-
-### 3 — Run the training script on the pod
-
-SSH in and run:
+### 2 — Run the training script
 
 ```bash
 ssh root@<runpod-ip> -p <port>
 
-# Roboflow datasets only (no SoccerNet account needed) — ~2 h on A10G
-bash <(curl -fsSL https://raw.githubusercontent.com/eirikbaekkelund/torchkick/main/scripts/train_remote.sh) --roboflow-only
+# Roboflow datasets only (~2h on A10G)
+bash scripts/train_remote.sh --roboflow-only
 
-# Or clone first and run locally
-git clone https://github.com/eirikbaekkelund/torchkick.git /workspace/torchkick
-bash /workspace/torchkick/scripts/train_remote.sh --roboflow-only
-```
+# With SoccerNet (requires credentials in .env)
+bash scripts/train_remote.sh
 
-With SoccerNet data as well (needs SoccerNet credentials set in the pod):
-
-```bash
-bash /workspace/torchkick/scripts/train_remote.sh
-```
-
-With ReID training (requires labelled player crops copied to the pod):
-
-```bash
-# Copy crops from local first
+# With ReID (copy crops to pod first)
 scp -P <port> -r data/reid/ root@<runpod-ip>:/workspace/torchkick/data/reid/
-
-bash /workspace/torchkick/scripts/train_remote.sh \
-    --roboflow-only \
-    --reid-crops-dir data/reid/
+bash scripts/train_remote.sh --roboflow-only --reid-crops-dir data/reid/
 ```
 
-Flags:
+Script flags:
 
-| Flag | Default | Description |
-|---|---|---|
-| `--roboflow-only` | off | Skip SoccerNet downloads |
-| `--skip-detection` | off | Skip player detector training |
-| `--skip-keypoints` | off | Skip pitch keypoint training |
-| `--reid-crops-dir <path>` | — | Enable ReID training with crops at this path |
-| `--epochs-detection <n>` | 50 | Player detector epochs |
-| `--epochs-keypoints <n>` | 100 | Pitch keypoint epochs |
-| `--batch <n>` | 32 | Batch size |
+| Flag | Description |
+|---|---|
+| `--roboflow-only` | Skip SoccerNet downloads |
+| `--skip-detection` | Skip player detector training |
+| `--skip-keypoints` | Skip pitch keypoint training |
+| `--reid-crops-dir <path>` | Enable ReID training |
+| `--epochs-detection <n>` | Player detector epochs (default 50) |
+| `--epochs-keypoints <n>` | Pitch keypoint epochs (default 100) |
+| `--batch <n>` | Batch size (default 32) |
 
-### 4 — Pull weights back to your machine
+### 3 — Pull weights back
 
 ```bash
-# From your LOCAL machine, from the repo root
+# From local machine, repo root
 bash scripts/pull_weights.sh <runpod-ip> <ssh-port>
 ```
 
-This rsync-pulls `weights_export/` from the pod into your local `weights/`
-and prints the ready-to-run `torchkick analyze` command with all weight paths filled in.
+---
 
-### 5 — Run inference with trained weights
+## Project structure
 
-```bash
-torchkick analyze -v match.mp4 \
-    --model weights/player_detector_yolo.pt --model-type yolo \
-    --pitch-weights weights/pitch_keypoints_yolo.pt \
-    --reid-weights  weights/reid_student.pth
 ```
+src/torchkick/
+  models/
+    player.py           PlayerDetector (YOLO wrapper)
+    pitch.py            HeatmapPitchDetector (DINOv2 + CNN decoder)
+    reid.py             DINOv2+LoRA+ArcFace ReID model
+  tracking/
+    homography.py       HomographyEstimator (32-kp Roboflow schema)
+    identity.py         IdentityAssigner — track→player role mapping
+    models.py           Track / TrackStore dataclasses
+    pitch_viz.py        PitchVisualizer — 2D minimap renderer
+    team_embedder.py    GameTeamEmbedder — jersey crop clustering
+    trajectory.py       Kalman-smoothed trajectory smoothing
+  training/
+    data/
+      detection_dataset.py    MixedDetectionDataset (SoccerNet + COCO)
+      pitch_heatmap_dataset.py PitchHeatmapDataset (YOLO-pose → Gaussian heatmaps)
+      reid_dataset.py         ReID crop datasets (supervised + SSL)
+      keypoint_dataset.py     KeypointAugDataset (SoccerNet calibration)
+    train_yolo_detection.py   YOLO training loop
+    train_pitch_heatmap.py    DINOv2 heatmap training loop
+    train_reid.py             ArcFace / BYOL training loop
+  soccernet/
+    download.py         SoccerNet + Roboflow dataset downloaders
+    tracking_data.py    PlayerTrackingDataset
+    calibration_data.py LineKeypointDataset
+  utils/
+    crops.py            Player crop extraction
+    video.py            Video I/O utilities
+    visualization.py    Overlay rendering helpers
+  inference.py          run_analysis() — full pipeline entry point
+  cli.py                torchkick CLI
 
+annotation_tool/
+  server.py             FastAPI backend
+  static/
+    index.html          UI layout
+    annotator.js        Canvas annotation logic
+
+scripts/
+  train_remote.sh       End-to-end remote training on RunPod
+  pull_weights.sh       rsync weights from RunPod to local
+```

@@ -45,7 +45,9 @@ def main() -> None:
 @click.option("--reid-interval", type=int, default=5, help="Frames between embedding updates.")
 @click.option("--conf", type=float, default=0.25, help="Detection confidence threshold.")
 @click.option("--no-overlay", is_flag=True, help="Disable pitch line wireframe overlay.")
-@click.option("--debug-anchors", is_flag=True, help="Draw white dot on standing-still anchor players (camera-motion debug).")
+@click.option(
+    "--debug-anchors", is_flag=True, help="Draw white dot on standing-still anchor players (camera-motion debug)."
+)
 def analyze(
     video: str,
     yolo_weights: str,
@@ -427,8 +429,6 @@ def train_reid_video_cmd(
         keep_tmp=keep_tmp,
     )
     click.echo(f"Done → {weights}")
-
-
 
 
 if __name__ == "__main__":
