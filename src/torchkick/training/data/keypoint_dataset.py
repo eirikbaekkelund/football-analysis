@@ -142,16 +142,4 @@ class KeypointAugDataset(Dataset):
         except ImportError:
             pass
 
-        # Horizontal flip (50% chance)
-        if np.random.random() < 0.5:
-            h, w = image.shape[:2]
-            image = cv2.flip(image, 1)
-            # Mirror x coordinates
-            kps[:, 0] = w - kps[:, 0]
-            # Swap left/right keypoint pairs
-            for left_idx, right_idx in self.FLIP_PAIRS:
-                if left_idx < len(kps) and right_idx < len(kps):
-                    kps[[left_idx, right_idx]] = kps[[right_idx, left_idx]]
-                    vis[[left_idx, right_idx]] = vis[[right_idx, left_idx]]
-
         return image, kps, vis

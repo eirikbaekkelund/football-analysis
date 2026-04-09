@@ -746,7 +746,7 @@ def build_soccernet_keypoint_dataset(
         f"val: {val_key}",
         "",
         f"kpt_shape: [32, 3]",
-        f"flip_idx: {_RF_FLIP_IDX}",
+        f"fliplr: 0.0",
         "",
         "nc: 1",
         "names: ['pitch']",

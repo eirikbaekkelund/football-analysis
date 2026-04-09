@@ -218,13 +218,6 @@ class PitchHeatmapDataset(Dataset):
         else:
             kp_xy, kp_vis = parsed
 
-        # --- horizontal flip augmentation (50%) ---
-        if self.augment and np.random.rand() < 0.5:
-            frame = frame[:, ::-1].copy()
-            kp_xy[:, 0] = 1.0 - kp_xy[:, 0]
-            kp_xy = kp_xy[_RF_FLIP_IDX]
-            kp_vis = kp_vis[_RF_FLIP_IDX]
-
         # --- photometric augmentation ---
         if self.augment:
             frame = self._aug(image=frame)["image"]
