@@ -12,8 +12,8 @@ Environment variables:
 
 If PLAYER_WEIGHTS / PITCH_WEIGHTS are not set, the server searches for
 default paths relative to the working directory:
-    models/players/yolo11l.pt
-    models/keypoints/heatmap.pt
+    models/players/finetune/run/weights/best_fp16.onnx
+    models/keypoints/finetune/last.pt
 """
 
 from __future__ import annotations
@@ -37,8 +37,8 @@ from pydantic import BaseModel
 # Config
 # ---------------------------------------------------------------------------
 
-_DEFAULT_PLAYER_WEIGHTS = "models/players/yolo11l.pt"
-_DEFAULT_PITCH_WEIGHTS = "models/keypoints/heatmap.pt"
+_DEFAULT_PLAYER_WEIGHTS = "models/players/yolo11l.onnx"
+_DEFAULT_PITCH_WEIGHTS = "models/keypoints/heatmap.onnx"
 
 
 def _resolve_weights(env_var: str, default: str) -> Optional[str]:
@@ -97,7 +97,7 @@ def _get_pitch_detector():
 
 
 class KeypointAnno(BaseModel):
-    index: int  # 0-31 Roboflow schema
+    index: int  # 0-29 for 30 pitch keypoints
     x: float  # pixel x in original frame
     y: float  # pixel y in original frame
     visible: bool = True
@@ -185,7 +185,7 @@ def _ensure_video_loaded(video_id: str) -> Optional[VideoMeta]:
 
 
 # ---------------------------------------------------------------------------
-# 32 Roboflow keypoint schema
+# 30-point pitch keypoint schema
 # ---------------------------------------------------------------------------
 
 # Pitch constants (must match homography.py)
@@ -201,6 +201,7 @@ _RF_GBW = 18.32
 _RF_GBD = 5.50
 _RF_CCR = 9.15
 _RF_PS = 11.0
+_RF_GW = 7.32
 _RF_HX = _RF_L / 2
 _RF_HY = _RF_W / 2
 
@@ -211,7 +212,7 @@ def _rf(x_raw: float, y_raw: float):
     return x, y
 
 
-_ROBOFLOW_VERTICES = [
+_VERTICES = [
     _rf(0, 0),  # 0  top-left corner
     _rf(0, (_RF_W - _RF_PBW) / 2),  # 1  left penalty box top
     _rf(0, (_RF_W - _RF_GBW) / 2),  # 2  left goal box top
@@ -220,30 +221,28 @@ _ROBOFLOW_VERTICES = [
     _rf(0, _RF_W),  # 5  bottom-left corner
     _rf(_RF_GBD, (_RF_W - _RF_GBW) / 2),  # 6  left goal box front top
     _rf(_RF_GBD, (_RF_W + _RF_GBW) / 2),  # 7  left goal box front bottom
-    _rf(_RF_PS, _RF_HY),  # 8  left penalty spot
-    _rf(_RF_PBD, (_RF_W - _RF_PBW) / 2),  # 9  left penalty box front top
-    _rf(_RF_PBD, (_RF_W - _RF_GBW) / 2),  # 10 left penalty box inner top
-    _rf(_RF_PBD, (_RF_W + _RF_GBW) / 2),  # 11 left penalty box inner bottom
-    _rf(_RF_PBD, (_RF_W + _RF_PBW) / 2),  # 12 left penalty box front bottom
-    _rf(_RF_HX, 0),  # 13 halfway line top
-    _rf(_RF_HX, _RF_HY - _RF_CCR),  # 14 centre circle top
-    _rf(_RF_HX, _RF_HY + _RF_CCR),  # 15 centre circle bottom
-    _rf(_RF_HX, _RF_W),  # 16 halfway line bottom
-    _rf(_RF_L - _RF_PBD, (_RF_W - _RF_PBW) / 2),  # 17 right penalty box front top
-    _rf(_RF_L - _RF_PBD, (_RF_W - _RF_GBW) / 2),  # 18 right penalty box inner top
-    _rf(_RF_L - _RF_PBD, (_RF_W + _RF_GBW) / 2),  # 19 right penalty box inner bottom
-    _rf(_RF_L - _RF_PBD, (_RF_W + _RF_PBW) / 2),  # 20 right penalty box front bottom
-    _rf(_RF_L - _RF_PS, _RF_HY),  # 21 right penalty spot
-    _rf(_RF_L - _RF_GBD, (_RF_W - _RF_GBW) / 2),  # 22 right goal box front top
-    _rf(_RF_L - _RF_GBD, (_RF_W + _RF_GBW) / 2),  # 23 right goal box front bottom
-    _rf(_RF_L, 0),  # 24 top-right corner
-    _rf(_RF_L, (_RF_W - _RF_PBW) / 2),  # 25 right penalty box top
-    _rf(_RF_L, (_RF_W - _RF_GBW) / 2),  # 26 right goal box top
-    _rf(_RF_L, (_RF_W + _RF_GBW) / 2),  # 27 right goal box bottom
-    _rf(_RF_L, (_RF_W + _RF_PBW) / 2),  # 28 right penalty box bottom
-    _rf(_RF_L, _RF_W),  # 29 bottom-right corner
-    _rf(_RF_HX - _RF_CCR, _RF_HY),  # 30 centre circle left
-    _rf(_RF_HX + _RF_CCR, _RF_HY),  # 31 centre circle right
+    _rf(_RF_PBD, (_RF_W - _RF_PBW) / 2),  # 8  left penalty box front top
+    _rf(_RF_PBD, (_RF_W - _RF_GBW) / 2),  # 9 left penalty box inner top
+    _rf(_RF_PBD, (_RF_W + _RF_GBW) / 2),  # 10 left penalty box inner bottom
+    _rf(_RF_PBD, (_RF_W + _RF_PBW) / 2),  # 11 left penalty box front bottom
+    _rf(_RF_HX, 0),  # 12 halfway line top
+    _rf(_RF_HX, _RF_HY - _RF_CCR),  # 13 centre circle top
+    _rf(_RF_HX, _RF_HY + _RF_CCR),  # 14 centre circle bottom
+    _rf(_RF_HX, _RF_W),  # 15 halfway line bottom
+    _rf(_RF_L - _RF_PBD, (_RF_W - _RF_PBW) / 2),  # 16 right penalty box front top
+    _rf(_RF_L - _RF_PBD, (_RF_W - _RF_GBW) / 2),  # 17 right penalty box inner top
+    _rf(_RF_L - _RF_PBD, (_RF_W + _RF_GBW) / 2),  # 18 right penalty box inner bottom
+    _rf(_RF_L - _RF_PBD, (_RF_W + _RF_PBW) / 2),  # 19 right penalty box front bottom
+    _rf(_RF_L - _RF_GBD, (_RF_W - _RF_GBW) / 2),  # 20 right goal box front top
+    _rf(_RF_L - _RF_GBD, (_RF_W + _RF_GBW) / 2),  # 21 right goal box front bottom
+    _rf(_RF_L, 0),  # 22 top-right corner
+    _rf(_RF_L, (_RF_W - _RF_PBW) / 2),  # 23 right penalty box top
+    _rf(_RF_L, (_RF_W - _RF_GBW) / 2),  # 24 right goal box top
+    _rf(_RF_L, (_RF_W + _RF_GBW) / 2),  # 25 right goal box bottom
+    _rf(_RF_L, (_RF_W + _RF_PBW) / 2),  # 26 right penalty box bottom
+    _rf(_RF_L, _RF_W),  # 27 bottom-right corner
+    _rf(_RF_HX - _RF_CCR, _RF_HY),  # 28 centre circle left
+    _rf(_RF_HX + _RF_CCR, _RF_HY),  # 29 centre circle right
 ]
 
 _KP_NAMES = [
@@ -255,7 +254,6 @@ _KP_NAMES = [
     "bottom-left corner",
     "left goal box front top",
     "left goal box front bottom",
-    "left penalty spot",
     "left penalty box front top",
     "left penalty box inner top",
     "left penalty box inner bottom",
@@ -268,7 +266,6 @@ _KP_NAMES = [
     "right penalty box inner top",
     "right penalty box inner bottom",
     "right penalty box front bottom",
-    "right penalty spot",
     "right goal box front top",
     "right goal box front bottom",
     "top-right corner",
@@ -292,21 +289,16 @@ def _pitch_to_canvas(x: float, y: float):
     return px, py
 
 
-# Penalty spots only — too occluded by players to annotate reliably.
-# All box corners (16m box, goal box), arc intersections, halfway line, centre circle kept.
-_PENALTY_BOX_INDICES: frozenset = frozenset([8, 21])
-
 _PITCH_KP_INFO = [
     {
         "index": i,
         "name": _KP_NAMES[i],
-        "pitch_x": float(_ROBOFLOW_VERTICES[i][0]),
-        "pitch_y": float(_ROBOFLOW_VERTICES[i][1]),
-        "canvas_px": _pitch_to_canvas(*_ROBOFLOW_VERTICES[i])[0],
-        "canvas_py": _pitch_to_canvas(*_ROBOFLOW_VERTICES[i])[1],
+        "pitch_x": float(_VERTICES[i][0]),
+        "pitch_y": float(_VERTICES[i][1]),
+        "canvas_px": _pitch_to_canvas(*_VERTICES[i])[0],
+        "canvas_py": _pitch_to_canvas(*_VERTICES[i])[1],
     }
-    for i in range(32)
-    if i not in _PENALTY_BOX_INDICES
+    for i in range(30)
 ]
 
 # ---------------------------------------------------------------------------
@@ -378,6 +370,16 @@ async def sample_frames(video_id: str, body: SampleRequest):
     meta = _ensure_video_loaded(video_id)
     if meta is None:
         raise HTTPException(404, "Video not found")
+
+    # Enforce minimum sampling intervals on large videos to prevent I/O and Inference bottlenecks.
+    interval_s = float(body.interval_s)
+    if meta.duration > 3600 and interval_s < 30:
+        interval_s = 30.0
+    elif meta.duration > 1800 and interval_s < 15:
+        interval_s = 15.0
+    elif meta.duration > 600 and interval_s < 5:
+        interval_s = 5.0
+
     # CAP_PROP_FRAME_COUNT often overcounts — find the true last readable frame
     cap = cv2.VideoCapture(meta.path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, meta.total_frames - 1)
@@ -397,7 +399,7 @@ async def sample_frames(video_id: str, body: SampleRequest):
     else:
         true_last = meta.total_frames - 1
     cap.release()
-    step = max(1, int(meta.fps * body.interval_s))
+    step = max(1, int(meta.fps * interval_s))
     indices = list(range(0, true_last + 1, step))
     _frame_lists[video_id] = indices
     asyncio.create_task(_annotate_all_bg(video_id, indices))
@@ -463,7 +465,7 @@ def _run_annotation(video_id: str, idx: int, frame_bgr) -> FrameAnno:
     if pitch_det is not None:
         kps, confs = pitch_det.detect(frame_bgr)
         for i, (xy, conf) in enumerate(zip(kps, confs)):
-            if conf > 0 and i not in _PENALTY_BOX_INDICES:
+            if conf > 0:
                 anno.keypoints.append(
                     KeypointAnno(
                         index=i,
@@ -480,29 +482,44 @@ def _run_annotation(video_id: str, idx: int, frame_bgr) -> FrameAnno:
 
 
 async def _annotate_all_bg(video_id: str, indices: List[int]) -> None:
-    """Background task: annotate every sampled frame, skipping already-done ones."""
+    """Background task: annotate every sampled frame in a single optimized pass."""
     _progress[video_id] = {"done": 0, "total": len(indices), "running": True}
     meta = _ensure_video_loaded(video_id)
-    if meta is None:
+    if meta is None or not indices:
         _progress[video_id]["running"] = False
         return
 
-    def _process_frame(idx: int) -> None:
-        if _annotations.get(video_id, {}).get(idx) is not None:
-            return  # already annotated (e.g. loaded from disk)
+    def _process_video_sequential():
         cap = cv2.VideoCapture(meta.path)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ok, frame_bgr = cap.read()
-        cap.release()
-        if ok:
-            _run_annotation(video_id, idx, frame_bgr)
+        sorted_indices = sorted(indices)
+        current_idx = 0
 
-    for idx in indices:
-        try:
-            await asyncio.to_thread(_process_frame, idx)
-        except Exception as exc:
-            print(f"[annotator] bg annotation failed frame {idx}: {exc}")
-        _progress[video_id]["done"] += 1
+        for target_idx in sorted_indices:
+            if _annotations.get(video_id, {}).get(target_idx) is not None:
+                _progress[video_id]["done"] += 1
+                continue
+
+            # Seek using grab() to fast-forward past unneeded frames
+            while current_idx < target_idx:
+                ok = cap.grab()
+                if not ok:
+                    break
+                current_idx += 1
+
+            if current_idx == target_idx:
+                ok, frame_bgr = cap.retrieve()
+                if ok:
+                    _run_annotation(video_id, target_idx, frame_bgr)
+                current_idx += 1
+
+            _progress[video_id]["done"] += 1
+
+        cap.release()
+
+    try:
+        await asyncio.to_thread(_process_video_sequential)
+    except Exception as exc:
+        print(f"[annotator] bg annotation failed: {exc}")
 
     _progress[video_id]["running"] = False
 
@@ -560,43 +577,59 @@ async def export_annotations(video_id: str):
         raise HTTPException(400, "No annotations to export")
 
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for frame_idx, anno in sorted(video_annos.items()):
-            w, h = anno.width, anno.height
-            fname = f"{frame_idx:06d}"
 
-            # --- players label ---
-            player_lines = []
-            for bbox in anno.bboxes:
-                cx = ((bbox.x1 + bbox.x2) / 2) / w
-                cy = ((bbox.y1 + bbox.y2) / 2) / h
-                bw = (bbox.x2 - bbox.x1) / w
-                bh = (bbox.y2 - bbox.y1) / h
-                player_lines.append(f"{bbox.class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
-            zf.writestr(f"players/{fname}.txt", "\n".join(player_lines))
-
-            # --- keypoints label (YOLO keypoint format, one pitch per frame) ---
-            # Build full 32-point array; missing = 0 0 0
-            kp_map: Dict[int, KeypointAnno] = {kp.index: kp for kp in anno.keypoints}
-            parts = ["0 0.5 0.5 1.0 1.0"]
-            for i in range(32):
-                kp = kp_map.get(i)
-                if kp and kp.visible:
-                    xn = kp.x / w
-                    yn = kp.y / h
-                    parts.append(f"{xn:.6f} {yn:.6f} 2")
-                else:
-                    parts.append("0 0 0")
-            zf.writestr(f"keypoints/{fname}.txt", " ".join(parts))
-
-            # --- frame image ---
+    def _build_zip():
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             cap = cv2.VideoCapture(meta.path)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ok, frame_bgr = cap.read()
+            current_idx = 0
+
+            for frame_idx, anno in sorted(video_annos.items()):
+                w, h = anno.width, anno.height
+                fname = f"{video_id}_{frame_idx:06d}"
+
+                # --- players label ---
+                player_lines = []
+                for bbox in anno.bboxes:
+                    cx = ((bbox.x1 + bbox.x2) / 2) / w
+                    cy = ((bbox.y1 + bbox.y2) / 2) / h
+                    bw = (bbox.x2 - bbox.x1) / w
+                    bh = (bbox.y2 - bbox.y1) / h
+                    player_lines.append(f"{bbox.class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+                # --- players label ---
+                zf.writestr(f"players/{fname}.txt", "\n".join(player_lines))
+
+                # --- keypoints label (YOLO keypoint format, one pitch per frame) ---
+                # Build full 30-point array; missing = 0 0 0
+                kp_map: Dict[int, KeypointAnno] = {kp.index: kp for kp in anno.keypoints}
+                parts = ["0 0.5 0.5 1.0 1.0"]
+                for i in range(30):
+                    kp = kp_map.get(i)
+                    if kp and kp.visible:
+                        xn = kp.x / w
+                        yn = kp.y / h
+                        parts.append(f"{xn:.6f} {yn:.6f} 2")
+                    else:
+                        parts.append("0 0 0")
+                zf.writestr(f"keypoints/{fname}.txt", " ".join(parts))
+
+                # --- frame image ---
+                # Seek using grab() to fast-forward past unneeded frames
+                while current_idx < frame_idx:
+                    ok = cap.grab()
+                    if not ok:
+                        break
+                    current_idx += 1
+
+                if current_idx == frame_idx:
+                    ok, frame_bgr = cap.retrieve()
+                    if ok:
+                        _, img_buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                        zf.writestr(f"images/{fname}.jpg", img_buf.tobytes())
+                    current_idx += 1
+
             cap.release()
-            if ok:
-                _, img_buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                zf.writestr(f"images/{fname}.jpg", img_buf.tobytes())
+
+    await asyncio.to_thread(_build_zip)
 
     buf.seek(0)
     return StreamingResponse(

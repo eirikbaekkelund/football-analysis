@@ -4,7 +4,7 @@ Command-line interface for torchkick.
 Commands:
     analyze  — Run YOLO detection + 2D pitch reconstruction on a video
     train    — Train detection/keypoint/ReID models
-    dataset  — Download SoccerNet / Roboflow datasets
+    dataset  — Download SoccerNet datasets
     download — Download pre-trained model weights
 
 Example:
@@ -44,9 +44,27 @@ def main() -> None:
 @click.option("--homography-interval", type=int, default=1, help="Frames between homography updates.")
 @click.option("--reid-interval", type=int, default=5, help="Frames between embedding updates.")
 @click.option("--conf", type=float, default=0.25, help="Detection confidence threshold.")
-@click.option("--no-overlay", is_flag=True, help="Disable pitch line wireframe overlay.")
+@click.option("--overlay", is_flag=True, help="Enable pitch line wireframe overlay (off by default).")
 @click.option(
     "--debug-anchors", is_flag=True, help="Draw white dot on standing-still anchor players (camera-motion debug)."
+)
+@click.option(
+    "--preset",
+    type=click.Choice(["production_fast", "quality", "demo", "edge"]),
+    default="production_fast",
+    help="Deployment preset (overrides precision/backend).",
+)
+@click.option(
+    "--backend",
+    type=click.Choice(["pytorch", "onnx", "auto"]),
+    default="auto",
+    help="Model inference backend.",
+)
+@click.option(
+    "--precision",
+    type=click.Choice(["fp16", "fp32", "auto"]),
+    default="auto",
+    help="Model precision (auto-detects GPU capability).",
 )
 def analyze(
     video: str,
@@ -57,8 +75,11 @@ def analyze(
     homography_interval: int,
     reid_interval: int,
     conf: float,
-    no_overlay: bool,
+    overlay: bool,
     debug_anchors: bool,
+    preset: str,
+    backend: str,
+    precision: str,
 ) -> None:
     """
     Run match analysis: YOLO detection, team assignment, 2D pitch projection.
@@ -81,6 +102,21 @@ def analyze(
     """
     from torchkick.inference import run_analysis
 
+    # Apply preset settings (overrides explicit backend/precision flags)
+    _presets = {
+        "production_fast": {"backend": "onnx", "precision": "fp16"},
+        "quality": {"backend": "pytorch", "precision": "fp32"},
+        "demo": {"backend": "onnx", "precision": "fp16"},
+        "edge": {"backend": "pytorch", "precision": "fp32"},
+    }
+    if preset in _presets:
+        preset_config = _presets[preset]
+        if backend == "auto":
+            backend = preset_config["backend"]
+        if precision == "auto":
+            precision = preset_config["precision"]
+        click.echo(f"[preset: {preset}] backend={backend}, precision={precision}")
+
     click.echo(f"Analyzing: {video}")
     output = run_analysis(
         video_path=video,
@@ -91,7 +127,7 @@ def analyze(
         homography_interval=homography_interval,
         reid_interval=reid_interval,
         conf=conf,
-        draw_overlay=not no_overlay,
+        draw_overlay=overlay,
         debug_anchors=debug_anchors,
     )
     click.echo(f"Done → {output}")
@@ -106,75 +142,37 @@ def analyze(
 @click.option(
     "--dataset",
     "-d",
-    type=click.Choice(["tracking", "calibration", "all", "roboflow-players", "roboflow-field", "roboflow"]),
+    type=click.Choice(["tracking", "calibration", "all"]),
     required=True,
 )
 @click.option("--output-dir", "-o", type=click.Path(), default="./data/soccernet/")
-@click.option("--splits", type=str, default="train,test", help="Comma-separated splits (SoccerNet only).")
-@click.option("--workspace", type=str, default=None, help="Roboflow workspace slug.")
-@click.option("--project", type=str, default=None, help="Roboflow project slug.")
-@click.option("--version", type=int, default=1)
-@click.option("--format", "fmt", type=str, default="yolov8")
-@click.option("--api-key", type=str, default=None)
+@click.option("--splits", type=str, default="train,test", help="Comma-separated splits.")
 def dataset(
     dataset: str,
     output_dir: str,
     splits: str,
-    workspace: str | None,
-    project: str | None,
-    version: int,
-    fmt: str,
-    api_key: str | None,
 ) -> None:
     """
-    Download SoccerNet or Roboflow datasets.
+    Download SoccerNet datasets.
 
     Example:
         $ torchkick dataset -d tracking -o ./data/
-        $ torchkick dataset -d roboflow --workspace myws --project myproj -o data/
+        $ torchkick dataset -d all -o ./data/soccernet/
     """
     from pathlib import Path
 
-    if dataset in ("tracking", "calibration", "all"):
-        split_list = [s.strip() for s in splits.split(",")]
-        try:
-            from torchkick.soccernet import download_tracking_data, download_pitch_calibration
+    split_list = [s.strip() for s in splits.split(",")]
+    try:
+        from torchkick.soccernet import download_tracking_data, download_pitch_calibration
 
-            if dataset in ("tracking", "all"):
-                download_tracking_data(str(Path(output_dir) / "tracking"), splits=split_list, include_2023=False)
-                click.echo("Tracking data downloaded.")
-            if dataset in ("calibration", "all"):
-                download_pitch_calibration(str(Path(output_dir) / "calibration"), splits=split_list)
-                click.echo("Calibration data downloaded.")
-        except ImportError:
-            raise click.UsageError("Install torchkick[soccernet] for dataset downloads.")
-
-    elif dataset == "roboflow-players":
-        from torchkick.soccernet import download_roboflow_players
-
-        path = download_roboflow_players(output_dir, api_key=api_key)
-        click.echo(f"Downloaded to {path}")
-
-    elif dataset == "roboflow-field":
-        from torchkick.soccernet import download_roboflow_field_keypoints
-
-        path = download_roboflow_field_keypoints(output_dir, api_key=api_key)
-        click.echo(f"Downloaded to {path}")
-
-    elif dataset == "roboflow":
-        if not workspace or not project:
-            raise click.UsageError("--workspace and --project required for Roboflow downloads.")
-        from torchkick.soccernet import download_roboflow_dataset
-
-        path = download_roboflow_dataset(
-            workspace=workspace,
-            project=project,
-            version=version,
-            output_dir=output_dir,
-            fmt=fmt,
-            api_key=api_key,
-        )
-        click.echo(f"Downloaded to {path}")
+        if dataset in ("tracking", "all"):
+            download_tracking_data(str(Path(output_dir) / "tracking"), splits=split_list, include_2023=False)
+            click.echo("Tracking data downloaded.")
+        if dataset in ("calibration", "all"):
+            download_pitch_calibration(str(Path(output_dir) / "calibration"), splits=split_list)
+            click.echo("Calibration data downloaded.")
+    except ImportError:
+        raise click.UsageError("Install torchkick[soccernet] for dataset downloads.")
 
 
 # =============================================================================

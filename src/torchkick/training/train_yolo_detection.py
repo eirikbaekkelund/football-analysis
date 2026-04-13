@@ -32,6 +32,10 @@ from PIL import Image
 from tqdm import tqdm
 
 
+# Removed 2 unreachable penalty spots.
+_ACTIVE_RF_KEYPOINTS = list(range(30))
+
+
 def get_jersey_color_class(img_pil: Image.Image, box: Tuple[int, int, int, int]) -> int:
     """
     Determine jersey color class from player crop.
@@ -409,7 +413,7 @@ def train_yolo(
     if use_colors:
         project_name += "_colors"
 
-    # Support both SoccerNet-converted (dataset.yaml) and Roboflow (data.yaml) layouts
+    # Support both SoccerNet-converted (dataset.yaml) and custom (data.yaml) layouts
     yaml_path = Path(data_dir) / "dataset.yaml"
     if not yaml_path.exists():
         yaml_path = Path(data_dir) / "data.yaml"
@@ -432,33 +436,33 @@ def train_yolo(
 
 
 # ---------------------------------------------------------------------------
-# SoccerNet calibration → YOLO-pose (32-keypoint Roboflow schema)
+# SoccerNet calibration → YOLO-pose (30-keypoint pitch schema)
 # ---------------------------------------------------------------------------
 
-# 26 of 32 Roboflow pitch keypoints are directly derivable from SoccerNet
+# 26 of 30 pitch keypoints are directly derivable from SoccerNet
 # line-class endpoints (sorted by image x then y).
-# Keys: (LINE_CLASS_NAME, sorted_endpoint_index)  →  RF vertex index (0-31)
-# Missing RF indices: 8, 10, 11, 18, 19, 21 (penalty spots + inner box intersections)
+# Keys: (LINE_CLASS_NAME, sorted_endpoint_index)  →  vertex index (0-29)
+# Missing indices (penalty spots deleted; 30 keypoints total)
 _SOCCERNET_TO_RF_VERTEX: dict = {
     # Pitch corners / boundary lines
     ("Side line top", 0): 0,
-    ("Side line top", 1): 24,
+    ("Side line top", 1): 22,
     ("Side line bottom", 0): 5,
-    ("Side line bottom", 1): 29,
+    ("Side line bottom", 1): 27,
     ("Side line left", 0): 0,
     ("Side line left", 1): 5,
-    ("Side line right", 0): 24,
-    ("Side line right", 1): 29,
+    ("Side line right", 0): 22,
+    ("Side line right", 1): 27,
     # Halfway line
-    ("Middle line", 0): 13,
-    ("Middle line", 1): 16,
+    ("Middle line", 0): 12,
+    ("Middle line", 1): 15,
     # Left penalty area
     ("Big rect. left top", 0): 1,
-    ("Big rect. left top", 1): 9,
+    ("Big rect. left top", 1): 8,
     ("Big rect. left bottom", 0): 4,
-    ("Big rect. left bottom", 1): 12,
-    ("Big rect. left main", 0): 9,
-    ("Big rect. left main", 1): 12,
+    ("Big rect. left bottom", 1): 11,
+    ("Big rect. left main", 0): 8,
+    ("Big rect. left main", 1): 11,
     # Left goal area
     ("Small rect. left top", 0): 2,
     ("Small rect. left top", 1): 6,
@@ -467,55 +471,53 @@ _SOCCERNET_TO_RF_VERTEX: dict = {
     ("Small rect. left main", 0): 6,
     ("Small rect. left main", 1): 7,
     # Right penalty area (sorted by x: front end first, goal line end second)
-    ("Big rect. right top", 0): 17,
-    ("Big rect. right top", 1): 25,
-    ("Big rect. right bottom", 0): 20,
-    ("Big rect. right bottom", 1): 28,
-    ("Big rect. right main", 0): 17,
-    ("Big rect. right main", 1): 20,
+    ("Big rect. right top", 0): 16,
+    ("Big rect. right top", 1): 23,
+    ("Big rect. right bottom", 0): 19,
+    ("Big rect. right bottom", 1): 26,
+    ("Big rect. right main", 0): 16,
+    ("Big rect. right main", 1): 19,
     # Right goal area
-    ("Small rect. right top", 0): 22,
-    ("Small rect. right top", 1): 26,
-    ("Small rect. right bottom", 0): 23,
-    ("Small rect. right bottom", 1): 27,
-    ("Small rect. right main", 0): 22,
-    ("Small rect. right main", 1): 23,
+    ("Small rect. right top", 0): 20,
+    ("Small rect. right top", 1): 24,
+    ("Small rect. right bottom", 0): 21,
+    ("Small rect. right bottom", 1): 25,
+    ("Small rect. right main", 0): 20,
+    ("Small rect. right main", 1): 21,
 }
 
 # Symmetric flip pairs for horizontal augmentation (YOLO-pose flip_idx field)
 _RF_FLIP_IDX: list = [
+    22,
+    23,
     24,
     25,
     26,
-    27,
-    28,
-    29,  # 0-5 → 24-29
-    22,
-    23,
-    21,  # 6-8 → 22, 23, 21
+    27,  # 0-5 → 22-27
+    20,
+    21,  # 6-7 → 20, 21
+    16,
     17,
     18,
-    19,
-    20,  # 9-12 → 17-20
+    19,  # 8-11 → 16-19
+    12,
     13,
     14,
-    15,
-    16,  # 13-16 self (halfway + circle top/bottom)
+    15,  # 12-15 self (halfway + circle top/bottom)
+    8,
     9,
     10,
-    11,
-    12,  # 17-20 → 9-12
-    8,  # 21 → 8
+    11,  # 16-19 → 8-11
     6,
-    7,  # 22-23 → 6-7
+    7,  # 20-21 → 6-7
     0,
     1,
     2,
     3,
     4,
-    5,  # 24-29 → 0-5
-    31,
-    30,  # 30-31 → 31, 30 (circle left ↔ right)
+    5,  # 22-27 → 0-5
+    29,
+    28,  # 28-29 → 29, 28 (circle left ↔ right)
 ]
 
 
@@ -527,11 +529,10 @@ def convert_soccernet_calibration_to_yolo_pose(
     min_keypoints: int = 6,
 ) -> int:
     """
-    Convert one SoccerNet calibration zip to YOLO-pose format (32-keypoint schema).
+    Convert one SoccerNet calibration zip to YOLO-pose format (30-keypoint schema).
 
-    26 of the 32 Roboflow pitch keypoints are derived from SoccerNet line
-    endpoints.  The 6 unreachable ones (penalty spots RF[8,21] and inner box
-    corners RF[10,11,18,19]) are written with visibility=0.
+    24 of the 30 pitch keypoints are derived from SoccerNet line
+    endpoints.  The 6 unreachable ones (inner box corners) are written with visibility=0.
 
     When the same RF vertex appears in multiple line classes (e.g. RF[0] is
     both "Side line top" pt[0] and "Side line left" pt[0]), pixel coordinates
@@ -539,9 +540,9 @@ def convert_soccernet_calibration_to_yolo_pose(
 
     Output layout::
 
-        output_dir/
-          images/<split>/<frame_id>.jpg
-          labels/<split>/<frame_id>.txt  # one row: 0 0.5 0.5 1.0 1.0 kp0…kp31
+                output_dir/
+                    images/<split>/<frame_id>.jpg
+                    labels/<split>/<frame_id>.txt  # one row: 0 0.5 0.5 1.0 1.0 kp0…kp29
 
     Args:
         zip_path: Path to the SoccerNet calibration zip for one split.
@@ -609,14 +610,14 @@ def convert_soccernet_calibration_to_yolo_pose(
                     # Find the 4 cardinal points by position
                     sorted_pts = sorted(pts, key=lambda p: (p["x"], p["y"]))
                     if len(sorted_pts) >= 2:
-                        # left-most x → RF[30], right-most x → RF[31]
-                        accum[30].append((sorted_pts[0]["x"], sorted_pts[0]["y"]))
-                        accum[31].append((sorted_pts[-1]["x"], sorted_pts[-1]["y"]))
+                        # left-most x → RF[28], right-most x → RF[29]
+                        accum[28].append((sorted_pts[0]["x"], sorted_pts[0]["y"]))
+                        accum[29].append((sorted_pts[-1]["x"], sorted_pts[-1]["y"]))
                     by_y = sorted(pts, key=lambda p: p["y"])
                     if len(by_y) >= 2:
-                        # top-most y → RF[14], bottom-most y → RF[15]
-                        accum[14].append((by_y[0]["x"], by_y[0]["y"]))
-                        accum[15].append((by_y[-1]["x"], by_y[-1]["y"]))
+                        # top-most y → RF[13], bottom-most y → RF[14]
+                        accum[13].append((by_y[0]["x"], by_y[0]["y"]))
+                        accum[14].append((by_y[-1]["x"], by_y[-1]["y"]))
                     continue
 
                 # Non-circle: sort by (x, y) for canonical endpoint order
@@ -629,7 +630,7 @@ def convert_soccernet_calibration_to_yolo_pose(
                         accum[rf_idx].append((p["x"], p["y"]))
 
             # Average duplicates, build flat label
-            kp = np.zeros((32, 3), dtype=np.float32)  # (x, y, vis)
+            kp = np.zeros((30, 3), dtype=np.float32)  # (x, y, vis)
             for rf_idx, coords in accum.items():
                 xs = [c[0] for c in coords]
                 ys = [c[1] for c in coords]
@@ -641,9 +642,9 @@ def convert_soccernet_calibration_to_yolo_pose(
             if int(np.sum(kp[:, 2] > 0)) < min_keypoints:
                 continue
 
-            # YOLO-pose row: class cx cy w h  kp0x kp0y kp0v ... kp31x kp31y kp31v
+            # YOLO-pose row: class cx cy w h  kp0x kp0y kp0v ... kp29x kp29y kp29v
             row = [0, 0.5, 0.5, 1.0, 1.0]
-            for i in range(32):
+            for i in _ACTIVE_RF_KEYPOINTS:
                 row.extend([kp[i, 0], kp[i, 1], int(kp[i, 2])])
 
             with open(lbl_dir / f"{frame_id}.txt", "w") as lf:
@@ -745,8 +746,8 @@ def build_soccernet_keypoint_dataset(
         f"train: {train_key}",
         f"val: {val_key}",
         "",
-        f"kpt_shape: [32, 3]",
-        f"fliplr: 0.0",
+        f"kpt_shape: [{len(_ACTIVE_RF_KEYPOINTS)}, 3]",
+        f"flip_idx: {str(_RF_FLIP_IDX)}",
         "",
         "nc: 1",
         "names: ['pitch']",

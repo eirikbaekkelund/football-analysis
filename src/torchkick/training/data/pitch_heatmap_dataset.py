@@ -1,7 +1,7 @@
 """
 Pitch heatmap dataset for DINOv2-based keypoint detector training.
 
-Reads YOLO-pose format label files (32-keypoint Roboflow schema) and converts
+Reads YOLO-pose format label files (30-keypoint pitch schema) and converts
 them to Gaussian heatmap targets for heatmap regression training.
 
 Label format (one line per image):
@@ -28,51 +28,12 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-# ---------------------------------------------------------------------------
-# 32-keypoint Roboflow horizontal-flip permutation.
-# flip_idx[i] = j means "after H-flip, keypoint i should be at slot j".
-# Copied verbatim from train_yolo_detection.py:_RF_FLIP_IDX
-# ---------------------------------------------------------------------------
-_RF_FLIP_IDX: List[int] = [
-    24,
-    25,
-    26,
-    27,
-    28,
-    29,  # 0-5  → 24-29
-    22,
-    23,
-    21,  # 6-8  → 22, 23, 21
-    17,
-    18,
-    19,
-    20,  # 9-12 → 17-20
-    13,
-    14,
-    15,
-    16,  # 13-16 self (halfway + circle top/bottom)
-    9,
-    10,
-    11,
-    12,  # 17-20 → 9-12
-    8,  # 21   → 8
-    6,
-    7,  # 22-23 → 6-7
-    0,
-    1,
-    2,
-    3,
-    4,
-    5,  # 24-29 → 0-5
-    31,
-    30,  # 30-31 → 31, 30 (circle left ↔ right)
-]
-
 # ImageNet normalization (DINOv2 pretraining statistics)
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-NUM_KEYPOINTS = 32
+FULL_NUM_KEYPOINTS = 30
+NUM_KEYPOINTS = 30
 INPUT_SIZE = 560  # must be multiple of 14 (DINOv2 patch size)
 HEATMAP_SIZE = 320  # decoder output size (INPUT_SIZE / 8 * 4 = 560/14*8 ≈ 320)
 
@@ -96,17 +57,33 @@ def _parse_label_line(line: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         or None if the line is malformed.
     """
     parts = line.strip().split()
-    if len(parts) < 5 + NUM_KEYPOINTS * 3:
+    if len(parts) < 5:
         return None
 
     flat = list(map(float, parts[5:]))
+    kp_count = len(flat) // 3
+
+    # Support both legacy 32-kp labels and new 30-kp compressed labels.
     kp_xy = np.zeros((NUM_KEYPOINTS, 2), dtype=np.float32)
     kp_vis = np.zeros(NUM_KEYPOINTS, dtype=np.float32)
 
-    for i in range(NUM_KEYPOINTS):
-        x, y, v = flat[i * 3], flat[i * 3 + 1], flat[i * 3 + 2]
-        kp_xy[i] = [x, y]
-        kp_vis[i] = 1.0 if v > 0 else 0.0
+    if kp_count == 32:
+        # Legacy annotations had 32 points. We need to drop indices 8 and 21.
+        source_idx = 0
+        dest_idx = 0
+        for i in range(32):
+            x, y, v = flat[i * 3], flat[i * 3 + 1], flat[i * 3 + 2]
+            if i not in {8, 21}:
+                kp_xy[dest_idx] = [x, y]
+                kp_vis[dest_idx] = 1.0 if v > 0 else 0.0
+                dest_idx += 1
+    elif kp_count == NUM_KEYPOINTS:
+        for i in range(NUM_KEYPOINTS):
+            x, y, v = flat[i * 3], flat[i * 3 + 1], flat[i * 3 + 2]
+            kp_xy[i] = [x, y]
+            kp_vis[i] = 1.0 if v > 0 else 0.0
+    else:
+        return None
 
     return kp_xy, kp_vis
 
@@ -148,6 +125,7 @@ class PitchHeatmapDataset(Dataset):
         self.min_kp = min_keypoints
         self.input_size = input_size
         self.heatmap_size = heatmap_size
+        self.num_keypoints = NUM_KEYPOINTS
 
         root = Path(data_dir)
         img_dir = root / "images" / split
@@ -185,16 +163,29 @@ class PitchHeatmapDataset(Dataset):
             f"({skipped} skipped by min_keypoints filter)"
         )
 
-        # Photometric augmentation only — no geometric transforms
+        # Aggressive Photometric & Geometric Transform pipeline
         self._aug = A.Compose(
             [
+                # Geometric additions for perspective/zoom variance
+                A.Perspective(scale=(0.02, 0.1), p=0.3),
+                A.Affine(scale=(0.8, 1.2), translate_percent=(-0.1, 0.1), rotate=(0, 0), shear=(-10, 10), p=0.3),
+                # Synthetic occlusions (e.g. shadow blocks / people)
+                A.CoarseDropout(
+                    num_holes_range=(1, 4), hole_height_range=(0.05, 0.2), hole_width_range=(0.05, 0.2), p=0.3
+                ),
+                # Existing Photometric
                 A.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.08, p=0.7),
                 A.RandomGamma(gamma_limit=(75, 130), p=0.4),
                 A.GaussNoise(std_range=(0.02, 0.11), p=0.3),
                 A.MotionBlur(blur_limit=7, p=0.3),
                 A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
-            ]
+            ],
+            keypoint_params=A.KeypointParams(format="xy", remove_invisible=False),
         )
+
+    def set_sigma(self, new_sigma: float):
+        """Dynamic mutator to decay the Gaussian peak spread during later training epochs."""
+        self.sigma = new_sigma
 
     def __len__(self) -> int:
         return len(self._samples)
@@ -218,9 +209,20 @@ class PitchHeatmapDataset(Dataset):
         else:
             kp_xy, kp_vis = parsed
 
-        # --- photometric augmentation ---
+        # --- photometric & geometric augmentation ---
         if self.augment:
-            frame = self._aug(image=frame)["image"]
+            h, w = frame.shape[:2]
+            abs_kp = kp_xy * np.array([w, h], dtype=np.float32)
+
+            aug_res = self._aug(image=frame, keypoints=abs_kp)
+            frame = aug_res["image"]
+            new_kp = np.array(aug_res["keypoints"], dtype=np.float32)
+
+            if len(new_kp) > 0:
+                # Any point dragged off-screen by augmentations is masked out
+                out_of_bounds = (new_kp[:, 0] < 0) | (new_kp[:, 0] >= w) | (new_kp[:, 1] < 0) | (new_kp[:, 1] >= h)
+                kp_vis[out_of_bounds] = 0.0
+                kp_xy = new_kp / np.array([w, h], dtype=np.float32)
 
         # --- resize to model input size ---
         frame = cv2.resize(frame, (self.input_size, self.input_size), interpolation=cv2.INTER_LINEAR)
@@ -230,10 +232,12 @@ class PitchHeatmapDataset(Dataset):
         img_f = (img_f - _IMAGENET_MEAN) / _IMAGENET_STD
         img_t = torch.from_numpy(img_f.transpose(2, 0, 1))  # [3, H, W]
 
-        # --- build Gaussian heatmap targets ---
+        # --- build Gaussian heatmap targets and offset targets ---
         hm_size = self.heatmap_size
         sigma = self.sigma
         heatmaps = np.zeros((NUM_KEYPOINTS, hm_size, hm_size), dtype=np.float32)
+        offsets = np.zeros((NUM_KEYPOINTS * 2, hm_size, hm_size), dtype=np.float32)
+        offset_mask = np.zeros((NUM_KEYPOINTS * 2, hm_size, hm_size), dtype=np.float32)
 
         for i in range(NUM_KEYPOINTS):
             if kp_vis[i] < 0.5:
@@ -244,10 +248,24 @@ class PitchHeatmapDataset(Dataset):
             if not (0.0 <= cx < hm_size and 0.0 <= cy < hm_size):
                 kp_vis[i] = 0.0
                 continue
-            heatmaps[i] = _gaussian_heatmap(cx, cy, sigma, hm_size)
 
-        hm_t = torch.from_numpy(heatmaps)  # [32, H, W]
-        vis_t = torch.from_numpy(kp_vis)  # [32]
+            # Find integer centers
+            icx, icy = int(cx), int(cy)
+
+            # Heatmaps (must be centered on integers so peak is exactly 1.0)
+            heatmaps[i] = _gaussian_heatmap(icx, icy, sigma, hm_size)
+
+            # Offsets (cx - int(cx)) exactly at the integer center pixel
+            if 0 <= icx < hm_size and 0 <= icy < hm_size:
+                offsets[i * 2, icy, icx] = cx - icx
+                offsets[i * 2 + 1, icy, icx] = cy - icy
+                offset_mask[i * 2, icy, icx] = 1.0
+                offset_mask[i * 2 + 1, icy, icx] = 1.0
+
+        hm_t = torch.from_numpy(heatmaps)  # [30, H, W]
+        off_t = torch.from_numpy(offsets)  # [60, H, W]
+        off_mask_t = torch.from_numpy(offset_mask)  # [60, H, W]
+        vis_t = torch.from_numpy(kp_vis)  # [30]
         pitch_label = torch.tensor([1.0], dtype=torch.float32)  # always 1 after filter
 
-        return img_t, hm_t, vis_t, pitch_label
+        return img_t, hm_t, off_t, off_mask_t, vis_t, pitch_label

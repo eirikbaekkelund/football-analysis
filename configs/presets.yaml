@@ -1,0 +1,43 @@
+# Deployment presets for different use cases
+
+presets:
+  production_fast:
+    description: "ONNX FP16, aggressive batching, prefetch enabled"
+    backend: "onnx"
+    precision: "fp16"
+    batch_prefetch_enabled: true
+    prefetch_buffer_size: 30
+    pass_parallelization: true
+    homography_interval: 1
+    reid_interval: 5
+
+  quality:
+    description: "PyTorch FP32, conservative batching, best accuracy"
+    backend: "pytorch"
+    precision: "fp32"
+    batch_prefetch_enabled: false
+    prefetch_buffer_size: 10
+    pass_parallelization: false
+    homography_interval: 1
+    reid_interval: 3
+
+  demo:
+    description: "ONNX FP16 with max batch sizes, TensorRT if available"
+    backend: "onnx"
+    precision: "fp16"
+    batch_prefetch_enabled: true
+    prefetch_buffer_size: 60
+    pass_parallelization: true
+    homography_interval: 1
+    reid_interval: 10
+    tensorrt_enabled: true
+
+  edge:
+    description: "Minimal memory footprint, PyTorch FP32, single-threaded"
+    backend: "pytorch"
+    precision: "fp32"
+    batch_prefetch_enabled: false
+    prefetch_buffer_size: 5
+    pass_parallelization: false
+    homography_interval: 5
+    reid_interval: 10

@@ -90,14 +90,33 @@ class GameTeamEmbedder:
         if not valid:
             return {}
 
-        # Embed jersey region per crop, mean-pool per track
+        # Batch embed all jersey crops from all tracks in one call (aggressive batching)
         track_ids = list(valid.keys())
-        pooled = []
-        print(f"[TeamEmbedder] Embedding {len(track_ids)} tracks via SigLIP …", flush=True)
+        track_id_to_crops = {}
+        all_jersey_crops = []
+        crop_to_track_map = []
+
         for tid in track_ids:
             jersey_crops = [_jersey_crop(c) for c in valid[tid]]
-            embs = self.siglip.embed(jersey_crops)  # [N, 768]
-            pooled.append(embs.mean(axis=0))
+            track_id_to_crops[tid] = len(jersey_crops)
+            for crop in jersey_crops:
+                all_jersey_crops.append(crop)
+                crop_to_track_map.append(tid)
+
+        n_total_crops = len(all_jersey_crops)
+        print(f"[TeamEmbedder] Embedding {n_total_crops} crops from {len(track_ids)} tracks via SigLIP …", flush=True)
+
+        # Single GPU call: embed all crops together
+        all_embeddings = self.siglip.embed(all_jersey_crops)  # [N_total_crops, 768]
+
+        # Mean-pool per track
+        pooled = []
+        crop_idx = 0
+        for tid in track_ids:
+            n_crops = track_id_to_crops[tid]
+            track_embeddings = all_embeddings[crop_idx : crop_idx + n_crops]
+            pooled.append(track_embeddings.mean(axis=0))
+            crop_idx += n_crops
 
         X = np.stack(pooled)  # [N_tracks, 768]
 

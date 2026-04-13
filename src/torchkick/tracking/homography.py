@@ -102,12 +102,10 @@ PITCH_LINE_COORDINATES: Dict[str, List[Tuple[int, PitchPoint]]] = {
 PITCH_LINE_COORDINATES["Circle central"] = _get_circle_points(0, 0, CENTER_CIRCLE_RADIUS)
 
 
-# Roboflow 32-keypoint pitch layout (SoccerPitchConfiguration.vertices, 0-indexed).
+# 30-keypoint pitch layout (0-indexed).
 # Converted to center-origin meters to match the existing HomographyEstimator coordinate system
 # (x: -52.5 … +52.5 along length, y: -34 … +34 along width).
-# Source: https://github.com/roboflow/sports/blob/main/sports/configs/soccer.py
-# Roboflow raw dimensions: 12000cm × 7000cm, origin at top-left corner.
-# Conversion: x_center = x_raw/100 - 60, y_center = y_raw/100 - 35
+# Raw dimensions: 120m × 70m, origin at top-left corner.
 _RF_L = 120.0  # pitch length m
 _RF_W = 70.0  # pitch width m
 _RF_PBW = 41.0  # penalty box width m
@@ -121,9 +119,9 @@ _RF_HY = _RF_W / 2  # 35.0
 
 
 def _rf(x_raw: float, y_raw: float) -> Tuple[float, float]:
-    """Convert Roboflow corner-origin coords to center-origin meters.
+    """Convert corner-origin coords to center-origin meters.
 
-    Normalises from the Roboflow 120×70m template to the codebase-standard
+    Normalises from the 120×70m template to the codebase-standard
     105×68m coordinate system (HALF_LENGTH=52.5, HALF_WIDTH=34) so that
     pitch_viz renders correctly.
     """
@@ -132,7 +130,7 @@ def _rf(x_raw: float, y_raw: float) -> Tuple[float, float]:
     return (x_scaled, y_scaled)
 
 
-ROBOFLOW_VERTICES: List[Tuple[float, float]] = [
+VERTICES: List[Tuple[float, float]] = [
     _rf(0, 0),  # 0  top-left corner
     _rf(0, (_RF_W - _RF_PBW) / 2),  # 1  left penalty box top
     _rf(0, (_RF_W - _RF_GBW) / 2),  # 2  left goal box top
@@ -141,30 +139,28 @@ ROBOFLOW_VERTICES: List[Tuple[float, float]] = [
     _rf(0, _RF_W),  # 5  bottom-left corner
     _rf(_RF_GBD, (_RF_W - _RF_GBW) / 2),  # 6  left goal box front top
     _rf(_RF_GBD, (_RF_W + _RF_GBW) / 2),  # 7  left goal box front bottom
-    _rf(_RF_PS, _RF_HY),  # 8  left penalty spot
-    _rf(_RF_PBD, (_RF_W - _RF_PBW) / 2),  # 9  left penalty box front top
-    _rf(_RF_PBD, (_RF_W - _RF_GBW) / 2),  # 10 left penalty box inner top
-    _rf(_RF_PBD, (_RF_W + _RF_GBW) / 2),  # 11 left penalty box inner bottom
-    _rf(_RF_PBD, (_RF_W + _RF_PBW) / 2),  # 12 left penalty box front bottom
-    _rf(_RF_HX, 0),  # 13 halfway line top
-    _rf(_RF_HX, _RF_HY - _RF_CCR),  # 14 centre circle top
-    _rf(_RF_HX, _RF_HY + _RF_CCR),  # 15 centre circle bottom
-    _rf(_RF_HX, _RF_W),  # 16 halfway line bottom
-    _rf(_RF_L - _RF_PBD, (_RF_W - _RF_PBW) / 2),  # 17 right penalty box front top
-    _rf(_RF_L - _RF_PBD, (_RF_W - _RF_GBW) / 2),  # 18 right penalty box inner top
-    _rf(_RF_L - _RF_PBD, (_RF_W + _RF_GBW) / 2),  # 19 right penalty box inner bottom
-    _rf(_RF_L - _RF_PBD, (_RF_W + _RF_PBW) / 2),  # 20 right penalty box front bottom
-    _rf(_RF_L - _RF_PS, _RF_HY),  # 21 right penalty spot
-    _rf(_RF_L - _RF_GBD, (_RF_W - _RF_GBW) / 2),  # 22 right goal box front top
-    _rf(_RF_L - _RF_GBD, (_RF_W + _RF_GBW) / 2),  # 23 right goal box front bottom
-    _rf(_RF_L, 0),  # 24 top-right corner
-    _rf(_RF_L, (_RF_W - _RF_PBW) / 2),  # 25 right penalty box top
-    _rf(_RF_L, (_RF_W - _RF_GBW) / 2),  # 26 right goal box top
-    _rf(_RF_L, (_RF_W + _RF_GBW) / 2),  # 27 right goal box bottom
-    _rf(_RF_L, (_RF_W + _RF_PBW) / 2),  # 28 right penalty box bottom
-    _rf(_RF_L, _RF_W),  # 29 bottom-right corner
-    _rf(_RF_HX - _RF_CCR, _RF_HY),  # 30 centre circle left
-    _rf(_RF_HX + _RF_CCR, _RF_HY),  # 31 centre circle right
+    _rf(_RF_PBD, (_RF_W - _RF_PBW) / 2),  # 8  left penalty box front top
+    _rf(_RF_PBD, (_RF_W - _RF_GBW) / 2),  # 9  left penalty box inner top
+    _rf(_RF_PBD, (_RF_W + _RF_GBW) / 2),  # 10 left penalty box inner bottom
+    _rf(_RF_PBD, (_RF_W + _RF_PBW) / 2),  # 11 left penalty box front bottom
+    _rf(_RF_HX, 0),  # 12 halfway line top
+    _rf(_RF_HX, _RF_HY - _RF_CCR),  # 13 centre circle top
+    _rf(_RF_HX, _RF_HY + _RF_CCR),  # 14 centre circle bottom
+    _rf(_RF_HX, _RF_W),  # 15 halfway line bottom
+    _rf(_RF_L - _RF_PBD, (_RF_W - _RF_PBW) / 2),  # 16 right penalty box front top
+    _rf(_RF_L - _RF_PBD, (_RF_W - _RF_GBW) / 2),  # 17 right penalty box inner top
+    _rf(_RF_L - _RF_PBD, (_RF_W + _RF_GBW) / 2),  # 18 right penalty box inner bottom
+    _rf(_RF_L - _RF_PBD, (_RF_W + _RF_PBW) / 2),  # 19 right penalty box front bottom
+    _rf(_RF_L - _RF_GBD, (_RF_W - _RF_GBW) / 2),  # 20 right goal box front top
+    _rf(_RF_L - _RF_GBD, (_RF_W + _RF_GBW) / 2),  # 21 right goal box front bottom
+    _rf(_RF_L, 0),  # 22 top-right corner
+    _rf(_RF_L, (_RF_W - _RF_PBW) / 2),  # 23 right penalty box top
+    _rf(_RF_L, (_RF_W - _RF_GBW) / 2),  # 24 right goal box top
+    _rf(_RF_L, (_RF_W + _RF_GBW) / 2),  # 25 right goal box bottom
+    _rf(_RF_L, (_RF_W + _RF_PBW) / 2),  # 26 right penalty box bottom
+    _rf(_RF_L, _RF_W),  # 27 bottom-right corner
+    _rf(_RF_HX - _RF_CCR, _RF_HY),  # 28 centre circle left
+    _rf(_RF_HX + _RF_CCR, _RF_HY),  # 29 centre circle right
 ]
 
 
@@ -341,7 +337,7 @@ class CameraPoseKalmanFilter:
 HomographyKalmanFilter = CameraPoseKalmanFilter
 
 
-# Geometric consistency constraint pairs for the 32-keypoint Roboflow pitch schema.
+# Geometric consistency constraint pairs for the 30-keypoint pitch schema.
 #
 # Keypoint index reference:
 #  0=TL-corner  1=L-pen-top   2=L-goal-top   3=L-goal-bot   4=L-pen-bot
@@ -416,7 +412,7 @@ _VERT_PAIRS: List[Tuple[int, int]] = [
 ]
 
 
-# Priority-ordered keypoint indices for homography estimation (Roboflow 32-keypoint schema).
+# Priority-ordered keypoint indices for homography estimation (30-keypoint pitch schema).
 # Ordered by geometric spread value: corners first (maximum spread), then halfway,
 # then penalty spots, then centre circle, then penalty box corners.
 # Used to fill remaining slots after zone-guaranteed selection.
@@ -551,7 +547,7 @@ class KeypointTracker:
 
     def __init__(
         self,
-        num_keypoints: int = 32,
+        num_keypoints: int = 30,
         ema_alpha: float = 1.0,
         var_alpha: float = 0.1,
         max_gap_frames: int = 10,
@@ -687,8 +683,12 @@ class HomographyEstimator:
 
         # Temporal fallback — extended to 30 frames so Kalman prediction covers ~1 s at 30fps
         self.frames_since_valid: int = 0
-        self.max_fallback_frames: int = 30
+        self.max_fallback_frames: int = 60
         self.last_valid_H: Optional[np.ndarray] = None
+
+        # Optical flow tracking for robust left/right disambiguation
+        self.prev_gray: Optional[np.ndarray] = None
+        self.H_flow_pred: Optional[np.ndarray] = None
 
         # Camera-pose Kalman smoother (replaces EMA when use_kalman=True)
         self._kalman: Optional[CameraPoseKalmanFilter] = CameraPoseKalmanFilter() if use_kalman else None
@@ -742,6 +742,7 @@ class HomographyEstimator:
         visibility,
         confidence,
         image_size: Tuple[int, int],
+        frame: Optional[np.ndarray] = None,
     ) -> bool:
         """
         Estimate homography from detected keypoints.
@@ -755,12 +756,37 @@ class HomographyEstimator:
             visibility: Visibility scores matching keypoints shape.
             confidence: Per-class or per-keypoint confidence scores.
             image_size: (height, width) of source image.
+            frame: Optional [H, W, 3] RGB frame used to calculate optical flow for stabilizing camera left/right panning.
 
         Returns:
             True if homography was successfully computed.
         """
         h, w = image_size
         self._last_image_size = image_size
+
+        # --- OPTICAL FLOW PASS ---
+        # Update flow prediction _before_ falling back into keypoint parsing.
+        if frame is not None and self.last_valid_H is not None:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame.copy()
+            if self.prev_gray is not None:
+                p0 = cv2.goodFeaturesToTrack(self.prev_gray, maxCorners=200, qualityLevel=0.02, minDistance=30)
+                if p0 is not None and len(p0) > 10:
+                    p1, st, err = cv2.calcOpticalFlowPyrLK(self.prev_gray, gray, p0, None)
+                    if p1 is not None and len(p1[st == 1]) > 10:
+                        good_new = p1[st == 1]
+                        good_old = p0[st == 1]
+                        H_cam, mask = cv2.findHomography(good_old, good_new, cv2.RANSAC, 3.0)
+                        if H_cam is not None:
+                            # H_cam maps pixels from N-1 to N.
+                            # P_old = H_cam^-1 @ P_new
+                            # P_pitch = H_old @ P_old = H_old @ H_cam^-1 @ P_new
+                            try:
+                                inv_H_cam = np.linalg.inv(H_cam)
+                                self.H_flow_pred = self.last_valid_H @ inv_H_cam
+                                self.H_flow_pred /= self.H_flow_pred[2, 2] + 1e-8
+                            except np.linalg.LinAlgError:
+                                pass
+            self.prev_gray = gray
 
         if isinstance(keypoints, torch.Tensor):
             keypoints = keypoints.cpu().numpy()
@@ -779,26 +805,25 @@ class HomographyEstimator:
 
         if keypoints.ndim == 2:
             # Flat format: [N, 2] pixel coords, confidence [N]
-            # If N <= 32, use Roboflow vertex lookup directly (index → pitch coordinate).
-            # Roboflow dataset has 32 keypoints; older versions may have fewer (e.g. 29).
-            # Fall back to SoccerNet LINE_CLASSES mapping only when N > 32.
-            use_roboflow = len(keypoints) <= len(ROBOFLOW_VERTICES)
+            # If N <= 30, use vertex lookup directly (index → pitch coordinate).
+            # Fall back to SoccerNet LINE_CLASSES mapping only when N > 30.
+            use_vertex_lookup = len(keypoints) <= len(VERTICES)
 
-            if use_roboflow:
+            if use_vertex_lookup:
                 # Use all keypoints above confidence threshold — RANSAC handles
                 # outlier rejection, so more points = better constraints.
                 # No cap: letting RANSAC work on the full above-threshold set
                 # is strictly better than pre-selecting a subset.
                 n = len(keypoints)
                 selected_indices: set = set()
-                for i in range(min(n, len(ROBOFLOW_VERTICES))):
+                for i in range(min(n, len(VERTICES))):
                     if confidence[i] < self.confidence_threshold:
                         continue
                     img_x, img_y = keypoints[i]
                     if img_x < 0 or img_x > w or img_y < 0 or img_y > h:
                         continue
                     selected_indices.add(i)
-                    px, py = ROBOFLOW_VERTICES[i]
+                    px, py = VERTICES[i]
                     src_points.append([float(img_x), float(img_y)])
                     dst_points.append([px, py])
                 self.selected_indices = frozenset(selected_indices)
@@ -876,6 +901,23 @@ class HomographyEstimator:
             self._matched_src = src_points[self.inliers]
             self._matched_dst = dst_points[self.inliers]
 
+        # Left/Right ambiguity correction via Optical Flow tracking
+        if self.H is not None and self.H_flow_pred is not None:
+            # Check where the image center projects on the pitch
+            center_h = np.array([[w / 2.0, h / 2.0, 1.0]], dtype=float).T
+
+            p_vit = self.H @ center_h
+            p_vit = p_vit / (p_vit[2] + 1e-8)
+
+            p_flow = self.H_flow_pred @ center_h
+            p_flow = p_flow / (p_flow[2] + 1e-8)
+
+            # If the x-coordinates have opposite signs and are far apart, it's likely a ViT left/right mistake
+            if p_vit[0, 0] * p_flow[0, 0] < 0 and abs(p_vit[0, 0] - p_flow[0, 0]) > 20.0:
+                # Reject the ViT's homography, force fallback to flow prediction
+                self.H = None
+                self.num_inliers = 0
+
         # Compute mean reprojection error on inliers (pitch metres)
         if self.H is not None and self._matched_src is not None and len(self._matched_src) > 0:
             proj = cv2.perspectiveTransform(self._matched_src.reshape(-1, 1, 2), self.H).reshape(-1, 2)
@@ -885,6 +927,17 @@ class HomographyEstimator:
 
         if self.H is None or self.num_inliers < self.min_inliers:
             self.frames_since_valid += 1
+
+            # OPTICAL FLOW OVERRIDE priority - if flow prediction is valid, use it for seamless tracking
+            if self.H_flow_pred is not None and self.last_valid_H is not None:
+                self.H_smoothed = self.H_flow_pred
+                self.last_valid_H = self.H_smoothed.copy()
+                try:
+                    self.H_inv = np.linalg.inv(self.H_smoothed)
+                except np.linalg.LinAlgError:
+                    self.H_inv = None
+                return True
+
             if self.last_valid_H is not None and self.frames_since_valid <= self.max_fallback_frames:
                 # Use Kalman prediction if available
                 if self._kalman is not None:

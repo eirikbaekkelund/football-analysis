@@ -5,12 +5,13 @@ services:
       - "8080:8080"
     volumes:
       - ./uploads:/app/uploads      # uploaded videos persist across restarts
-      - ./weights:/app/weights      # mount pre-trained model weights here
+      - ./models:/app/models        # mount local trained models here
+      - ./weights:/app/weights      # fallback alternative mount
       - ./exports:/app/exports      # exported annotation zips land here
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      - PLAYER_WEIGHTS=/app/weights/player.pt
-      - PITCH_WEIGHTS=/app/weights/pitch.pt
+      - PLAYER_WEIGHTS=/app/models/players/yolo11l.onnx
+      - PITCH_WEIGHTS=/app/models/keypoints/heatmap.onnx
       - DEVICE=cuda
       - UPLOAD_DIR=/app/uploads
     deploy:

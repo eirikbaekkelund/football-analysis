@@ -1,0 +1,54 @@
+# Model registry for inference configuration
+
+models:
+  yolo_detection:
+    name: "YOLO11l Player Detection"
+    pytorch_path: "weights/yolo11l_football/best.pt"
+    onnx_path: "weights/yolo11l_football/best_fp16.onnx"
+    input_shape: [640, 640]
+    batch_sizes:
+      8gb: 8
+      16gb: 16
+      24gb: 24
+      40gb: 32
+      80gb: 48
+    default_precision: "fp16"
+
+  pitch_keypoints:
+    name: "DINOv2 Pitch Keypoint Detector"
+    pytorch_path: "weights/keypoints/best.pt"
+    onnx_path: "weights/keypoints/best_fp16.onnx"
+    input_shape: [512, 512]
+    batch_sizes:
+      8gb: 4
+      16gb: 8
+      24gb: 12
+      40gb: 16
+      80gb: 24
+    default_precision: "fp16"
+
+  siglip_embedder:
+    name: "SigLIP Vision Encoder (Team Classification)"
+    pytorch_path: null
+    onnx_path: "weights/siglip_fp16.onnx"
+    input_shape: [384, 384]
+    batch_sizes:
+      8gb: 128
+      16gb: 256
+      24gb: 384
+      40gb: 512
+      80gb: 1024
+    default_precision: "fp16"
+
+  reid_embedder:
+    name: "DINOv2-L14 ReID (with LoRA)"
+    pytorch_path: "weights/reid/best.pt"
+    onnx_path: "weights/reid/best_fp16.onnx"
+    input_shape: [224, 224]
+    batch_sizes:
+      8gb: 96
+      16gb: 192
+      24gb: 256
+      40gb: 384
+      80gb: 512
+    default_precision: "fp16"

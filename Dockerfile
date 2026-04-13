@@ -14,12 +14,15 @@ WORKDIR /app
 
 # Copy project files
 COPY pyproject.toml ./
+COPY README.md ./
 COPY src/ ./src/
 COPY annotation_tool/ ./annotation_tool/
 
 # Install torchkick + annotation + model deps
 # PyTorch CUDA index is already declared in pyproject.toml [tool.uv]
-RUN uv pip install --system -e ".[annotation,training,reid]"
+RUN uv pip install --system -e ".[annotation,training,reid,onnx]"
+# cache installations
+RUN uv pip cache purge
 
 EXPOSE 8080
 

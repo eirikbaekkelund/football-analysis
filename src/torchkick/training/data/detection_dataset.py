@@ -1,7 +1,7 @@
 """
 Mixed detection dataset for RT-DETR-X training.
 
-Merges SoccerNet tracking data, Roboflow football datasets, and CVAT exports
+Merges SoccerNet tracking data, COCO-format datasets, and CVAT exports
 into a unified COCO-format PyTorch Dataset. Supports mosaic augmentation
 (4-image mosaic following YOLOv5 strategy) via albumentations.
 
@@ -12,8 +12,8 @@ Sources supported:
 Example:
     >>> sources = [
     ...     {"type": "soccernet_zip", "path": "data/soccernet/tracking/train.zip"},
-    ...     {"type": "coco_json", "path": "data/roboflow/annotations.json",
-    ...      "images_dir": "data/roboflow/images/"},
+    ...     {"type": "coco_json", "path": "data/custom/annotations.json",
+    ...      "images_dir": "data/custom/images/"},
     ... ]
     >>> dataset = MixedDetectionDataset(sources, augment=True, input_size=640)
     >>> img, targets = dataset[0]
@@ -248,7 +248,7 @@ class MixedDetectionDataset(Dataset):
     """
     Multi-source detection dataset for RT-DETR-X training.
 
-    Merges SoccerNet tracking, Roboflow COCO exports, and CVAT exports
+    Merges SoccerNet tracking, COCO exports, and CVAT exports
     into a unified interface returning (image_tensor, targets) pairs.
 
     Args:

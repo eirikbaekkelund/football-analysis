@@ -50,9 +50,27 @@ def _prepare_dataset(data_dir: Path, out_dir: Path, val_frac: float = 0.15) -> t
 
     Returns (detection_dir, keypoints_dir).
     """
-    images = sorted((data_dir / "images").glob("*.jpg"))
-    player_lbls = {p.stem: p for p in (data_dir / "players").glob("*.txt")}
-    kp_lbls = {p.stem: p for p in (data_dir / "keypoints").glob("*.txt")}
+    subdirs = []
+    if (data_dir / "images").exists() and (data_dir / "players").exists() and (data_dir / "keypoints").exists():
+        subdirs.append(data_dir)
+    else:
+        for d in data_dir.iterdir():
+            if d.is_dir() and (d / "images").exists() and (d / "players").exists() and (d / "keypoints").exists():
+                subdirs.append(d)
+
+    if not subdirs:
+        raise RuntimeError(f"No valid annotation folders found in {data_dir}")
+
+    images = []
+    player_lbls = {}
+    kp_lbls = {}
+
+    for d in subdirs:
+        images.extend(d.glob("images/*.jpg"))
+        for p in d.glob("players/*.txt"):
+            player_lbls[p.stem] = p
+        for p in d.glob("keypoints/*.txt"):
+            kp_lbls[p.stem] = p
 
     # Only keep frames that have both label files
     stems = sorted(s for s in [p.stem for p in images] if s in player_lbls and s in kp_lbls)
@@ -82,14 +100,18 @@ def _prepare_dataset(data_dir: Path, out_dir: Path, val_frac: float = 0.15) -> t
     return out_dir / "detection", out_dir / "keypoints"
 
 
-def _write_yolo_yaml(detection_dir: Path) -> Path:
+def _write_yolo_yaml(detection_dir: Path, weights: str) -> Path:
+    from ultralytics import YOLO
+
+    model = YOLO(weights)
+    names = model.names  # e.g. {0: 'player'} or {0: 'player', 1: 'goalkeeper', ...}
     yaml_path = detection_dir / "data.yaml"
     yaml_path.write_text(
         f"path: {detection_dir.resolve()}\n"
         "train: images/train\n"
         "val:   images/valid\n"
-        "nc: 4\n"
-        "names: ['player', 'goalkeeper', 'referee', 'ball']\n"
+        f"nc: {len(names)}\n"
+        f"names: {list(names.values())}\n"
     )
     return yaml_path
 
@@ -100,7 +122,7 @@ def finetune_detection(detection_dir: Path, weights: str, epochs: int, batch: in
     print(f"  data    : {detection_dir}")
     print(f"  epochs  : {epochs}  batch: {batch}")
 
-    yaml = _write_yolo_yaml(detection_dir)
+    yaml = _write_yolo_yaml(detection_dir, weights)
 
     from ultralytics import YOLO
 
@@ -126,11 +148,11 @@ def finetune_detection(detection_dir: Path, weights: str, epochs: int, batch: in
     return best
 
 
-def finetune_keypoints(keypoints_dir: Path, weights: str, epochs: int, batch: int) -> Path:
+def finetune_keypoints(keypoints_dir: Path, weights: str, epochs: int, batch: int, lr: float) -> Path:
     print(f"\n--- Fine-tuning pitch keypoint detector ---")
     print(f"  weights : {weights}")
     print(f"  data    : {keypoints_dir}")
-    print(f"  epochs  : {epochs}  batch: {batch}")
+    print(f"  epochs  : {epochs}  batch: {batch}  lr: {lr}")
 
     from torchkick.training import train_pitch_heatmap
 
@@ -139,6 +161,7 @@ def finetune_keypoints(keypoints_dir: Path, weights: str, epochs: int, batch: in
         base_model=weights,
         epochs=epochs,
         batch_size=batch,
+        learning_rate=lr,
         min_keypoints=3,  # relaxed — small dataset may have partial views
         compile_model=False,  # skip compile for quick sanity runs
         save_dir=str(_ROOT / "models" / "keypoints" / "finetune"),
@@ -163,6 +186,7 @@ def main() -> None:
     )
     parser.add_argument("--epochs", type=int, default=20, help="Fine-tuning epochs (default 20)")
     parser.add_argument("--batch", type=int, default=4, help="Batch size (default 4 — safe for small datasets)")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate for keypoints (default 1e-3)")
     parser.add_argument("--val-frac", type=float, default=0.15, help="Fraction of data to use for validation")
     parser.add_argument(
         "--out-dir",
@@ -191,7 +215,7 @@ def main() -> None:
         finetune_detection(detection_dir, args.player_weights, args.epochs, args.batch)
 
     if not args.detection_only:
-        finetune_keypoints(keypoints_dir, args.pitch_weights, args.epochs, args.batch)
+        finetune_keypoints(keypoints_dir, args.pitch_weights, args.epochs, args.batch, args.lr)
 
     print("\nAll done.")
 

@@ -94,7 +94,8 @@ class PlayerDetector:
             from ultralytics import YOLO
 
             self.model = YOLO(str(weights_path))
-            self.model.to(device)
+            if str(weights_path).endswith(".pt"):
+                self.model.to(device)
         except ImportError:
             raise ImportError("ultralytics package required. Install with: pip install ultralytics")
 

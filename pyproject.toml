@@ -44,6 +44,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+onnx = [
+    "onnx>=1.14.0",
+    "onnxruntime-gpu>=1.16.0",
+    "onnxscript>=0.6.2",
+]
 soccernet = [
     "SoccerNet>=0.1.0",
 ]
@@ -53,9 +58,6 @@ tracking = [
 reid = [
     "transformers>=4.46.0",
     "peft>=0.13.0",
-]
-roboflow = [
-    "roboflow>=1.0.0",
 ]
 annotation = [
     "fastapi>=0.110.0",
@@ -77,7 +79,7 @@ dev = [
     "ruff>=0.1.0",
 ]
 all = [
-    "torchkick[annotation,soccernet,tracking,reid,roboflow,training,dev]",
+    "torchkick[annotation,onnx,soccernet,tracking,reid,training,dev]",
 ]
 
 [project.scripts]

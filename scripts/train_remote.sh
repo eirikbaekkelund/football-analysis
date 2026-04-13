@@ -6,7 +6,6 @@
 #   bash scripts/train_remote.sh [OPTIONS]
 #
 # Options:
-#   --roboflow-only     Skip SoccerNet downloads (no SoccerNet account needed)
 #   --skip-detection    Skip player detector training
 #   --skip-keypoints    Skip pitch keypoint training
 #   --skip-reid         Skip ReID training (requires --reid-crops-dir)
@@ -19,8 +18,8 @@
 #   --batch             Batch size for detection/keypoint training (default 32)
 #
 # What it trains:
-#   1. Player detector  (YOLO11n on Roboflow players dataset)
-#   2. Pitch keypoints  (YOLO11n-pose on Roboflow field dataset)
+#   1. Player detector  (YOLO11n on SoccerNet data)
+#   2. Pitch keypoints  (DINOv2 heatmap on SoccerNet calibration data)
 #   3. ReID embedder    (DINOv2+LoRA+ArcFace — only if --reid-crops-dir given)
 #   4. ReID distillation → ViT-S student for real-time inference
 #
@@ -36,7 +35,6 @@ REPO_DIR="$WORKSPACE/torchkick"
 LOG_FILE="$WORKSPACE/torchkick_train.log"
 
 # Defaults
-ROBOFLOW_ONLY=0
 SKIP_DETECTION=0
 SKIP_KEYPOINTS=0
 SKIP_REID=1          # off by default — needs crops
@@ -50,7 +48,6 @@ BATCH=32
 # Parse flags
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --roboflow-only)   ROBOFLOW_ONLY=1 ;;
         --skip-detection)  SKIP_DETECTION=1 ;;
         --skip-keypoints)  SKIP_KEYPOINTS=1 ;;
         --skip-reid)       SKIP_REID=1 ;;
@@ -111,85 +108,45 @@ else
 fi
 cd "$REPO_DIR"
 
-# Copy .env if it doesn't exist on the remote (ROBOFLOW_API_KEY must be set)
-if [ ! -f ".env" ] && [ -n "${ROBOFLOW_API_KEY:-}" ]; then
-    echo "ROBOFLOW_API_KEY=$ROBOFLOW_API_KEY" > .env
-    ok ".env written from environment"
-fi
-
-if [ ! -f ".env" ]; then
-    echo "ERROR: .env not found and ROBOFLOW_API_KEY not set in environment."
-    echo "Either scp your .env to $REPO_DIR/.env or export ROBOFLOW_API_KEY=<key>"
-    exit 1
-fi
-
 # ── 2. Install ───────────────────────────────────────────────────────────────
 log "Installing torchkick"
 pip install -q uv
-uv pip install --system -e ".[reid,training]" \
+uv pip install --system -e ".[soccernet,reid,training]" \
     --extra-index-url https://download.pytorch.org/whl/cu128 \
     --index-strategy unsafe-best-match
-# roboflow installed separately — its idna pin conflicts with the PyTorch index
-pip install -q roboflow
 ok "torchkick installed"
 
 # ── 3. Download datasets ─────────────────────────────────────────────────────
-log "Downloading Roboflow datasets"
-torchkick dataset -d roboflow-players -o data/roboflow/players/
-ok "Roboflow player detection dataset ready"
-
-torchkick dataset -d roboflow-field -o data/roboflow/field/
-ok "Roboflow field keypoints dataset ready"
-
-if [ "$ROBOFLOW_ONLY" -eq 0 ]; then
-    log "Downloading SoccerNet datasets (requires SoccerNet account)"
-    # train split only — test adds ~8 GB not needed for training; 2023 edition skipped by default
-    torchkick dataset -d tracking    -o data/soccernet/ --splits train
-    torchkick dataset -d calibration -o data/soccernet/ --splits train
-    ok "SoccerNet datasets ready"
-fi
+log "Downloading SoccerNet datasets (requires SoccerNet account)"
+# train split only — test adds ~8 GB not needed for training; 2023 edition skipped by default
+torchkick dataset -d tracking    -o data/soccernet/ --splits train
+torchkick dataset -d calibration -o data/soccernet/ --splits train
+ok "SoccerNet datasets ready"
 
 # ── 4. Train player detector ─────────────────────────────────────────────────
 if [ "$SKIP_DETECTION" -eq 0 ]; then
     log "Training player detector (YOLO11n)"
+    SOCCERNET_TRACKING_ZIP="data/soccernet/tracking/tracking/train.zip"
     torchkick train yolo \
-        --data   data/roboflow/players/ \
+        --data   "$SOCCERNET_TRACKING_ZIP" \
         --epochs "$EPOCHS_DETECTION" \
         --batch-size "$BATCH" \
         --base-model yolo11n.pt
-
-    # If SoccerNet data is also available, train a combined model
-    # SDK saves to data/soccernet/tracking/tracking/train.zip (nested by task name)
-    SOCCERNET_TRACKING_ZIP="data/soccernet/tracking/tracking/train.zip"
-    if [ "$ROBOFLOW_ONLY" -eq 0 ] && [ -f "$SOCCERNET_TRACKING_ZIP" ]; then
-        log "Training combined detector (Roboflow + SoccerNet)"
-        torchkick train detection \
-            --soccernet "$SOCCERNET_TRACKING_ZIP" \
-            --roboflow-json data/roboflow/players/train/_annotations.coco.json \
-            --roboflow-images data/roboflow/players/train/ \
-            --epochs "$EPOCHS_DETECTION" \
-            --save-dir weights/detection_combined/
-        ok "Combined RT-DETR detector trained"
-    fi
 fi
 
 # ── 5. Train pitch keypoints ─────────────────────────────────────────────────
 if [ "$SKIP_KEYPOINTS" -eq 0 ]; then
-    log "Training YOLO-pose pitch keypoints"
-    torchkick train yolo-keypoints \
-        --data   data/roboflow/field/data.yaml \
-        --epochs "$EPOCHS_KEYPOINTS" \
-        --save-dir weights/keypoints_yolo/
-
     # SDK saves to data/soccernet/calibration/calibration/train.zip
     SOCCERNET_CALIB_ZIP="data/soccernet/calibration/calibration/train.zip"
-    if [ "$ROBOFLOW_ONLY" -eq 0 ] && [ -f "$SOCCERNET_CALIB_ZIP" ]; then
-        log "Training ViTPose pitch keypoints (SoccerNet)"
-        torchkick train keypoints \
-            --data "$SOCCERNET_CALIB_ZIP" \
+    if [ -f "$SOCCERNET_CALIB_ZIP" ]; then
+        log "Training DINOv2 heatmap pitch keypoints (SoccerNet)"
+        torchkick train pitch-heatmap \
+            --soccernet-calibration-dir data/soccernet/calibration/ \
             --epochs "$EPOCHS_KEYPOINTS" \
-            --save-dir weights/keypoints_vitpose/
-        ok "ViTPose keypoints trained"
+            --batch-size "$BATCH"
+        ok "Pitch keypoints trained"
+    else
+        echo "WARNING: SoccerNet calibration data not found, skipping keypoint training."
     fi
 fi
 
@@ -226,23 +183,17 @@ if [ -n "$YOLO_BEST" ]; then
     ok "Player detector: weights_export/player_detector_yolo.pt"
 fi
 
-# Pitch keypoints (YOLO-pose)
-KP_BEST=$(find weights/keypoints_yolo/ -name "best.pt" 2>/dev/null | head -1)
+# Pitch keypoints
+KP_BEST=$(find weights/pitch_heatmap/ -name "best.pt" 2>/dev/null | head -1)
 if [ -n "$KP_BEST" ]; then
-    cp "$KP_BEST" weights_export/pitch_keypoints_yolo.pt
-    ok "Pitch keypoints: weights_export/pitch_keypoints_yolo.pt"
+    cp "$KP_BEST" weights_export/pitch_keypoints_heatmap.pt
+    ok "Pitch keypoints: weights_export/pitch_keypoints_heatmap.pt"
 fi
 
 # ViTPose (if trained)
 if [ -f "weights/keypoints_vitpose/vitpose_best.pth" ]; then
     cp weights/keypoints_vitpose/vitpose_best.pth weights_export/pitch_keypoints_vitpose.pth
     ok "ViTPose keypoints: weights_export/pitch_keypoints_vitpose.pth"
-fi
-
-# RT-DETR combined (if trained)
-if [ -f "weights/detection_combined/rtdetr_best.pth" ]; then
-    cp weights/detection_combined/rtdetr_best.pth weights_export/player_detector_rtdetr.pth
-    ok "RT-DETR detector: weights_export/player_detector_rtdetr.pth"
 fi
 
 # ReID student (if trained)

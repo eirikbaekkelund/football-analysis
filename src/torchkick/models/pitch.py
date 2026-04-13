@@ -2,9 +2,9 @@
 Pitch keypoint detection models.
 
 HeatmapPitchDetector uses a DINOv2 ViT-S/14 backbone with a CNN heatmap
-decoder to detect 32 pitch landmark keypoints (Roboflow schema) and a
-broadcast-view confidence score, used to compute the pitch-to-image
-homography via HomographyEstimator.
+decoder to detect 30 pitch landmark keypoints and a broadcast-view
+confidence score, used to compute the pitch-to-image homography via
+HomographyEstimator.
 
 Example:
     >>> from torchkick.models.pitch import HeatmapPitchDetector
@@ -16,7 +16,7 @@ Example:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Tuple, Union
 
 import cv2
 import numpy as np
@@ -34,16 +34,16 @@ class DINOv2PitchModel(torch.nn.Module):
 
     Args:
         backbone_name: DINOv2 hub model name ("dinov2_vits14" or "dinov2_vitb14").
-        num_keypoints: Number of output heatmap channels (default 32).
+        num_keypoints: Number of output heatmap channels (default 30).
 
     Input:  [B, 3, 560, 560]  (ImageNet-normalised RGB)
-    Output: (logits [B, 32, 320, 320],  pitch_logit [B, 1])
+    Output: (logits [B, 30, 320, 320],  pitch_logit [B, 1])
     """
 
     def __init__(
         self,
         backbone_name: str = "dinov2_vits14",
-        num_keypoints: int = 32,
+        num_keypoints: int = 30,
     ) -> None:
         super().__init__()
         self.num_keypoints = num_keypoints
@@ -81,13 +81,21 @@ class DINOv2PitchModel(torch.nn.Module):
             # stage 3: 160×160 → 320×320
             _block(128, 64),
             torch.nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-            # 1×1 projection to keypoint channels (no activation — raw logits)
-            torch.nn.Conv2d(64, num_keypoints, 1),
         )
+
+        # 1×1 projection to keypoint channels (no activation — raw logits)
+        self.heatmap_head = torch.nn.Conv2d(64, num_keypoints, 1)
+        torch.nn.init.constant_(
+            self.heatmap_head.bias, -4.595
+        )  # CenterNet-style bias initialization to prevent initial 20000+ focal loss jump
+
+        # 1x1 projection to (X, Y) sub-pixel offsets (range approx [-0.5, 0.5])
+        self.offset_head = torch.nn.Conv2d(64, num_keypoints * 2, 1)
+        torch.nn.init.constant_(self.offset_head.bias, 0.0)
 
         torch.nn.init.constant_(self.pitch_head.bias, 2.0)  # prior: most frames are broadcast
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             x: [B, 3, H, W]
@@ -107,9 +115,12 @@ class DINOv2PitchModel(torch.nn.Module):
         grid_size = int(n_patches**0.5)
         spatial = patch_tokens.permute(0, 2, 1).reshape(B, -1, grid_size, grid_size)
 
-        logits = self.decoder(spatial)  # [B, 32, 320, 320]
+        decoded = self.decoder(spatial)
+        hm_logits = self.heatmap_head(decoded)  # [B, 30, 320, 320]
+        offset_logits = self.offset_head(decoded)  # [B, 60, 320, 320]
+
         pitch_logit = self.pitch_head(cls_token)  # [B, 1]
-        return logits, pitch_logit
+        return hm_logits, offset_logits, pitch_logit
 
 
 class HeatmapPitchDetector:
@@ -118,9 +129,9 @@ class HeatmapPitchDetector:
 
     Drop-in replacement for YOLOPoseKeypointDetector — same detect() interface.
 
-    Detects 32 pitch keypoints (Roboflow schema) and a broadcast-view
-    confidence score.  If the frame is not a broadcast view (pitch_conf < 0.5)
-    empty arrays are returned immediately so the caller can skip homography.
+    Detects 30 pitch keypoints and a broadcast-view confidence score.
+    If the frame is not a broadcast view (pitch_conf < 0.5) empty arrays
+    are returned immediately so the caller can skip homography.
 
     Args:
         weights_path:      Path to .pt checkpoint saved by train_pitch_heatmap.
@@ -132,10 +143,10 @@ class HeatmapPitchDetector:
     Example:
         >>> detector = HeatmapPitchDetector("weights/pitch_heatmap/best.pt")
         >>> keypoints, confidence = detector.detect(frame)
-        >>> # keypoints: np.ndarray [32, 2], confidence: np.ndarray [32]
+        >>> # keypoints: np.ndarray [30, 2], confidence: np.ndarray [30]
     """
 
-    NUM_KEYPOINTS = 32
+    NUM_KEYPOINTS = 30
     INPUT_SIZE = 560
     HEATMAP_SIZE = 320
     _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -145,15 +156,23 @@ class HeatmapPitchDetector:
         self,
         weights_path: Union[str, Path],
         device: str = "cuda",
-        conf_threshold: float = 0.3,
-        pitch_threshold: float = 0.5,
-        use_fp16: bool = True,
+        conf_threshold: float = 0.5,
+        pitch_threshold: float = 0.65,
+        precision: str = "auto",
     ) -> None:
+        from torchkick.utils.precision import PrecisionManager
+
         self.device = torch.device(device)
         self.conf_threshold = conf_threshold
         self.pitch_threshold = pitch_threshold
-        self.use_fp16 = use_fp16 and "cuda" in str(device)
-        self._model: Optional[DINOv2PitchModel] = None
+
+        # Auto-detect FP16 support
+        if precision == "auto":
+            precision = PrecisionManager.get_optimal_precision(device)
+        self.precision = precision
+        self.use_fp16 = precision == "fp16"
+        self._model = None
+        self._session = None  # ONNX session
         self._load_model(str(weights_path))
 
     @property
@@ -162,6 +181,16 @@ class HeatmapPitchDetector:
         return self._model.backbone if self._model is not None else None
 
     def _load_model(self, weights_path: str) -> None:
+        if weights_path.endswith(".onnx"):
+            import onnxruntime as ort
+
+            providers = ["CUDAExecutionProvider"] if "cuda" in str(self.device).lower() else ["CPUExecutionProvider"]
+            self._session = ort.InferenceSession(weights_path, providers=providers)
+            # Cannot infer backbone or num keypoints from compiled ONNX
+            # Default to 30 for production since that's what we trained.
+            self.NUM_KEYPOINTS = 30
+            return
+
         ckpt = torch.load(weights_path, map_location=self.device, weights_only=False)
         cfg = ckpt.get("config", {})
         backbone = cfg.get("backbone_variant", "dinov2_vits14")
@@ -220,13 +249,22 @@ class HeatmapPitchDetector:
             np.zeros((self.NUM_KEYPOINTS, 2), dtype=np.float32),
             np.zeros(self.NUM_KEYPOINTS, dtype=np.float32),
         )
-        if self._model is None:
+        if self._model is None and self._session is None:
             return empty
 
         h_orig, w_orig = frame.shape[:2]
         inp = self._preprocess(frame)
 
-        logits, pitch_logit = self._model(inp)
+        # Run model inference
+        if self._session is not None:
+            input_name = self._session.get_inputs()[0].name
+            inp_np = inp.cpu().numpy()
+            out_np = self._session.run(None, {input_name: inp_np})
+            hm_logits = torch.from_numpy(out_np[0])
+            offset_logits = torch.from_numpy(out_np[1])
+            pitch_logit = torch.from_numpy(out_np[2])
+        else:
+            hm_logits, offset_logits, pitch_logit = self._model(inp)
 
         # --- pitch-presence gate ---
         pitch_conf = float(torch.sigmoid(pitch_logit[0, 0]).cpu())
@@ -234,7 +272,9 @@ class HeatmapPitchDetector:
             return empty
 
         # --- decode heatmaps ---
-        heatmaps = torch.sigmoid(logits[0]).float().cpu().numpy()  # [32, 320, 320]
+        heatmaps = torch.sigmoid(hm_logits[0]).float().cpu().numpy()  # [30, 320, 320]
+        offsets = offset_logits[0].float().cpu().numpy()  # [60, 320, 320]
+
         hm_w = hm_h = self.HEATMAP_SIZE
 
         kps = np.zeros((self.NUM_KEYPOINTS, 2), dtype=np.float32)
@@ -245,10 +285,21 @@ class HeatmapPitchDetector:
             peak = float(hm.max())
             if peak < self.conf_threshold:
                 continue
-            hx, hy = self._subpixel_argmax(hm)
+
+            # Get integer argmax
+            idx = np.argmax(hm)
+            hy, hx = np.unravel_index(idx, hm.shape)
+
+            # Refine with subpixel offsets predicted by offset head
+            dx = offsets[k * 2, hy, hx]
+            dy = offsets[(k * 2) + 1, hy, hx]
+
+            hx_refined = float(hx) + dx
+            hy_refined = float(hy) + dy
+
             # scale from heatmap space to original image space
-            kps[k, 0] = (hx + 0.5) / hm_w * w_orig
-            kps[k, 1] = (hy + 0.5) / hm_h * h_orig
+            kps[k, 0] = (hx_refined + 0.5) / hm_w * w_orig
+            kps[k, 1] = (hy_refined + 0.5) / hm_h * h_orig
             conf[k] = peak
 
         return kps, conf

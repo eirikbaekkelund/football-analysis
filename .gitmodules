@@ -1,3 +1,0 @@
-[submodule "src/torchkick/sam3_models/external/sam3"]
-	path = src/torchkick/sam3_models/external/sam3
-	url = https://github.com/facebookresearch/sam3.git

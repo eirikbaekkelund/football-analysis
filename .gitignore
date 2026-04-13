@@ -17,6 +17,8 @@ yolo_dataset/
 SV_*
 *.csv
 *.jpg
+*.png
+args.yaml
 *.json
 *.jpeg
 logs/
@@ -24,3 +26,5 @@ logs/
 *.gz
 *.safetensors
 *.mov
+finetune/run/*
+uv.lock

@@ -255,12 +255,19 @@ class DINOv2ReIDEmbedder:
         model_name: str = "facebook/dinov2-small",
         device: str = "cuda",
         batch_size: int = 32,
-        use_fp16: bool = True,
+        precision: str = "auto",
         num_classes: int = 3,
     ) -> None:
+        from torchkick.utils.precision import PrecisionManager
+
         self.device = torch.device(device)
         self.batch_size = batch_size
-        self.use_fp16 = use_fp16 and "cuda" in device
+
+        # Auto-detect FP16 support
+        if precision == "auto":
+            precision = PrecisionManager.get_optimal_precision(device)
+        self.precision = precision
+        self.use_fp16 = precision == "fp16"
         self.num_classes = num_classes
 
         self._backbone: Optional[nn.Module] = None
@@ -482,14 +489,26 @@ class SigLIPTeamEmbedder:
         model_name: str = "google/siglip-base-patch16-224",
         device: str = "cuda",
         batch_size: int = 32,
+        precision: str = "auto",
     ) -> None:
+        from torchkick.utils.precision import PrecisionManager
+
         self.device = torch.device(device)
         self.batch_size = batch_size
+
+        # Auto-detect FP16 support
+        if precision == "auto":
+            precision = PrecisionManager.get_optimal_precision(device)
+        self.precision = precision
+        self.use_fp16 = precision == "fp16"
+
         try:
             from transformers import AutoImageProcessor, SiglipVisionModel
 
             self._processor = AutoImageProcessor.from_pretrained(model_name)
             self._model = SiglipVisionModel.from_pretrained(model_name).to(self.device).eval()
+            if self.use_fp16:
+                self._model = self._model.half()
         except ImportError as e:
             raise ImportError(
                 f"SigLIPTeamEmbedder dependency missing: {e}. "
@@ -518,6 +537,8 @@ class SigLIPTeamEmbedder:
             pil_imgs = [Image.fromarray(cv2.cvtColor(c, cv2.COLOR_BGR2RGB)) for c in batch_crops]
             inputs = self._processor(images=pil_imgs, return_tensors="pt")
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            if self.use_fp16:
+                inputs = {k: v.half() for k, v in inputs.items()}
             out = self._model(**inputs)
             # SigLIP vision model returns BaseModelOutputWithPooling; use pooler_output
             image_features = out.pooler_output if hasattr(out, "pooler_output") else out.last_hidden_state[:, 0]

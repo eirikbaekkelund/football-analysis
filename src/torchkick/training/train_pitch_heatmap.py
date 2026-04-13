@@ -2,7 +2,7 @@
 Training script for the DINOv2+heatmap pitch keypoint detector.
 
 Trains a DINOv2PitchModel (ViT-S/14 backbone + CNN decoder) on the
-32-keypoint Roboflow pitch schema using weighted MSE heatmap loss plus
+30-keypoint pitch schema using weighted MSE heatmap loss plus
 a lightweight broadcast-view BCE head.
 
 No backbone freeze is applied — differential learning rates (backbone 10×
@@ -35,7 +35,7 @@ from torch.utils.data import DataLoader
 
 from torchkick.training.data.pitch_heatmap_dataset import PitchHeatmapDataset
 
-# Zone index ranges for per-zone PCK (Roboflow 32-kp schema)
+# Zone index ranges for per-zone PCK (30-keypoint pitch schema)
 _ZONE_LEFT = list(range(0, 13))  # left boundary + left box
 _ZONE_CENTER = list(range(13, 17)) + [30, 31]  # centre line + circle
 _ZONE_RIGHT = list(range(17, 30))  # right box + right boundary
@@ -49,35 +49,34 @@ _ZONE_RIGHT = list(range(17, 30))  # right box + right boundary
 def _heatmap_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
-    visibility: torch.Tensor,
-    fg_weight: float = 100.0,
+    alpha: float = 2.0,
+    beta: float = 4.0,
 ) -> torch.Tensor:
     """
-    Weighted MSE on sigmoid-activated heatmaps.
-
-    Foreground pixels (target > 0.01) receive fg_weight× higher loss weight
-    so the optimiser cannot minimise loss by predicting all-zeros.
-    Invisible keypoints (visibility == 0) are fully masked out.
+    Penalty-Reduced Focal Loss used in CenterNet and CornerNet.
 
     Args:
-        logits:     [B, 32, H, W]  raw model output (no sigmoid)
-        targets:    [B, 32, H, W]  Gaussian heatmap targets in [0, 1]
-        visibility: [B, 32]        binary keypoint visibility mask
-        fg_weight:  foreground pixel loss multiplier (default 100)
+        logits:     [B, num_keypoints, H, W] raw model output (no sigmoid)
+        targets:    [B, num_keypoints, H, W] Gaussian heatmap targets in [0, 1]
+        alpha, beta: Focal loss focalizing hyperparameters
 
     Returns:
-        Scalar loss.
+        Scalar focal loss.
     """
-    pred = torch.sigmoid(logits)
-    weight = torch.ones_like(targets)
-    weight[targets > 0.01] = fg_weight
+    pred = torch.clamp(torch.sigmoid(logits), min=1e-4, max=1 - 1e-4)
 
-    # mask out invisible keypoints entirely
-    vis_mask = visibility.view(visibility.shape[0], visibility.shape[1], 1, 1).expand_as(targets)
-    weight = weight * vis_mask
+    # We find peaks exactly where target >= 0.99 for numerical safety
+    pos_inds = targets.ge(0.99).float()
+    neg_inds = targets.lt(0.99).float()
 
-    denom = weight.sum().clamp(min=1.0)
-    return (weight * (pred - targets) ** 2).sum() / denom
+    pos_loss = torch.log(pred) * torch.pow(1 - pred, alpha) * pos_inds
+    neg_loss = torch.log(1 - pred) * torch.pow(pred, alpha) * torch.pow(1 - targets, beta) * neg_inds
+
+    # Calculate total loss, normalizing by the number of actual peaks found
+    num_pos = torch.clamp(pos_inds.sum(), min=1.0)
+    loss = -(pos_loss.sum() + neg_loss.sum()) / num_pos
+
+    return loss
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +85,8 @@ def _heatmap_loss(
 
 
 def _decode_heatmaps(
-    logits: torch.Tensor,
+    hm_logits: torch.Tensor,
+    off_logits: torch.Tensor,
     orig_h: int,
     orig_w: int,
 ) -> np.ndarray:
@@ -96,17 +96,23 @@ def _decode_heatmaps(
     Returns:
         kps: [B, 32, 2] pixel coordinates in [0, orig_w] × [0, orig_h]
     """
-    hm_size = logits.shape[-1]
-    heatmaps = torch.sigmoid(logits).float().cpu().numpy()  # [B, 32, H, W]
+    hm_size = hm_logits.shape[-1]
+    heatmaps = torch.sigmoid(hm_logits).float().cpu().numpy()  # [B, K, H, W]
+    offsets = off_logits.float().cpu().numpy()  # [B, 2*K, H, W]
     B = heatmaps.shape[0]
-    kps = np.zeros((B, 32, 2), dtype=np.float32)
+    K = heatmaps.shape[1]
+    kps = np.zeros((B, K, 2), dtype=np.float32)
 
     for b in range(B):
-        for k in range(32):
+        for k in range(K):
             hm = heatmaps[b, k]
             hy, hx = np.unravel_index(np.argmax(hm), hm.shape)
-            kps[b, k, 0] = (float(hx) + 0.5) / hm_size * orig_w
-            kps[b, k, 1] = (float(hy) + 0.5) / hm_size * orig_h
+
+            dx = float(offsets[b, k * 2, hy, hx])
+            dy = float(offsets[b, (k * 2) + 1, hy, hx])
+
+            kps[b, k, 0] = (float(hx) + dx + 0.5) / hm_size * orig_w
+            kps[b, k, 1] = (float(hy) + dy + 0.5) / hm_size * orig_h
 
     return kps
 
@@ -140,11 +146,16 @@ def _compute_pck(
             return float("nan")
         return float(((d < threshold_px) & v).sum() / n)
 
+    num_kp = pred_kps.shape[1]
+    left_idx = [i for i in _ZONE_LEFT if i < num_kp]
+    center_idx = [i for i in _ZONE_CENTER if i < num_kp]
+    right_idx = [i for i in _ZONE_RIGHT if i < num_kp]
+
     return {
-        "all": _zone_pck(list(range(32))),
-        "left": _zone_pck(_ZONE_LEFT),
-        "center": _zone_pck(_ZONE_CENTER),
-        "right": _zone_pck(_ZONE_RIGHT),
+        "all": _zone_pck(list(range(num_kp))),
+        "left": _zone_pck(left_idx),
+        "center": _zone_pck(center_idx),
+        "right": _zone_pck(right_idx),
     }
 
 
@@ -163,7 +174,6 @@ def train_pitch_heatmap(
     learning_rate: float = 1e-4,
     backbone_lr_scale: float = 0.1,
     warmup_epochs: int = 5,
-    fg_weight: float = 100.0,
     min_keypoints: int = 6,
     sigma: float = 2.5,
     imgsz: int = 560,
@@ -260,12 +270,20 @@ def train_pitch_heatmap(
     )
 
     # --- model ---
-    model = DINOv2PitchModel(backbone_name=backbone_variant, num_keypoints=32)
+    model = DINOv2PitchModel(backbone_name=backbone_variant, num_keypoints=train_ds.num_keypoints)
 
     if base_model is not None:
         ckpt = torch.load(base_model, map_location="cpu", weights_only=False)
         state = ckpt.get("model_state_dict", ckpt)
-        missing, unexpected = model.load_state_dict(state, strict=False)
+        # Filter layers with mismatching shapes (like the final 32->30 conv head)
+        filtered_state = {}
+        for k, v in state.items():
+            if k in model.state_dict():
+                if v.shape != model.state_dict()[k].shape:
+                    print(f"  [load] skipping mismatch {k}: {v.shape} vs {model.state_dict()[k].shape}")
+                    continue
+            filtered_state[k] = v
+        missing, unexpected = model.load_state_dict(filtered_state, strict=False)
         if missing:
             print(f"  Missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
         print(f"  Resumed from {base_model}")
@@ -320,7 +338,6 @@ def train_pitch_heatmap(
                     batch_size=batch_size,
                     lr=learning_rate,
                     backbone_lr_scale=backbone_lr_scale,
-                    fg_weight=fg_weight,
                     sigma=sigma,
                     imgsz=imgsz,
                     min_keypoints=min_keypoints,
@@ -343,31 +360,54 @@ def train_pitch_heatmap(
     for epoch in range(epochs):
         t0 = time.perf_counter()
 
+        # Update sigma dynamically (from 4.0 to 1.5 across epochs)
+        current_sigma = max(1.5, 4.0 - (4.0 - 1.5) * (epoch / float(epochs)))
+        train_ds.set_sigma(current_sigma)
+        val_ds.set_sigma(current_sigma)
+
         # ---- train ----
         model.train()
         train_loss = 0.0
         n_batches = len(train_loader)
         log_interval = max(1, n_batches // 10)  # ~10 updates per epoch
 
-        for batch_idx, (imgs, hm_targets, vis, pitch_labels) in enumerate(train_loader):
+        for batch_idx, (imgs, hm_targets, off_targets, off_mask, vis, pitch_labels) in enumerate(train_loader):
             imgs = imgs.to(dev)
             hm_targets = hm_targets.to(dev)
+            off_targets = off_targets.to(dev)
+            off_mask = off_mask.to(dev)
             vis = vis.to(dev)
             pitch_labels = pitch_labels.to(dev)
 
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", enabled="cuda" in device):
-                logits, pitch_logit = model(imgs)
-                loss_hm = _heatmap_loss(logits, hm_targets, vis, fg_weight)
+                hm_logits, off_logits, pitch_logit = model(imgs)
+
+                # 1. Focal Heatmap loss
+                loss_hm = _heatmap_loss(hm_logits, hm_targets)
+
+                # 2. Offset L1 loss (only evaluated at gt centers where mask == 1.0)
+                loss_off = F.l1_loss(off_logits * off_mask, off_targets * off_mask, reduction="sum")
+                num_off_points = off_mask.sum().clamp(min=1.0)
+                loss_off = loss_off / num_off_points
+
                 loss_pitch = F.binary_cross_entropy_with_logits(pitch_logit, pitch_labels)
-                loss = loss_hm + 0.1 * loss_pitch
+
+                # Combine losses
+                loss = loss_hm + loss_off + (0.1 * loss_pitch)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+            old_scaler = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
+
+            if old_scaler <= scaler.get_scale():
+                # Step was not skipped by Inf/NaN
+                optimizer.step_was_called = True
 
             train_loss += loss_hm.item()
 
@@ -381,10 +421,13 @@ def train_pitch_heatmap(
         train_loss /= max(len(train_loader), 1)
 
         # ---- lr scheduler step ----
-        if epoch < warmup_epochs:
-            warmup_sched.step()
-        else:
-            cosine_sched.step()
+        # PyTorch requires checking if amp skipped optimizer.step() to avoid a warning
+        if getattr(optimizer, "step_was_called", False):
+            if epoch < warmup_epochs:
+                warmup_sched.step()
+            else:
+                cosine_sched.step()
+            optimizer.step_was_called = False
 
         # ---- validate ----
         model.eval()
@@ -395,20 +438,20 @@ def train_pitch_heatmap(
         n_visible = []
 
         with torch.no_grad():
-            for imgs, hm_targets, vis, _ in val_loader:
+            for imgs, hm_targets, off_targets, off_mask, vis, _ in val_loader:
                 imgs = imgs.to(dev)
                 hm_targets = hm_targets.to(dev)
                 vis_dev = vis.to(dev)
 
                 with torch.amp.autocast("cuda", enabled="cuda" in device):
-                    logits, _ = model(imgs)
-                    loss_hm = _heatmap_loss(logits, hm_targets, vis_dev, fg_weight)
+                    hm_logits, off_logits, _ = model(imgs)
+                loss_hm = _heatmap_loss(hm_logits, hm_targets)
 
                 val_loss += loss_hm.item()
 
                 # decode for PCK (use imgsz as reference pixel space)
-                pred_kps = _decode_heatmaps(logits, imgsz, imgsz)
-                gt_kps = _decode_gt(hm_targets, imgsz)
+                pred_kps = _decode_heatmaps(hm_logits, off_logits, imgsz, imgsz)
+                gt_kps = _decode_gt(hm_targets, off_targets, imgsz)
 
                 all_pred.append(pred_kps)
                 all_gt.append(gt_kps)
@@ -453,15 +496,33 @@ def train_pitch_heatmap(
                 "epoch": epoch + 1,
             }
             if (epoch + 1) % 10 == 0:
-                log["val/heatmap_viz"] = _make_wandb_heatmap_images(_wandb, imgs[:4], logits[:4], hm_targets[:4])
+                log["val/heatmap_viz"] = _make_wandb_heatmap_images(_wandb, imgs[:4], hm_logits[:4], hm_targets[:4])
             _wandb.log(log)
 
         # ---- checkpoint ----
-        _save_ckpt(model, optimizer, epoch + 1, pck10["all"], val_loss, backbone_variant, last_ckpt)
+        _save_ckpt(
+            model,
+            optimizer,
+            epoch + 1,
+            pck10["all"],
+            val_loss,
+            backbone_variant,
+            train_ds.num_keypoints,
+            last_ckpt,
+        )
 
         if pck10["all"] > best_pck or math.isnan(best_pck):
             best_pck = pck10["all"]
-            _save_ckpt(model, optimizer, epoch + 1, pck10["all"], val_loss, backbone_variant, best_ckpt)
+            _save_ckpt(
+                model,
+                optimizer,
+                epoch + 1,
+                pck10["all"],
+                val_loss,
+                backbone_variant,
+                train_ds.num_keypoints,
+                best_ckpt,
+            )
             print(f"  ✓ New best PCK@10: {best_pck:.4f} → {best_ckpt}")
 
     if _wandb is not None:
@@ -477,30 +538,37 @@ def train_pitch_heatmap(
 # ---------------------------------------------------------------------------
 
 
-def _decode_gt(hm_targets: torch.Tensor, imgsz: int) -> np.ndarray:
+def _decode_gt(hm_targets: torch.Tensor, off_targets: torch.Tensor, imgsz: int) -> np.ndarray:
     """
     Decode GT heatmap targets to pixel coordinates for PCK evaluation.
 
     Args:
-        hm_targets: [B, 32, H, W]  Gaussian targets in [0,1]
-        imgsz:      reference pixel space size
+        hm_targets:  [B, 32, H, W]  Gaussian targets in [0,1]
+        off_targets: [B, 64, H, W]  Float offset targets
+        imgsz:       reference pixel space size
 
     Returns:
         [B, 32, 2] pixel coordinates
     """
     hm_size = hm_targets.shape[-1]
     hm = hm_targets.float().cpu().numpy()
+    offsets = off_targets.float().cpu().numpy()
     B = hm.shape[0]
-    kps = np.zeros((B, 32, 2), dtype=np.float32)
+    K = hm.shape[1]
+    kps = np.zeros((B, K, 2), dtype=np.float32)
 
     for b in range(B):
-        for k in range(32):
+        for k in range(K):
             h = hm[b, k]
             if h.max() < 1e-4:
                 continue
             hy, hx = np.unravel_index(np.argmax(h), h.shape)
-            kps[b, k, 0] = (float(hx) + 0.5) / hm_size * imgsz
-            kps[b, k, 1] = (float(hy) + 0.5) / hm_size * imgsz
+
+            dx = float(offsets[b, k * 2, hy, hx])
+            dy = float(offsets[b, (k * 2) + 1, hy, hx])
+
+            kps[b, k, 0] = (float(hx) + dx + 0.5) / hm_size * imgsz
+            kps[b, k, 1] = (float(hy) + dy + 0.5) / hm_size * imgsz
 
     return kps
 
@@ -512,6 +580,7 @@ def _save_ckpt(
     val_pck: float,
     val_loss: float,
     backbone_variant: str,
+    num_keypoints: int,
     path: str,
 ) -> None:
     """Save model checkpoint with config dict for inference reconstruction."""
@@ -526,7 +595,7 @@ def _save_ckpt(
             "val_loss": val_loss,
             "config": {
                 "backbone_variant": backbone_variant,
-                "num_keypoints": 32,
+                "num_keypoints": num_keypoints,
                 "input_size": 560,
                 "heatmap_size": 320,
             },

@@ -18,6 +18,8 @@ Example:
 from __future__ import annotations
 
 import random
+import threading
+import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
@@ -174,8 +176,8 @@ def detect_and_project(
     homography = HomographyEstimator(
         min_correspondences=4,
         min_inliers=4,
-        confidence_threshold=0.4,
-        visibility_threshold=0.4,
+        confidence_threshold=0.55,
+        visibility_threshold=0.55,
         use_kalman=True,
     )
     kp_tracker = KeypointTracker()
@@ -201,8 +203,12 @@ def detect_and_project(
             _should_update_h = (frame_idx % homography_interval == 0) or _force_h_update
             if _should_update_h and pitch_kp_detector is not None:
                 kps, conf_kps = pitch_kp_detector.detect(frame_bgr)
+                if conf_kps is not None and len(conf_kps) > 21:
+                    conf_kps = conf_kps.copy()
+                    for kp_idx in _IGNORED_KP_INDICES:
+                        conf_kps[kp_idx] = 0.0
                 kps_smooth, eff_conf = kp_tracker.update(kps, conf_kps)
-                ok = homography.estimate(kps_smooth, eff_conf, eff_conf, frame_bgr.shape[:2])
+                ok = homography.estimate(kps_smooth, eff_conf, eff_conf, frame_bgr.shape[:2], frame=frame_bgr)
 
                 # Accept new H only if: camera moved (force) OR quality improved
                 quality_improved = (
@@ -504,13 +510,17 @@ _REF_COLOR = (50, 50, 50)  # dark grey
 _GK_COLOR_T0 = (0, 255, 255)  # cyan
 _GK_COLOR_T1 = (255, 255, 0)  # yellow
 
+# Disabled keypoints during inference due to unstable labels.
+# 8: L-pen-spot, 21: R-pen-spot
+_IGNORED_KP_INDICES = {8, 21}
+
 
 def render_visualization(
     video_path: str,
     store: TrajectoryStore,
     assignments: Dict,
     max_duration: Optional[float] = None,
-    draw_overlay: bool = True,
+    draw_overlay: bool = False,
     debug_anchors: bool = False,
 ) -> str:
     """
@@ -625,6 +635,8 @@ def render_visualization(
                     kps, raw_conf, eff_conf, kp_selected = current_kps
                     _CONF_THRESHOLD = 0.4
                     for k in range(len(kps)):
+                        if k in _IGNORED_KP_INDICES:
+                            continue
                         rc = float(raw_conf[k])
                         ec = float(eff_conf[k])
                         if rc < 0.05:
@@ -696,6 +708,15 @@ def render_visualization(
                 minimap_entries = []
                 for obs in obs_list:
                     pos = obs.get("pitch_pos")
+                    if pos is None and current_H_inv is not None:
+                        # Fallback projection for minimap when stored pitch_pos is missing.
+                        bx1, by1, bx2, by2 = obs["box"]
+                        foot_pt = np.array([[[float((bx1 + bx2) / 2.0), float(by2)]]], dtype=np.float32)
+                        try:
+                            proj = cv2.perspectiveTransform(foot_pt, current_H_inv)[0, 0]
+                            pos = (float(proj[0]), float(proj[1]))
+                        except cv2.error:
+                            pos = None
                     if pos is None:
                         continue
                     role = obs["role"]
@@ -726,8 +747,9 @@ def render_visualization(
 
                 pitch_img = pitch_viz.base_pitch.copy()
                 for x, y, tid, team_code, is_ghost in minimap_entries:
-                    if abs(x) > HALF_LENGTH + 5 or abs(y) > HALF_WIDTH + 5:
-                        continue
+                    # Keep dots visible even when projection drifts slightly outside bounds.
+                    x = float(np.clip(x, -HALF_LENGTH, HALF_LENGTH))
+                    y = float(np.clip(y, -HALF_WIDTH, HALF_WIDTH))
                     px_dot, py_dot = pitch_viz._pitch_to_pixel(x, y)  # margin-aware
                     if team_code >= 10:
                         dot_color = _GK_COLOR_T0 if (team_code - 10) == 0 else _GK_COLOR_T1
@@ -799,7 +821,7 @@ def run_analysis(
     homography_interval: int = 1,
     reid_interval: int = 5,
     conf: float = 0.6,
-    draw_overlay: bool = True,
+    draw_overlay: bool = False,
     debug_anchors: bool = False,
     device: Optional[str] = None,
 ) -> str:
@@ -852,14 +874,20 @@ def run_analysis(
     from ultralytics import YOLO
 
     detector = YOLO(yolo_weights)
-    detector.to(dev)
+    if yolo_weights.endswith(".pt"):
+        detector.to(dev)
 
     # Load pitch keypoint detector (DINOv2 heatmap)
     pitch_kp_detector = None
     if pitch_weights is not None:
         from torchkick.models.pitch import HeatmapPitchDetector
 
-        pitch_kp_detector = HeatmapPitchDetector(weights_path=pitch_weights, device=str(dev))
+        pitch_kp_detector = HeatmapPitchDetector(
+            weights_path=pitch_weights,
+            device=str(dev),
+            conf_threshold=0.5,
+            pitch_threshold=0.65,
+        )
         print(f"Pitch keypoint detector loaded: {pitch_weights}")
 
     # Load ReID embedder
@@ -910,11 +938,21 @@ def run_analysis(
     if reid_embedder is not None:
         relink_tracks(store)
 
-    # Pass 2: Smooth trajectories
-    smooth_trajectories(store)
+    # Pass 2 & 3: Parallelize trajectory smoothing with team assignment
+    # Thread Pass 2 (smoothing) while main thread runs Pass 3 (team assignment)
+    t_pass_start = time.time()
 
-    # Per-game team assignment: SigLIP → UMAP(3D) → KMeans k=3
+    smooth_thread = None
     team_labels: Optional[Dict[int, int]] = None
+
+    # Start Pass 2 in background thread
+    def _smooth_worker():
+        smooth_trajectories(store)
+
+    smooth_thread = threading.Thread(target=_smooth_worker, daemon=False)
+    smooth_thread.start()
+
+    # Run Pass 3 in main thread while Pass 2 runs
     if siglip_embedder is not None:
         try:
             team_embedder = GameTeamEmbedder(siglip_embedder)
@@ -930,6 +968,13 @@ def run_analysis(
         team_centroids=team_centroids,
         team_labels=team_labels,
     )
+
+    # Wait for Pass 2 (smoothing) to complete before rendering
+    if smooth_thread is not None:
+        smooth_thread.join()
+
+    t_parallel = time.time() - t_pass_start
+    print(f"[timing] Parallel passes (2 & 3): {t_parallel:.1f}s")
 
     # Pass 4: Render
     output_path = render_visualization(
